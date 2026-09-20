@@ -352,6 +352,35 @@ static void v3d_flush_caches(io_mapping_t *v3d)
 }
 
 /*
+ * Writes the documented CTSUBS restart trigger to a CLE thread's CS
+ * register, then gives the hardware a beat to actually process it
+ * before returning.
+ *
+ * Added after a hardware test showed CTSUBS clearing CA/EA to zero as
+ * part of leaving halt - meaning the documented "restarts if CA != EA"
+ * condition can never be true in that same instant, so the thread just
+ * re-stops immediately. The new job's QMA/QMS/QTS/QBA/QEA were written
+ * right after, with no gap at all, which is exactly the shape of a
+ * write-after-write hazard against a hardware state machine still
+ * mid-transition - and that same test's readback showed the new job's
+ * registers were never latched. This isn't "wait for an async
+ * operation to finish" (there's nothing meaningful to poll for until
+ * we've actually queued new work), just a fixed settle delay before
+ * hitting the same control register block with more writes - same
+ * technique as the PM_GRAFX reset pulse delay in module.c, and the
+ * same reasoning for why the loop counter must be volatile.
+ */
+static void v3d_restart_thread(io_mapping_t *v3d, unsigned int cs_reg)
+{
+    volatile unsigned int spin;
+
+    IO_WORD(*v3d, cs_reg) = V3D_CT_CS_CTSUBS;
+
+    for (spin = 0; spin < 100000u; spin++)
+        ;
+}
+
+/*
  * Waits for a CLE frame counter (V3D_CLE_BFC/RFC) to advance past
  * `initial`, polling in short bursts rather than holding one long-lived
  * OS_Memory 14 mapping. That matters here, not just as a style choice:
@@ -607,8 +636,9 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
      * "stopped at halt"/error condition left over from a previous run
      * before relying on QBA/QEA to kick things off. Never write
      * V3D_CT_CS_CTRUN here - that bit STOPS a thread, it doesn't start
-     * one. */
-    IO_WORD(v3d, V3D_CLE_CT0CS) = V3D_CT_CS_CTSUBS;
+     * one. See v3d_restart_thread's comment for why there's a settle
+     * delay before the writes that follow. */
+    v3d_restart_thread(&v3d, V3D_CLE_CT0CS);
 
     IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
     IO_WORD(v3d, V3D_CLE_CT0QMS) = TILE_ALLOC_PAGE_COUNT * PAGE_SIZE;
@@ -633,7 +663,7 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     v3d_flush_caches(&v3d);
     last_rfc = IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu;
 
-    IO_WORD(v3d, V3D_CLE_CT1CS) = V3D_CT_CS_CTSUBS; /* see thread 0's comment */
+    v3d_restart_thread(&v3d, V3D_CLE_CT1CS); /* see thread 0's comment */
 
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering */

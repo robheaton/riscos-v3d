@@ -389,6 +389,30 @@ evidence (the stuck CT0CA) that *something* was left in a bad state
 from early in this session that ordinary software paths didn't reach
 on their own.
 
+**Hardware result, attempt 9 (2026-09-20):** `CS=0x50` -
+`CTRUN=0, CTSUBS=1, CTERR=0`: stopped at halt again, but *no error*
+this time. `CA=0x00000000, EA=0x00000000` - both zeroed. And `rQBA`/
+`rQEA` this run exactly matched the *previous* run's written values,
+not this run's - the new job was never latched at all.
+
+Read together: writing `CTSUBS` to restart very likely clears `CA`/`EA`
+to zero as part of leaving halt - which means the documented restart
+condition ("starts running if `CA != EA`") can never be true in that
+same instant (0 == 0), so the thread just re-stops immediately. We
+then wrote the new job's `QMA`/`QMS`/`QTS`/`QBA`/`QEA` with zero delay
+after that restart trigger - exactly the shape of a write-after-write
+race against a hardware state machine still mid-transition, and the
+readback confirms those writes never landed.
+
+Added `v3d_restart_thread()` (`cl_clear.c`): issues the `CTSUBS`
+restart write, then a fixed settle delay (same volatile-counted-loop
+technique as the `PM_GRAFX` reset pulse in `module.c`, same reasoning
+for why the counter must be volatile) before any further register
+writes. This isn't "wait for an async op to finish" - there's nothing
+meaningful to poll for until new work is actually queued - just room
+for the hardware to finish processing one control write before the
+next one arrives. Not yet re-tested on hardware.
+
 ## Layout
 
 ```
