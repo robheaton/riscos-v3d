@@ -210,8 +210,39 @@ multi-million-iteration spin is a different animal. Rewrote the poll
 (`v3d_poll_counter` in `cl_clear.c`) to remap in short bursts (10,000
 reads at a time, 500 bursts, same total ceiling) instead of one
 unbroken hold - not yet confirmed this was the actual cause, only that
-the old pattern violated the documented contract regardless. Not yet
-re-tested on hardware.
+the old pattern violated the documented contract regardless.
+
+**Hardware result, attempt 4 (2026-09-20): identical error again.**
+Ruled out the shared-IO-window theory too. Also discovered a real,
+separate bug while re-testing: calling `V3D_ClearTest` twice without
+`*RMKill`-ing the module between runs failed with *"memory cannot be
+moved"* - `pmp_alloc` always tried to claim fresh physical pages for
+the same PMP page range, which fails when that range is still locked
+and mapped from the previous call. Fixed (`pmp_release` in
+`phys_buffer.c`, called at the start of every `pmp_alloc`, unmaps then
+releases any existing pages at that range first - safe even on a
+never-used range, since the PRM documents that as a no-op). This makes
+repeat testing possible but is unrelated to the BFC timeout itself.
+
+Reconsidered something more fundamental for the timeout: RISC OS runs
+with CPU data caches enabled, and our BCL/RCL bytes are written by the
+CPU into normal (default-cacheable) RAM via `pmp_alloc`. The V3D GPU is
+a separate bus master reading DRAM directly - if those CPU writes were
+still sitting in cache rather than having reached physical memory, the
+GPU would see stale/garbage data instead of our control list, which
+would fully explain binning never producing anything coherent enough to
+reach `OP_FLUSH`. RISC OS has a documented API specifically for this
+class of problem (`OS_Memory 19`, "Prepare for DMA"), which is itself
+confirmation this is a real, commonly-hit issue on this OS - its own
+docs describe exactly the CPU-writes-DMA-reads-stale-data scenario.
+Rather than take on `OS_Memory 19`'s substantial callback-based
+interface, used a simpler fix: `OS_DynamicArea 22`'s page-flags word
+already has unused cache-policy bits (4 and 5), and setting both marks
+a page **NCNB - VMSA "Strongly-Ordered" memory**: every CPU write goes
+straight to physical RAM, nothing to flush, at a performance cost that
+doesn't matter for a handful of small buffers. Applied to every page
+`pmp_alloc` maps (`PAGE_FLAG_NONCACHEABLE` in `phys_buffer.c`). Not yet
+tested on hardware.
 
 ## Layout
 

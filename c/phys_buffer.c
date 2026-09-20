@@ -30,6 +30,26 @@ enum
 /* Page flags used by OS_DynamicArea 21/22 (bit 15 = lock to this area) */
 #define PAGE_FLAG_LOCK            (1u << 15)
 
+/*
+ * Bit 4 (nonbufferable) + bit 5 (noncacheable), cache-policy sub-field
+ * (bits 12-14) left at 0 = NCNB = VMSA "Strongly-Ordered" memory (see
+ * riscosopen.org/wiki/.../Memory Cache Policies). Every buffer this
+ * module allocates is either read or written by the GPU directly via
+ * the bus (a non-cache-coherent DMA master) - without this, CPU writes
+ * to the BCL/RCL could sit in the ARM data cache indefinitely and the
+ * GPU would see stale/garbage physical memory instead of the control
+ * list actually built for it. Added after binning still timed out with
+ * a correct-looking control list and a demonstrably-not-holding-the-
+ * shared-IO-window poll - cache coherency is the next most likely
+ * explanation and RISC OS's own docs treat DMA-vs-cache as a real,
+ * commonly-hit problem (see OS_Memory 19, "Prepare for DMA" - not used
+ * here because its callback-based interface is substantial machinery
+ * for what a fixed non-cacheable mapping solves more simply, at the
+ * cost of some performance we don't need yet for a handful of tiny
+ * buffers).
+ */
+#define PAGE_FLAG_NONCACHEABLE    ((1u << 4) | (1u << 5))
+
 static inline unsigned int round_up_pages(unsigned int bytes)
 {
     return (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -62,6 +82,58 @@ _kernel_oserror *pmp_create(const char *name, unsigned int max_logical_bytes,
     return NULL;
 }
 
+enum { MAX_PAGES_PER_CALL = 64 };
+
+/*
+ * Releases (unmaps, then unclaims) any pages currently held at
+ * [page_index, page_index+num_pages) in `area`. Safe to call on a
+ * range that was never allocated: per the PRM, OS_DynamicArea 21/22
+ * treat a page already in the requested state ("unmapped"/"unclaimed",
+ * which is the state every PMP page starts in) as a no-op, not an
+ * error. Called at the start of pmp_alloc so repeat calls for the same
+ * range - e.g. re-running a test SWI without reloading the module -
+ * don't try to reclaim pages that are still locked+mapped from the
+ * previous call. (Found the hard way: a second V3D_ClearTest without
+ * an intervening *RMKill failed with "memory cannot be moved" - the
+ * claim step refusing to swap a still-mapped page's physical backing,
+ * exactly as the PRM says it will.)
+ */
+static _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
+                                     unsigned int num_pages)
+{
+    unsigned int list[MAX_PAGES_PER_CALL][3];
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+    unsigned int i;
+
+    /* unmap first - releasing a still-mapped page is refused */
+    for (i = 0; i < num_pages; i++)
+    {
+        list[i][0] = page_index + i; /* DA page number */
+        list[i][1] = (unsigned int) -1; /* unmap */
+        list[i][2] = 0;
+    }
+    regs.r[0] = DA_MapPages;
+    regs.r[1] = (int) area->area_num;
+    regs.r[2] = (int) list;
+    regs.r[3] = (int) num_pages;
+    err = _kernel_swi(SWI_OS_DynamicArea, &regs, &regs);
+    if (err)
+        return err;
+
+    for (i = 0; i < num_pages; i++)
+    {
+        list[i][0] = page_index + i; /* PMP page index */
+        list[i][1] = (unsigned int) -1; /* release */
+        list[i][2] = 0;
+    }
+    regs.r[0] = DA_ClaimPages;
+    regs.r[1] = (int) area->area_num;
+    regs.r[2] = (int) list;
+    regs.r[3] = (int) num_pages;
+    return _kernel_swi(SWI_OS_DynamicArea, &regs, &regs);
+}
+
 _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
                             unsigned int num_pages,
                             unsigned int *phys_addr_out,
@@ -70,8 +142,6 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
     /* Small, fixed cap: this milestone only needs a handful of pages
      * (control lists, tile state, small buffers). A bigger cap would
      * need heap allocation instead of a stack array. */
-    enum { MAX_PAGES_PER_CALL = 64 };
-
     unsigned int claim_list[MAX_PAGES_PER_CALL][3];
     unsigned int map_list[MAX_PAGES_PER_CALL][3];
     _kernel_swi_regs regs;
@@ -86,6 +156,10 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
         };
         return &err_bad_count;
     }
+
+    err = pmp_release(area, page_index, num_pages);
+    if (err)
+        return err;
 
     /* --- find physically-contiguous pages (OS_Memory 12) --- */
     regs.r[0] = Mem_RecommendPage;
@@ -116,7 +190,8 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
     {
         map_list[i][0] = page_index + i;     /* DA page number (logical) */
         map_list[i][1] = page_index + i;     /* PMP page index to map in */
-        map_list[i][2] = PAGE_FLAG_LOCK;     /* access=0 (full RW), locked */
+        map_list[i][2] = PAGE_FLAG_LOCK | PAGE_FLAG_NONCACHEABLE;
+        /* access=0 (full RW), locked, Strongly-Ordered (see above) */
     }
     regs.r[0] = DA_MapPages;
     regs.r[1] = (int) area->area_num;
