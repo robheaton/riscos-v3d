@@ -170,23 +170,32 @@ on a GPU stall would be a worse failure mode than an honest error.
 render target's physical address (R0) and the read-back first pixel
 (R1) out. Requires `V3D_PowerOn` first.
 
-**Hardware result (2026-09-20): `Bad alignment request`.** Traced this
-down rather than taking it at face value - it turned out to be a red
-herring pointing at a bug in *this project's own error handling*, not
-at the real failure. Every `TODO: real error` placeholder throughout
-the code (timeouts, "not powered on", bad page counts) was returning
-`_kernel_last_oserror()` - which doesn't create an error, it reads back
-whatever error happened to be cached *anywhere* in the system last. A
+**Hardware result, attempt 1 (2026-09-20): `Bad alignment request`.**
+Traced this down rather than taking it at face value - it turned out to
+be a red herring pointing at a bug in *this project's own error
+handling*, not at the real failure. Every `TODO: real error` placeholder
+throughout the code (timeouts, "not powered on", bad page counts) was
+returning `_kernel_last_oserror()` - which doesn't create an error, it
+reads back whatever error happened to be cached *anywhere* in the
+system last. A
 [ROOL bug thread](https://www.riscosopen.org/forum/forums/4/topics/17507)
 shows this exact message ("Bad alignment request", error 279) turning
-up in completely unrelated contexts for the same reason. So the actual
-failure is still unknown - only that it was misreported. Replaced every
-placeholder with a real, distinct, descriptive `_kernel_oserror` (see
-`module.c`, `phys_buffer.c`, `cl_clear.c`), and fixed the SWI handler's
-default case to return cmunge's own `error_BAD_SWI` instead of the same
-bad pattern. Re-testing now should report which specific step actually
-failed - most likely the BCL/BFC timeout given the known risk noted
-above, but no longer a guess.
+up in completely unrelated contexts for the same reason. Replaced every
+placeholder with a real, distinct, descriptive `_kernel_oserror`, and
+fixed the SWI handler's default case to return cmunge's own
+`error_BAD_SWI` instead of the same bad pattern.
+
+**Hardware result, attempt 2 (2026-09-20):** with real error reporting
+in place: *"timed out waiting for V3D_CLE_BFC to advance - binning did
+not complete"* - confirming the exact risk flagged above. Fix: added
+back the reference's full always-present viewport/clip/raster
+state-setup block (`ClipWindow` through `VcmCacheSize`, ~20 packets,
+values copied verbatim from the reference since they're otherwise
+geometry-related and inert without any primitives) between
+`OP_START_TILE_BINNING` and `OP_FLUSH`. A bare `TileBinningModeCfg` +
+`OP_START_TILE_BINNING` + `OP_FLUSH` was apparently not enough for the
+CLE to reach completion on its own - not yet confirmed that the full
+block is. Not yet re-tested on hardware.
 
 ## Layout
 

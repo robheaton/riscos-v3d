@@ -14,12 +14,15 @@
  * cache-flush dance) is transcribed the same way from that reference's
  * src/device/v3d/v3d_qpu.cpp (executeBin/executeRender).
  *
- * NOT VERIFIED: whether a BCL with zero primitives/viewport/shader-state
- * setup (as used here, since nothing is actually drawn) is valid on real
- * V3D hardware. The reference never exercises this path - its BCL always
- * sets up a full viewport+shader-state+VertexArrayPrims because it always
- * draws a triangle. This is the single most likely thing to need fixing
- * once this hits hardware.
+ * UPDATE (2026-09-20, after first hardware test): a BCL with just
+ * TileBinningModeCfg + OP_START_TILE_BINNING + OP_FLUSH and nothing
+ * else left V3D_CLE_BFC never advancing - binning never completed.
+ * Confirms the risk flagged in the original version of this comment.
+ * Fix: reproduced the reference's full always-present viewport/clip/
+ * raster state-setup block (ClipWindow through VcmCacheSize) verbatim,
+ * values and all, minus only GlShaderState/VertexArrayPrims since we
+ * draw nothing. Still not confirmed on hardware that this is sufficient
+ * - only that the bare-minimum version wasn't.
  */
 
 #include "cl_clear.h"
@@ -51,6 +54,144 @@ static void emit_tile_binning_mode_cfg(cl_buf_t *b, unsigned int w, unsigned int
 static void emit_flush_vcd_cache(cl_buf_t *b) { cl_u8(b, 19); }
 static void emit_start_tile_binning(cl_buf_t *b) { cl_u8(b, 6); }
 static void emit_flush(cl_buf_t *b) { cl_u8(b, 4); }
+
+/*
+ * Reference's BCL always includes the block below between
+ * OP_START_TILE_BINNING and its shader-state/VertexArrayPrims/OP_FLUSH
+ * epilogue - the risk noted at the top of this file was that skipping
+ * it (since we draw nothing) might leave the CLE unable to reach
+ * completion. Hardware confirmed binning never completed with it
+ * skipped, so it's reproduced here verbatim (values copied from the
+ * reference's own call, which are otherwise geometry-related and
+ * inert without any primitives to apply them to).
+ */
+
+/* opcode(1) + address u32(4) = 5. */
+static void emit_occlusion_query_counter(cl_buf_t *b, unsigned int addr)
+{
+    cl_u8(b, 92);
+    cl_u32(b, addr);
+}
+
+/* opcode(1) + left(2) + bottom(2) + width(2) + height(2) = 9. */
+static void emit_clip_window(cl_buf_t *b, unsigned int left, unsigned int bottom,
+                              unsigned int w, unsigned int h)
+{
+    cl_u8(b, 107);
+    cl_u16(b, left);
+    cl_u16(b, bottom);
+    cl_u16(b, w);
+    cl_u16(b, h);
+}
+
+/* opcode(1) + byte1[ff:1|rf:1|cw:1|depthoff:1|linerast:2|oversample:2]
+ * + byte2[unused:3|d3dwire:1|depthfunc:3|zupdate:1]
+ * + byte3[earlyz:1|earlyzupd:1|stencil:1|blend:1|d3dpointfill:1|
+ *         d3dprovoking:1|unused:2] = 4. */
+static void emit_cfg_bits(cl_buf_t *b, int ff_prim, int rf_prim, int clockwise,
+                           int depth_off, unsigned int line_raster,
+                           unsigned int oversample, int d3d_wireframe,
+                           unsigned int depth_test_func, int z_update,
+                           int early_z, int early_z_update, int stencil,
+                           int blend, int d3d_point_fill, int d3d_provoking)
+{
+    unsigned int b1 = (ff_prim ? 1u : 0u) | ((rf_prim ? 1u : 0u) << 1) |
+        ((clockwise ? 1u : 0u) << 2) | ((depth_off ? 1u : 0u) << 3) |
+        ((line_raster & 0x3u) << 4) | ((oversample & 0x3u) << 6);
+    unsigned int b2 = ((d3d_wireframe ? 1u : 0u) << 3) |
+        ((depth_test_func & 0x7u) << 4) | ((z_update ? 1u : 0u) << 7);
+    unsigned int b3 = (early_z ? 1u : 0u) | ((early_z_update ? 1u : 0u) << 1) |
+        ((stencil ? 1u : 0u) << 2) | ((blend ? 1u : 0u) << 3) |
+        ((d3d_point_fill ? 1u : 0u) << 4) | ((d3d_provoking ? 1u : 0u) << 5);
+    cl_u8(b, 96);
+    cl_u8(b, b1);
+    cl_u8(b, b2);
+    cl_u8(b, b3);
+}
+
+static void emit_point_size(cl_buf_t *b, float size) { cl_u8(b, 104); cl_f32(b, size); }
+static void emit_line_width(cl_buf_t *b, float w) { cl_u8(b, 105); cl_f32(b, w); }
+
+static void emit_clipper_xy_scaling(cl_buf_t *b, float w, float h)
+{
+    cl_u8(b, 110);
+    cl_f32(b, w);
+    cl_f32(b, h);
+}
+
+static void emit_clipper_z_scale_and_offset(cl_buf_t *b, float scale, float offset)
+{
+    cl_u8(b, 111);
+    cl_f32(b, scale);
+    cl_f32(b, offset);
+}
+
+static void emit_clipper_z_min_max(cl_buf_t *b, float zmin, float zmax)
+{
+    cl_u8(b, 109);
+    cl_f32(b, zmin);
+    cl_f32(b, zmax);
+}
+
+/* opcode(1) + [centre_x:22(fp14.8)|coarse_x:10](4) +
+ * [centre_y:22(fp14.8)|coarse_y:10](4) = 9. */
+static void emit_viewport_offset(cl_buf_t *b, float x, float y,
+                                  unsigned int coarse_x, unsigned int coarse_y)
+{
+    unsigned int vx = ((unsigned int) (x * 256.0f) & 0x3FFFFFu) |
+        ((coarse_x & 0x3FFu) << 22);
+    unsigned int vy = ((unsigned int) (y * 256.0f) & 0x3FFFFFu) |
+        ((coarse_y & 0x3FFu) << 22);
+    cl_u8(b, 108);
+    cl_u32(b, vx);
+    cl_u32(b, vy);
+}
+
+static void emit_color_write_masks(cl_buf_t *b, unsigned int mask)
+{
+    cl_u8(b, 87);
+    cl_u32(b, mask);
+}
+
+static void emit_blend_constant_color(cl_buf_t *b, unsigned int r, unsigned int g,
+                                       unsigned int bl, unsigned int a)
+{
+    cl_u8(b, 86);
+    cl_u16(b, r);
+    cl_u16(b, g);
+    cl_u16(b, bl);
+    cl_u16(b, a);
+}
+
+static void emit_zero_all_flat_shade_flags(cl_buf_t *b) { cl_u8(b, 97); }
+static void emit_zero_all_non_perspective_flags(cl_buf_t *b) { cl_u8(b, 99); }
+static void emit_zero_all_centroid_flags(cl_buf_t *b) { cl_u8(b, 88); }
+
+/* opcode(1) + [count:5|unused:2|enable:1](1) = 2. */
+static void emit_transform_feedback_specs(cl_buf_t *b, unsigned int count, int enable)
+{
+    cl_u8(b, 74);
+    cl_u8(b, (count & 0x1Fu) | ((enable ? 1u : 0u) << 7));
+}
+
+/* opcode(1) + [mask:4|unused:4](1) + unused(1) + coverage u16(2) = 5.
+ * coverage is the top 16 bits of the f32 bit pattern. */
+static void emit_sample_state(cl_buf_t *b, unsigned int mask, float coverage)
+{
+    union { float f; unsigned int u; } conv;
+    conv.f = coverage;
+    cl_u8(b, 91);
+    cl_u8(b, mask & 0xFu);
+    cl_u8(b, 0);
+    cl_u16(b, (conv.u >> 16) & 0xFFFFu);
+}
+
+/* opcode(1) + [bin:4|render:4](1) = 2. */
+static void emit_vcm_cache_size(cl_buf_t *b, unsigned int bin_count, unsigned int render_count)
+{
+    cl_u8(b, 71);
+    cl_u8(b, (bin_count & 0xFu) | ((render_count & 0xFu) << 4));
+}
 
 /* opcode(1) + [sub_id=0|ntargets-1=0](1) + width(2) + height(2)
  * + [bpp:2|msaa:1|dbuf:1|unused:1|earlyz_dir:1|earlyz_dis:1|depth_type:4
@@ -241,13 +382,38 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     (void) tile_alloc_log;
     (void) tile_state_log;
 
-    /* --- BCL: empty bin (no primitives, no viewport/shader setup -
-     * see the NOT VERIFIED note at the top of this file) --- */
+    /* --- BCL: empty bin (no primitives - see the reference's full
+     * always-present state-setup block below, added after hardware
+     * confirmed a bare TileBinningModeCfg+OP_START_TILE_BINNING+
+     * OP_FLUSH left binning never completing; order and values copied
+     * verbatim from the reference's gl_rainbow_triangle.cpp) --- */
     cl_init(&bcl, cl_log, cl_phys, PAGE_SIZE);
     bcl_start = cl_paddr(&bcl);
     emit_tile_binning_mode_cfg(&bcl, CL_CLEAR_TEST_WIDTH, CL_CLEAR_TEST_HEIGHT);
     emit_flush_vcd_cache(&bcl);
+    emit_occlusion_query_counter(&bcl, 0);
     emit_start_tile_binning(&bcl);
+
+    emit_clip_window(&bcl, 0, 0, CL_CLEAR_TEST_WIDTH, CL_CLEAR_TEST_HEIGHT);
+    emit_cfg_bits(&bcl, 1, 1, 1, 0, 0, 0, 0, 7, 0, 0, 1, 0, 0, 0, 0);
+    emit_point_size(&bcl, 1.0f);
+    emit_line_width(&bcl, 1.0f);
+    emit_clipper_xy_scaling(&bcl, (CL_CLEAR_TEST_WIDTH / 2) * 256.0f,
+                             (CL_CLEAR_TEST_HEIGHT / 2) * -256.0f);
+    emit_clipper_z_scale_and_offset(&bcl, 0.5f, 0.5f);
+    emit_clipper_z_min_max(&bcl, 0.0f, 1.0f);
+    emit_viewport_offset(&bcl, CL_CLEAR_TEST_WIDTH / 2, CL_CLEAR_TEST_HEIGHT / 2, 0, 0);
+    emit_color_write_masks(&bcl, 0);
+    emit_blend_constant_color(&bcl, 0, 0, 0, 0);
+    emit_zero_all_flat_shade_flags(&bcl);
+    emit_zero_all_non_perspective_flags(&bcl);
+    emit_zero_all_centroid_flags(&bcl);
+    emit_transform_feedback_specs(&bcl, 0, 0);
+    emit_occlusion_query_counter(&bcl, 0);
+    emit_sample_state(&bcl, 0xF, 1.0f);
+    emit_vcm_cache_size(&bcl, 4, 4);
+
+    /* No GlShaderState / VertexArrayPrims - we draw nothing. */
     emit_flush(&bcl);
     bcl_end = cl_paddr(&bcl);
 
