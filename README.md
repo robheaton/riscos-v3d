@@ -338,10 +338,56 @@ actual disassembly that `-O2` didn't eliminate it, since a delay loop
 with no other side effect is exactly the kind of thing an optimiser is
 entitled to remove).
 
-Not yet re-tested on hardware. Given how it was discovered, worth
-trying an actual power cycle of the CM4 too if this alone doesn't do
-it - software reset pulses don't always reach everything a hardware
-reset does.
+**Hardware result, attempt 8 (2026-09-20): different failure this
+time, and it's genuine progress.** `wQBA`/`rQBA` and `wQEA`/`rQEA` no
+longer matched each other at all - a new symptom, not the same result
+again. Rather than treat that as noise, found the actual, authoritative
+register documentation instead of continuing to infer from names:
+Broadcom's own **"VideoCore IV 3D Architecture Reference Guide"**
+(docs.broadcom.com/doc/12358545, found in the very first research pass
+of this whole project and never actually opened until now), Table 49,
+gives the real bit-level meaning of `V3D_CTnCS`:
+
+- bit 5 `CTRUN`: 1 = running (writing 1 *stops* a thread - never write
+  it to start one)
+- bit 4 `CTSUBS`: writing 1 clears a "stopped at halt" condition and
+  restarts the thread if `CA != EA`
+- bit 3 `CTERR`: read-only, set when stopped *with an error*
+
+Decoded against this: the *previous* attempt's `CS=0x58` meant
+`CTRUN=0, CTERR=1` - **the thread was halted with an error**, which is
+exactly consistent with "wedged since early in the session" and
+explains why four earlier fixes all produced the identical result. The
+*latest* attempt's `CS=0x20` means `CTRUN=1` - genuinely running, no
+error - confirming the reset-pulse fix really did clear that error
+state. Progress, not a new dead end: `CA` had advanced roughly 32KB
+past our submitted 107-byte control list without stopping at
+`OP_FLUSH`, so the thread is now actually executing, just not
+completing cleanly - a different, narrower problem than "wedged".
+
+Note on this document's scope: it's the *older* VC4 generation, and
+its description of `CTnCA`/`CTnEA` as the direct submission registers
+does **not** apply to the modern V3D used here (the real V3D driver,
+proven correct by the bare-metal reference actually rendering on real
+Pi4 hardware, submits via `CT0QBA`/`QEA` instead) - only the `CTnCS`
+bit layout and general thread-state model were treated as still
+authoritative, since those are lower-level architectural concepts that
+carried forward and this is the only place they're documented at the
+bit level at all.
+
+Added the documented restart step - write `CTSUBS` (bit 4) to
+`CT0CS`/`CT1CS` before every submission, clearing any leftover
+halt/error state via the official mechanism rather than relying only
+on the block-level `PM_GRAFX` reset pulse to reach it - plus decoded
+`CS` (`RUN`/`STOP`/`ERR`) into the diagnostic message alongside the
+existing fields. Not yet re-tested on hardware.
+
+If this still doesn't produce a clean completion, worth trying an
+actual power cycle of the CM4 too - software reset pulses don't always
+reach everything a hardware reset does, and we now have concrete
+evidence (the stuck CT0CA) that *something* was left in a bad state
+from early in this session that ordinary software paths didn't reach
+on their own.
 
 ## Layout
 

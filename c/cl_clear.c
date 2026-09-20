@@ -447,7 +447,10 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     if (sts == 0)               append_str(out_err->errmess, &pos, "none");
     append_str(out_err->errmess, &pos, ") CS=");
     append_hex32(out_err->errmess, &pos, cs);
-    append_str(out_err->errmess, &pos, " CA=");
+    append_str(out_err->errmess, &pos, " (");
+    append_str(out_err->errmess, &pos, (cs & V3D_CT_CS_CTRUN) ? "RUN " : "STOP ");
+    if (cs & V3D_CT_CS_CTERR) append_str(out_err->errmess, &pos, "ERR ");
+    append_str(out_err->errmess, &pos, ") CA=");
     append_hex32(out_err->errmess, &pos, ca);
     append_str(out_err->errmess, &pos, " EA=");
     append_hex32(out_err->errmess, &pos, ea);
@@ -600,6 +603,13 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     v3d_flush_caches(&v3d);
     last_bfc = IO_WORD(v3d, V3D_CLE_BFC) & 0xFFu;
 
+    /* Explicit, documented restart (Broadcom PRM Table 49): clears any
+     * "stopped at halt"/error condition left over from a previous run
+     * before relying on QBA/QEA to kick things off. Never write
+     * V3D_CT_CS_CTRUN here - that bit STOPS a thread, it doesn't start
+     * one. */
+    IO_WORD(v3d, V3D_CLE_CT0CS) = V3D_CT_CS_CTSUBS;
+
     IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
     IO_WORD(v3d, V3D_CLE_CT0QMS) = TILE_ALLOC_PAGE_COUNT * PAGE_SIZE;
     IO_WORD(v3d, V3D_CLE_CT0QTS) = tile_state_phys | V3D_CLE_CT0QTS_ENABLE;
@@ -622,6 +632,8 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
 
     v3d_flush_caches(&v3d);
     last_rfc = IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu;
+
+    IO_WORD(v3d, V3D_CLE_CT1CS) = V3D_CT_CS_CTSUBS; /* see thread 0's comment */
 
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering */

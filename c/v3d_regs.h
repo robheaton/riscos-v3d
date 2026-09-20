@@ -91,14 +91,37 @@
 #define V3D_CLE_CT0QMS    (V3D_CORE0 + 0x174u) /* bin tile-alloc mem size  */
 
 /*
- * Diagnostic-only "thread state" registers for CLE thread 0 (bin).
- * V3D_CLE_CT0CA in particular is effectively a program counter into
- * the control list - the real Linux driver's own timeout-detection
- * logic (v3d_cl_job_timedout, drivers/gpu/drm/v3d/v3d_sched.c) reads
- * it and CT0RA specifically to tell "never started" apart from "stuck
- * partway through", which is exactly the question we have.
+ * "Thread state" registers for CLE thread 0 (bin). V3D_CLE_CT0CA is
+ * effectively a program counter into the control list - the real
+ * Linux driver's own timeout-detection logic (v3d_cl_job_timedout,
+ * drivers/gpu/drm/v3d/v3d_sched.c) reads it and CT0RA specifically to
+ * tell "never started" apart from "stuck partway through".
+ *
+ * CT0CS bit meanings below are NOT guessed - transcribed from
+ * Broadcom's own "VideoCore IV 3D Architecture Reference Guide"
+ * (docs.broadcom.com/doc/12358545), Table 49 "V3D_CTnCS Register
+ * Description". That doc predates V3D (it's for the older VC4
+ * generation) and its description of CTnCA/CTnEA as the direct
+ * submission registers does NOT apply here - the real V3D driver for
+ * this exact silicon (v3d_sched.c) submits via CT0QBA/QEA instead, and
+ * that's proven correct by the bare-metal reference actually
+ * rendering on real Pi4 hardware. But the CS bit layout, and the CLE's
+ * general thread-state model (Stopped/Running/Stopped-at-halt/Error),
+ * are architectural concepts that carried forward, and this is the
+ * only place they're actually documented at the bit level - used here
+ * for diagnostics and for the documented halt-clear/restart sequence.
  */
 #define V3D_CLE_CT0CS     (V3D_CORE0 + 0x100u) /* control/status           */
+#define V3D_CT_CS_CTRUN   (1u << 5)  /* R/W: 1=running. Writing 1 STOPS the
+                                       * thread - never write this to start
+                                       * one, only to deliberately halt it. */
+#define V3D_CT_CS_CTSUBS  (1u << 4)  /* R/W: writing 1 clears a "stopped at
+                                       * halt" condition and restarts the
+                                       * thread if CA != EA. Also clears
+                                       * CTERR as a side effect ("Cleared on
+                                       * restarting" per the PRM). */
+#define V3D_CT_CS_CTERR   (1u << 3)  /* R only: set when stopped with an
+                                       * error. */
 #define V3D_CLE_CT0EA     (V3D_CORE0 + 0x108u) /* active end address       */
 #define V3D_CLE_CT0CA     (V3D_CORE0 + 0x110u) /* current address (~ PC)   */
 #define V3D_CLE_CT0RA     (V3D_CORE0 + 0x118u) /* return address           */
