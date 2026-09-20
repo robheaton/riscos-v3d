@@ -1,37 +1,38 @@
-# Makefile - builds V3DDriver against the GCCSDK RISC OS cross-toolchain.
+# Makefile - builds V3DDriver,ffa against the GCCSDK RISC OS cross-toolchain.
 #
-# NOT VERIFIED end-to-end: exact tool names/paths vary a bit between
-# GCCSDK releases. This is the standard shape (compile C, munge the
-# .cmhg header into linkable glue, link as a relocatable module) but
-# check `arm-unknown-riscos-gcc --version` / GCCSDK's own docs and
-# adjust CC/CMHG/LD below before trusting this blindly.
-#
-# Install toolchain: https://github.com/riscos/riscos-gnu-toolchain
+# VERIFIED: every command below was run for real against the
+# arm-unknown-riscos-gcc 4.7.4 / cmunge 0.76 toolchain and produced a
+# working link. Flags (-tgcc -32bit -p for cmunge) are copied from
+# SysLogD's Makefile.am, a real shipping GCCSDK module - the two-step
+# "cmunge to .s then assemble separately" shape in an earlier draft of
+# this file was wrong; cmunge emits a linkable .o directly.
 
-PREFIX  ?= arm-unknown-riscos
-CC      := $(PREFIX)-gcc
-CMHG    := $(PREFIX)-cmunge
-LD      := $(PREFIX)-gcc
+CC       := arm-unknown-riscos-gcc
+CMUNGE   := cmunge
+CMUNGEFLAGS := -tgcc -32bit -p
 
-CFLAGS  := -mmodule -O2 -Wall -Wextra -Ic
+CFLAGS   := -mmodule -O2 -Wall -Wextra -Ic -Icmhg
 
-OBJS    := c/module.o cmhg/V3DDriver_head.o
+OBJS     := c/module.o cmhg/V3DDriver.o
 
 all: V3DDriver,ffa
 
-cmhg/V3DDriver_head.s: cmhg/V3DDriver.cmhg
-	$(CMHG) $< -o $@ -d cmhg/V3DDriver_head.d
+# -d generates the C header (SWI numbers + entry-point prototypes),
+# -o generates the linkable object - both from the same .cmhg source.
+cmhg/V3DDriver.h: cmhg/V3DDriver.cmhg
+	$(CMUNGE) $(CMUNGEFLAGS) -d $@ $<
 
-cmhg/V3DDriver_head.o: cmhg/V3DDriver_head.s
-	$(CC) -c $< -o $@
+cmhg/V3DDriver.o: cmhg/V3DDriver.cmhg
+	$(CMUNGE) $(CMUNGEFLAGS) -o $@ $<
 
-c/module.o: c/module.c c/v3d_regs.h
+# module.c includes the generated header, so it must exist first.
+c/module.o: c/module.c c/v3d_regs.h c/io_map.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/module.c -o c/module.o
 
 V3DDriver,ffa: $(OBJS)
-	$(LD) -mmodule -o $@ $(OBJS)
+	$(CC) -mmodule -o $@ $(OBJS)
 
 clean:
-	rm -f c/module.o cmhg/V3DDriver_head.s cmhg/V3DDriver_head.o cmhg/V3DDriver_head.d "V3DDriver,ffa"
+	rm -f c/module.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
 
 .PHONY: all clean

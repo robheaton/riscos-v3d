@@ -20,6 +20,7 @@
 #ifndef IO_MAP_H
 #define IO_MAP_H
 
+#include <stddef.h>
 #include "kernel.h"
 
 #define SWI_OS_Memory 0x68

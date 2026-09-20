@@ -17,10 +17,15 @@
  * mappings from this shared window.
  */
 
+#include <stddef.h>
 #include "kernel.h"
 #include "swis.h"
 #include "v3d_regs.h"
 #include "io_map.h"
+#include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
+                         * prototypes. Included so a signature mismatch
+                         * (like the module_final one below) is a compile
+                         * error, not a silent ABI bug. */
 
 static int g_powered_on = 0;
 
@@ -116,12 +121,13 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
     return NULL;
 }
 
-void module_final(int fatal, int podule_base, void *pw)
+_kernel_oserror *module_final(int fatal, int podule_base, void *pw)
 {
     (void) fatal;
     (void) podule_base;
     (void) pw;
     /* No persistent IO mapping is held, so nothing to release. */
+    return NULL;
 }
 
 /* ---------------------------------------------------------------- */
@@ -151,7 +157,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
         case SWI_V3D_ReadIdent:
         {
-            unsigned int ident[4];
+            unsigned int ident[4] = { 0 };
             _kernel_oserror *err = v3d_read_ident(ident, 4);
             if (err)
                 return err;
