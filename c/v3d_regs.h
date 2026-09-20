@@ -63,6 +63,20 @@
 #define V3D_CTL_L2TFLSTA  (V3D_CORE0 + 0x34u)
 #define V3D_CTL_L2TFLEND  (V3D_CORE0 + 0x38u)
 
+/* Interrupt status - diagnostic only, we don't use actual IRQs yet.
+ * Source: real Linux kernel drivers/gpu/drm/v3d/v3d_regs.h. Notably,
+ * V3D_INT_OUTOMEM: the Linux driver's own comment says the binner
+ * stalls waiting for this interrupt to be serviced (more tile-alloc
+ * memory fed to it via V3D_PTB_BPOA/BPOS) before it can make further
+ * progress - if BFC never advances, this bit is the first thing worth
+ * checking, since a bin stalled on OOM looks identical from BFC's
+ * perspective to one that never started at all. */
+#define V3D_CTL_INT_STS   (V3D_CORE0 + 0x50u)
+#define V3D_INT_FRDONE    (1u << 0)  /* render done */
+#define V3D_INT_FLDONE    (1u << 1)  /* bin (flush/load) done */
+#define V3D_INT_OUTOMEM   (1u << 2)  /* binner stalled, needs more tile-alloc memory */
+#define V3D_INT_GMPV      (1u << 5)  /* GPU memory protection violation */
+
 #define V3D_CLE_CT0QBA    (V3D_CORE0 + 0x160u) /* bin CL start address    */
 #define V3D_CLE_CT1QBA    (V3D_CORE0 + 0x164u) /* render CL start address */
 #define V3D_CLE_CT0QEA    (V3D_CORE0 + 0x168u) /* bin CL end address (writing

@@ -241,8 +241,37 @@ already has unused cache-policy bits (4 and 5), and setting both marks
 a page **NCNB - VMSA "Strongly-Ordered" memory**: every CPU write goes
 straight to physical RAM, nothing to flush, at a performance cost that
 doesn't matter for a handful of small buffers. Applied to every page
-`pmp_alloc` maps (`PAGE_FLAG_NONCACHEABLE` in `phys_buffer.c`). Not yet
-tested on hardware.
+`pmp_alloc` maps (`PAGE_FLAG_NONCACHEABLE` in `phys_buffer.c`).
+
+**Hardware result, attempt 5 (2026-09-20): identical error, fourth
+time in a row.** The memory-cannot-be-moved fix confirmed working;
+the BFC timeout itself was completely unmoved by cache coherency
+either. Four different, individually well-reasoned fixes in a row
+producing byte-for-byte the same failure means continuing to guess at
+fixes stopped being a good use of anyone's time - so this round adds
+**instrumentation instead of another guess**.
+
+The real Linux v3d driver (`v3d_irq.c`, fetched from kernel.org)
+signals bin completion via an interrupt, `V3D_INT_FLDONE`, and
+explicitly handles a separate `V3D_INT_OUTOMEM` condition where *the
+binner stalls waiting for more tile-allocation memory* until software
+feeds it more via `V3D_PTB_BPOA`/`BPOS` - a driver comment states this
+plainly: "we need to allocate some new memory and pass it to the
+binner so the current job can make progress." A binner stalled on OOM
+would look, from `V3D_CLE_BFC` alone, identical to one that never
+started - and we've never touched the OOM path at all. This is a real,
+plausible mechanism, not a guess dressed up as one, but it needs data
+to confirm, not another blind fix.
+
+Added `diagnose_timeout()` (`cl_clear.c`): on a BFC/RFC timeout, it now
+reads `V3D_CTL_INT_STS` (the interrupt status register - offset and
+bits transcribed from the real kernel header, not guessed) and decodes
+it into the returned error message, e.g. whether `OUTOMEM` is set, or
+`FLDONE`/`FRDONE` (meaning the hardware *did* think it finished, which
+would point at a BFC-reading bug instead), or nothing at all (meaning
+the bin genuinely never got anywhere). Whatever comes back next
+should tell us which of these it actually is, rather than us
+continuing to guess.
 
 ## Layout
 

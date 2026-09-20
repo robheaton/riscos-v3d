@@ -367,8 +367,59 @@ static void v3d_flush_caches(io_mapping_t *v3d)
  * version (500 * 10000 = 5,000,000), just no longer in one unbroken
  * hold.
  */
+static void append_str(char *dst, unsigned int *pos, const char *s)
+{
+    while (*s)
+        dst[(*pos)++] = *s++;
+}
+
+static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int i;
+    dst[(*pos)++] = '0';
+    dst[(*pos)++] = 'x';
+    for (i = 28; i >= 0; i -= 4)
+        dst[(*pos)++] = hex[(v >> i) & 0xFu];
+}
+
+/*
+ * On timeout, reads V3D_CTL_INT_STS and decodes it into out_err's
+ * message before returning it - a raw "timed out" is a dead end to
+ * debug further; this at least says whether the hardware itself
+ * reports anything (in particular V3D_INT_OUTOMEM - see the register's
+ * comment in v3d_regs.h for why a stalled-on-OOM binner would look
+ * identical to a never-started one from BFC's perspective alone).
+ */
+static void diagnose_timeout(_kernel_oserror *out_err, const char *what)
+{
+    io_mapping_t v3d;
+    unsigned int sts = 0;
+    unsigned int pos = 0;
+
+    if (!io_map(V3D_MB_BASE, &v3d))
+    {
+        sts = IO_WORD(v3d, V3D_CTL_INT_STS);
+        io_unmap(&v3d);
+    }
+
+    append_str(out_err->errmess, &pos, "V3DDriver: timed out waiting for ");
+    append_str(out_err->errmess, &pos, what);
+    append_str(out_err->errmess, &pos, ". V3D_CTL_INT_STS=");
+    append_hex32(out_err->errmess, &pos, sts);
+    append_str(out_err->errmess, &pos, " (");
+    if (sts & V3D_INT_OUTOMEM)  append_str(out_err->errmess, &pos, "OUTOMEM ");
+    if (sts & V3D_INT_FLDONE)   append_str(out_err->errmess, &pos, "FLDONE ");
+    if (sts & V3D_INT_FRDONE)   append_str(out_err->errmess, &pos, "FRDONE ");
+    if (sts & V3D_INT_GMPV)     append_str(out_err->errmess, &pos, "GMPV ");
+    if (sts == 0)               append_str(out_err->errmess, &pos, "none");
+    append_str(out_err->errmess, &pos, ")");
+    out_err->errmess[pos] = '\0';
+}
+
 static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
-                                          _kernel_oserror *timeout_err)
+                                          _kernel_oserror *timeout_err,
+                                          const char *what)
 {
     unsigned int outer;
 
@@ -392,6 +443,7 @@ static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
         io_unmap(&v3d);
     }
 
+    diagnose_timeout(timeout_err, what);
     return timeout_err;
 }
 
@@ -509,11 +561,9 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     io_unmap(&v3d);
 
     {
-        static _kernel_oserror err_bin_timeout = {
-            7, "V3DDriver: timed out waiting for V3D_CLE_BFC to "
-               "advance - binning did not complete"
-        };
-        err = v3d_poll_counter(V3D_CLE_BFC, last_bfc, &err_bin_timeout);
+        static _kernel_oserror err_bin_timeout = { 7, "" };
+        err = v3d_poll_counter(V3D_CLE_BFC, last_bfc, &err_bin_timeout,
+                                "V3D_CLE_BFC to advance - binning did not complete");
         if (err)
             return err;
     }
@@ -531,13 +581,10 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     io_unmap(&v3d);
 
     {
-        static _kernel_oserror err_render_timeout = {
-            8, "V3DDriver: timed out waiting for V3D_CLE_RFC to "
-               "advance - rendering did not complete (binning did "
-               "complete, so this is specifically an RCL/render-side "
-               "issue, not the BCL)"
-        };
-        err = v3d_poll_counter(V3D_CLE_RFC, last_rfc, &err_render_timeout);
+        static _kernel_oserror err_render_timeout = { 8, "" };
+        err = v3d_poll_counter(V3D_CLE_RFC, last_rfc, &err_render_timeout,
+                                "V3D_CLE_RFC to advance - rendering did not "
+                                "complete (binning did complete)");
         if (err)
             return err;
     }
