@@ -89,6 +89,23 @@
 #define V3D_CLE_CT0QTS    (V3D_CORE0 + 0x15Cu) /* bin tile-state addr      */
 #define V3D_CLE_CT0QMA    (V3D_CORE0 + 0x170u) /* bin tile-alloc mem addr  */
 #define V3D_CLE_CT0QMS    (V3D_CORE0 + 0x174u) /* bin tile-alloc mem size  */
+
+/*
+ * Diagnostic-only "thread state" registers for CLE thread 0 (bin).
+ * V3D_CLE_CT0CA in particular is effectively a program counter into
+ * the control list - the real Linux driver's own timeout-detection
+ * logic (v3d_cl_job_timedout, drivers/gpu/drm/v3d/v3d_sched.c) reads
+ * it and CT0RA specifically to tell "never started" apart from "stuck
+ * partway through", which is exactly the question we have.
+ */
+#define V3D_CLE_CT0CS     (V3D_CORE0 + 0x100u) /* control/status           */
+#define V3D_CLE_CT0EA     (V3D_CORE0 + 0x108u) /* active end address       */
+#define V3D_CLE_CT0CA     (V3D_CORE0 + 0x110u) /* current address (~ PC)   */
+#define V3D_CLE_CT0RA     (V3D_CORE0 + 0x118u) /* return address           */
+#define V3D_CLE_CT1CS     (V3D_CORE0 + 0x104u) /* same, thread 1 (render)  */
+#define V3D_CLE_CT1EA     (V3D_CORE0 + 0x10Cu)
+#define V3D_CLE_CT1CA     (V3D_CORE0 + 0x114u)
+#define V3D_CLE_CT1RA     (V3D_CORE0 + 0x11Cu)
 #define V3D_CLE_CT0QTS_ENABLE (1u << 1)
 
 #define V3D_L2TCACTL_L2TFLS      (1u << 0)

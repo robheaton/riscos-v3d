@@ -367,9 +367,19 @@ static void v3d_flush_caches(io_mapping_t *v3d)
  * version (500 * 10000 = 5,000,000), just no longer in one unbroken
  * hold.
  */
+/* Must match _kernel_oserror.errmess's declared size (kernel.h: char
+ * errmess[252]). Hard-capped here rather than just relying on the
+ * call sites keeping the message short - a first version of this
+ * diagnostic added enough fields that its worst-case length (291
+ * bytes, computed after the fact) would have overflowed a 252-byte
+ * buffer in a kernel module. That's not a cosmetic bug. Every append
+ * below is bounds-checked against this regardless of how the message
+ * is edited in future. */
+#define ERRMESS_CAPACITY 252u
+
 static void append_str(char *dst, unsigned int *pos, const char *s)
 {
-    while (*s)
+    while (*s && *pos < ERRMESS_CAPACITY - 1u)
         dst[(*pos)++] = *s++;
 }
 
@@ -377,6 +387,8 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
 {
     static const char hex[] = "0123456789ABCDEF";
     int i;
+    if (*pos + 10u >= ERRMESS_CAPACITY)
+        return; /* not enough room left for "0x" + 8 hex digits */
     dst[(*pos)++] = '0';
     dst[(*pos)++] = 'x';
     for (i = 28; i >= 0; i -= 4)
@@ -391,21 +403,41 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
  * comment in v3d_regs.h for why a stalled-on-OOM binner would look
  * identical to a never-started one from BFC's perspective alone).
  */
-static void diagnose_timeout(_kernel_oserror *out_err, const char *what)
+static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
+                              int is_bin, unsigned int qba, unsigned int qea)
 {
     io_mapping_t v3d;
-    unsigned int sts = 0;
+    unsigned int sts = 0, cs = 0, ca = 0, ea = 0, ra = 0;
+    unsigned int rb_qba = 0, rb_qea = 0;
     unsigned int pos = 0;
 
     if (!io_map(V3D_MB_BASE, &v3d))
     {
         sts = IO_WORD(v3d, V3D_CTL_INT_STS);
+        if (is_bin)
+        {
+            cs = IO_WORD(v3d, V3D_CLE_CT0CS);
+            ca = IO_WORD(v3d, V3D_CLE_CT0CA);
+            ea = IO_WORD(v3d, V3D_CLE_CT0EA);
+            ra = IO_WORD(v3d, V3D_CLE_CT0RA);
+            rb_qba = IO_WORD(v3d, V3D_CLE_CT0QBA);
+            rb_qea = IO_WORD(v3d, V3D_CLE_CT0QEA);
+        }
+        else
+        {
+            cs = IO_WORD(v3d, V3D_CLE_CT1CS);
+            ca = IO_WORD(v3d, V3D_CLE_CT1CA);
+            ea = IO_WORD(v3d, V3D_CLE_CT1EA);
+            ra = IO_WORD(v3d, V3D_CLE_CT1RA);
+            rb_qba = IO_WORD(v3d, V3D_CLE_CT1QBA);
+            rb_qea = IO_WORD(v3d, V3D_CLE_CT1QEA);
+        }
         io_unmap(&v3d);
     }
 
     append_str(out_err->errmess, &pos, "V3DDriver: timed out waiting for ");
     append_str(out_err->errmess, &pos, what);
-    append_str(out_err->errmess, &pos, ". V3D_CTL_INT_STS=");
+    append_str(out_err->errmess, &pos, ". INT_STS=");
     append_hex32(out_err->errmess, &pos, sts);
     append_str(out_err->errmess, &pos, " (");
     if (sts & V3D_INT_OUTOMEM)  append_str(out_err->errmess, &pos, "OUTOMEM ");
@@ -413,13 +445,29 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what)
     if (sts & V3D_INT_FRDONE)   append_str(out_err->errmess, &pos, "FRDONE ");
     if (sts & V3D_INT_GMPV)     append_str(out_err->errmess, &pos, "GMPV ");
     if (sts == 0)               append_str(out_err->errmess, &pos, "none");
-    append_str(out_err->errmess, &pos, ")");
+    append_str(out_err->errmess, &pos, ") CS=");
+    append_hex32(out_err->errmess, &pos, cs);
+    append_str(out_err->errmess, &pos, " CA=");
+    append_hex32(out_err->errmess, &pos, ca);
+    append_str(out_err->errmess, &pos, " EA=");
+    append_hex32(out_err->errmess, &pos, ea);
+    append_str(out_err->errmess, &pos, " RA=");
+    append_hex32(out_err->errmess, &pos, ra);
+    append_str(out_err->errmess, &pos, " wQBA=");
+    append_hex32(out_err->errmess, &pos, qba);
+    append_str(out_err->errmess, &pos, " rQBA=");
+    append_hex32(out_err->errmess, &pos, rb_qba);
+    append_str(out_err->errmess, &pos, " wQEA=");
+    append_hex32(out_err->errmess, &pos, qea);
+    append_str(out_err->errmess, &pos, " rQEA=");
+    append_hex32(out_err->errmess, &pos, rb_qea);
     out_err->errmess[pos] = '\0';
 }
 
 static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
                                           _kernel_oserror *timeout_err,
-                                          const char *what)
+                                          const char *what, int is_bin,
+                                          unsigned int qba, unsigned int qea)
 {
     unsigned int outer;
 
@@ -443,7 +491,7 @@ static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
         io_unmap(&v3d);
     }
 
-    diagnose_timeout(timeout_err, what);
+    diagnose_timeout(timeout_err, what, is_bin, qba, qea);
     return timeout_err;
 }
 
@@ -563,7 +611,7 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     {
         static _kernel_oserror err_bin_timeout = { 7, "" };
         err = v3d_poll_counter(V3D_CLE_BFC, last_bfc, &err_bin_timeout,
-                                "V3D_CLE_BFC to advance - binning did not complete");
+                                "BFC (binning)", 1, bcl_start, bcl_end);
         if (err)
             return err;
     }
@@ -583,8 +631,7 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     {
         static _kernel_oserror err_render_timeout = { 8, "" };
         err = v3d_poll_counter(V3D_CLE_RFC, last_rfc, &err_render_timeout,
-                                "V3D_CLE_RFC to advance - rendering did not "
-                                "complete (binning did complete)");
+                                "RFC (render)", 0, rcl_start, rcl_end);
         if (err)
             return err;
     }

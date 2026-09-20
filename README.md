@@ -273,6 +273,39 @@ the bin genuinely never got anywhere). Whatever comes back next
 should tell us which of these it actually is, rather than us
 continuing to guess.
 
+**Hardware result, attempt 6 (2026-09-20): `INT_STS=0x00000000 (none)`.**
+Real data, and it ruled out three things at once: not OOM (`OUTOMEM`
+clear), not a BFC-reading bug (`FLDONE` also clear - the hardware
+itself doesn't think it finished either), not a GMP violation. Nothing
+happened at all, which points at the submission itself, not anything
+downstream of it.
+
+Went looking at the real driver's actual job-submission code next
+(`v3d_sched.c`, `v3d_bin_job_run()`) rather than guessing again - it
+writes `V3D_CLE_CT0QMA`/`QMS`/`QTS`/`QBA`/`QEA` in exactly the order
+this project already does, byte for byte, with the same "writing QEA
+starts the job" comment. So the *sequence* isn't the gap. What the
+driver's own timeout handler (`v3d_cl_job_timedout`) checks instead is
+`V3D_CLE_CTNCA`/`CTNRA` - a "current address"/"return address" pair
+that acts as a program counter into the control list, specifically to
+tell "never started" apart from "stuck partway through".
+
+Added those registers (`V3D_CLE_CT0CS/EA/CA/RA` and their thread-1
+equivalents, offsets from the real kernel header) to `diagnose_timeout()`,
+plus a readback of what we actually wrote to `QBA`/`QEA` - if the
+readback doesn't match what we wrote, the write itself never reached
+the hardware, which would be a different bug entirely from anything
+considered so far.
+
+While adding these fields, caught a real bug in the diagnostic code
+itself before it shipped: the worst-case message length came to 291
+bytes against `_kernel_oserror.errmess`'s 252-byte buffer - a genuine
+overflow risk in a kernel module, not cosmetic. Shortened the message
+and added hard bounds-checking to `append_str`/`append_hex32`
+regardless (252-byte cap enforced in code, not just by keeping the
+call sites short), so a future edit that grows the message again fails
+safe instead of corrupting memory.
+
 ## Layout
 
 ```
