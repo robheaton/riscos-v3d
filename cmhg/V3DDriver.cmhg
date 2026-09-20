@@ -1,15 +1,23 @@
 ; V3DDriver.cmhg - CMHG module header for the M0/M1 V3D driver sketch.
 ;
-; SWI chunk 0x50EC0 below is a PLACEHOLDER. Before this is ever built into
-; something shared with anyone else, request a real chunk allocation from
-; ROOL (see riscosopen.org SWI number registry) to avoid clashing with an
-; existing module - do not ship against a made-up chunk number.
+; SWI chunk number, per ROOL's documented allocation rules
+; (https://www.riscosopen.org/content/allocate,
+;  https://www.riscosopen.org/wiki/documentation/pages/Introduction+To+SWIs):
+;   bits 18-19 of the SWI number select the "SWI group" - 00=OS,
+;   01=OS modules, 10=third-party (officially allocated), 11=user
+;   applications (free for private/development use, author's own
+;   responsibility to avoid clashes on their own machine).
+; 0xC0040 = group 0b11 (user applications, bits 18-19) | chunk number 1
+; (bits 6-16). This replaces an earlier placeholder (0x50EC0) that sat
+; in the "OS modules" group by mistake - safe for private dev use, but
+; NOT for release: before this is shared with anyone else, request a
+; real allocation via !Allocate to allocate@riscosopen.org.
 
 title-string:            V3DDriver
 help-string:              V3DDriver 0.01 (M0/M1 sketch - not for release)
 initialisation-code:      module_init
 finalisation-code:        module_final
-swi-chunk-base-number:    0x50EC0
+swi-chunk-base-number:    0xC0040
 swi-handler-code:         v3d_swi_handler
 swi-decoding-table:       V3D 2
  PowerOn

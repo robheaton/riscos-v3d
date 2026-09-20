@@ -73,4 +73,20 @@
 #define V3D_L2TCACTL_L2TFLS      (1u << 0)
 #define V3D_L2TCACTL_FLM_FLUSH   (0u << 2) /* field, bits[3:2] = 0 = flush */
 
+/*
+ * Megabyte-aligned windows for OS_Memory 14 (see map.h). RISC OS only
+ * ever has ONE of these mapped at a time - each is a separate region
+ * that must be mapped, used, and released before the next.
+ *
+ *   MBOX_MB_BASE : covers VIDEOCORE_MBOX                      (0xFE000000)
+ *   PM_MB_BASE   : covers PM_GRAFX                            (0xFE100000)
+ *   V3D_MB_BASE  : covers V3D_HUB, V3D_CORE0 *and* the ASB     (0xFEC00000)
+ *                  registers - confirmed all three sit inside the same
+ *                  megabyte (0xFEC00000-0xFECFFFFF), so one mapping
+ *                  serves the whole power-on + ident-read sequence.
+ */
+#define MBOX_MB_BASE   (VIDEOCORE_MBOX  & 0xFFF00000u)
+#define PM_MB_BASE     (PM_BASE         & 0xFFF00000u)
+#define V3D_MB_BASE    (V3D_HUB         & 0xFFF00000u)
+
 #endif /* V3D_REGS_H */

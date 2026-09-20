@@ -23,16 +23,29 @@ driver as a dependency, RISC OS included.
   32-bit-reachable mapping RISC OS already relies on elsewhere on this
   board (GPIO/UART/mailbox), so no address translation should be needed.
 
-**Needs verification against ROOL's actual source before relying on it:**
-- `HAL_IOAddress()` as the mechanism to turn a device physical address
-  into a usable logical pointer inside a module. This is the standard
-  pattern on RISC OS HAL ports, but the exact signature/behaviour should
-  be confirmed against an existing hardware module in ROOL's tree (e.g.
-  grep for `HAL_IOAddress` under an existing Pi-specific driver) rather
-  than trusted blindly from this sketch.
-- SWI chunk number `0x50EC0` in `cmhg/V3DDriver.cmhg` is a placeholder —
-  request a real allocation from ROOL before this touches any machine
-  that might run other modules using a colliding chunk.
+**Now verified against ROOL's own documentation (previously flagged as guesses):**
+- IO mapping (`c/io_map.h`) uses `OS_Memory 14`/`15`, the documented
+  public SWI for temporarily mapping a megabyte of device physical
+  memory — see
+  [OS_Memory 14](https://www.riscosopen.org/wiki/documentation/show/OS_Memory%2014) /
+  [15](https://www.riscosopen.org/wiki/documentation/show/OS_Memory%2015)
+  on the ROOL wiki. This replaced an earlier `HAL_IOAddress()` guess,
+  which was the wrong mechanism. Important consequence found in the
+  docs: RISC OS keeps only **one** such mapping alive system-wide, and
+  explicitly warns against mapping once at module-init and holding the
+  pointer — every access now maps, reads/writes, and releases
+  (`io_unmap`) before returning, instead of caching pointers in
+  module-global state.
+- SWI chunk number is now `0xC0040`, placed in the "user applications"
+  group (bits 18-19 = `11`) per
+  [ROOL's resource allocation rules](https://www.riscosopen.org/content/allocate)
+  and the [SWI number bit layout](https://www.riscosopen.org/wiki/documentation/pages/Introduction+To+SWIs).
+  The original placeholder (`0x50EC0`) was actually sitting in the
+  reserved "OS modules" group by mistake — safe for private/dev use now,
+  but still **not** an official allocation: request one via `!Allocate`
+  to `allocate@riscosopen.org` before this is ever shared or released.
+
+**Still needs verification:**
 - The Makefile's exact GCCSDK tool invocations (`cmunge` name/flags) —
   shape is standard, but confirm against whatever GCCSDK build is
   actually installed.
@@ -43,14 +56,15 @@ driver as a dependency, RISC OS included.
 riscos-v3d/
   cmhg/V3DDriver.cmhg   module header: title, SWI chunk, entry points
   c/v3d_regs.h          register offsets (see attribution above)
+  c/io_map.h            OS_Memory 14/15 mapping helper (see above)
   c/module.c            module_init / module_final / SWI handler
   Makefile              GCCSDK build (needs local toolchain confirmation)
 ```
 
 ## SWIs exposed
 
-- `V3D_PowerOn` (0x50EC0) — deassert V3D reset, release ASB gates.
-- `V3D_ReadIdent` (0x50EC1) — returns V3D_HUB_IDENT0/1/2 and
+- `V3D_PowerOn` (0xC0040) — deassert V3D reset, release ASB gates.
+- `V3D_ReadIdent` (0xC0041) — returns V3D_HUB_IDENT0/1/2 and
   V3D_CTL_IDENT0 in R0-R3. A correct read confirms the GPU is powered
   and responding — Mesa's `v3d_get_device_info()` decodes these same
   fields (core count, QPU count, VPM size, HW version) if we want to
