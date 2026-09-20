@@ -90,21 +90,43 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
  * reference (pm.cpp) - direct PM_GRAFX reset deassert + ASB master/slave
  * gate release. No firmware mailbox call required for this step.
+ *
+ * DIVERGES FROM THE REFERENCE HERE, deliberately: the reference only
+ * ever sets PM_V3DRSTN (deassert reset), never clears it, because it
+ * runs once on a chip fresh from power-on reset, where the bit is
+ * already guaranteed clear - their single "set" call is the real,
+ * only reset-deassertion transition that ever happens. We call
+ * V3D_PowerOn repeatedly across a whole debugging session without an
+ * intervening reboot, so after the first call the bit is already set
+ * and every subsequent call was a complete no-op - including, we
+ * discovered via CT0CA/CT0RA reading a stale address from several
+ * test runs ago, doing nothing to un-wedge a CLE thread that got
+ * stuck on an early malformed submission. Explicitly asserting reset
+ * first, then deasserting it, forces a genuine pulse every call.
  */
 static _kernel_oserror *v3d_power_on(void)
 {
     io_mapping_t pm, v3d;
     _kernel_oserror *err;
     unsigned int val;
-    unsigned int spin;
+    volatile unsigned int spin; /* volatile: the reset-pulse delay loop
+                                  * below has no other side effect, and
+                                  * -O2 is entitled to delete a plain
+                                  * empty counting loop entirely */
 
-    /* --- PM_GRAFX: deassert V3D reset --- */
+    /* --- PM_GRAFX: assert then deassert V3D reset (real pulse) --- */
     err = io_map(PM_MB_BASE, &pm);
     if (err)
         return err;
 
     val = IO_WORD(pm, PM_GRAFX);
-    IO_WORD(pm, PM_GRAFX) = PM_PASSWORD | val | PM_V3DRSTN;
+    IO_WORD(pm, PM_GRAFX) = PM_PASSWORD | (val & ~PM_V3DRSTN); /* assert reset */
+
+    for (spin = 0; spin < 100000u; spin++)
+        ; /* crude delay - no documented minimum pulse width to go on */
+
+    val = IO_WORD(pm, PM_GRAFX);
+    IO_WORD(pm, PM_GRAFX) = PM_PASSWORD | val | PM_V3DRSTN; /* deassert reset */
 
     io_unmap(&pm);
 

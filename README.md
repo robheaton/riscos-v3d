@@ -306,6 +306,43 @@ regardless (252-byte cap enforced in code, not just by keeping the
 call sites short), so a future edit that grows the message again fails
 safe instead of corrupting memory.
 
+**Hardware result, attempt 7 (2026-09-20) - the actual finding:**
+`CA=0x0304A000` while our actual submission was at `wQBA=0x03089000`/
+`rQBA=0x03089000` (write and readback matching, so the write itself
+was never in question). `0x0304A000` is suspiciously close to
+`0x03049000` - the physical address `V3D_TestBuffer` reported *several
+test attempts ago, near the start of this debugging session*. The
+CLE's "current position in the control list" register was pointing at
+a stale address from a job submitted long before the current one, not
+our actual submission - meaning **the bin thread has been wedged since
+early in this session**, most likely from the very first, genuinely
+malformed control list (before the BCL state-setup block existed), and
+every fix since then was tested against a thread that was never
+listening in the first place. That explains why four individually
+well-reasoned, unrelated fixes all produced byte-for-byte the same
+result: none of them addressed *un-wedging it*.
+
+Root cause of why nothing since has un-wedged it: `v3d_power_on()` only
+ever set `PM_GRAFX`'s reset-deassert bit, copied faithfully from the
+bare-metal reference - which is correct there, since it runs once on a
+chip fresh from power-on reset where the bit starts clear, so their one
+"set" call is the only real reset transition that ever happens for
+them. This project calls `V3D_PowerOn` repeatedly across a whole
+debugging session with no reboot in between, so after the first call
+the bit was already set and every subsequent call was a complete
+no-op - it never actually reset anything, wedged CLE included. Fixed:
+`v3d_power_on()` now explicitly clears the bit (asserts reset) before
+setting it again (deasserts), forcing a genuine pulse on every call,
+with a volatile-counted delay loop between the two (checked in the
+actual disassembly that `-O2` didn't eliminate it, since a delay loop
+with no other side effect is exactly the kind of thing an optimiser is
+entitled to remove).
+
+Not yet re-tested on hardware. Given how it was discovered, worth
+trying an actual power cycle of the CM4 too if this alone doesn't do
+it - software reset pulses don't always reach everything a hardware
+reset does.
+
 ## Layout
 
 ```
