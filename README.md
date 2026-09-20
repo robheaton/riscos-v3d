@@ -192,10 +192,26 @@ back the reference's full always-present viewport/clip/raster
 state-setup block (`ClipWindow` through `VcmCacheSize`, ~20 packets,
 values copied verbatim from the reference since they're otherwise
 geometry-related and inert without any primitives) between
-`OP_START_TILE_BINNING` and `OP_FLUSH`. A bare `TileBinningModeCfg` +
-`OP_START_TILE_BINNING` + `OP_FLUSH` was apparently not enough for the
-CLE to reach completion on its own - not yet confirmed that the full
-block is. Not yet re-tested on hardware.
+`OP_START_TILE_BINNING` and `OP_FLUSH`.
+
+**Hardware result, attempt 3 (2026-09-20): identical error.** Ruled out
+the state-setup block as the cause. Reconsidered something more
+fundamental instead of guessing at more BCL content: the completion
+poll held a single `OS_Memory 14` mapping through up to 5,000,000 loop
+iterations. The PRM is explicit that this is a single, system-wide
+*shared* mapping window, and warns against holding it for anything
+long-running - if anything else in the system (an interrupt handler,
+another driver's own temporary mapping) used the same mechanism during
+that busy-wait, our window would be silently repointed at a *different*
+device's registers, and the loop would spin against the wrong memory
+until timeout regardless of what the GPU actually did. M0/M1's
+single-word reads never hit this (in and out in microseconds); this
+multi-million-iteration spin is a different animal. Rewrote the poll
+(`v3d_poll_counter` in `cl_clear.c`) to remap in short bursts (10,000
+reads at a time, 500 bursts, same total ceiling) instead of one
+unbroken hold - not yet confirmed this was the actual cause, only that
+the old pattern violated the documented contract regardless. Not yet
+re-tested on hardware.
 
 ## Layout
 

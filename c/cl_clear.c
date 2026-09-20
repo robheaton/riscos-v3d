@@ -351,6 +351,50 @@ static void v3d_flush_caches(io_mapping_t *v3d)
     IO_WORD(*v3d, V3D_CTL_SLCACTL) = 0xFFFFFFFFu;
 }
 
+/*
+ * Waits for a CLE frame counter (V3D_CLE_BFC/RFC) to advance past
+ * `initial`, polling in short bursts rather than holding one long-lived
+ * OS_Memory 14 mapping. That matters here, not just as a style choice:
+ * the PRM is explicit that OS_Memory 14 hands out a single, system-wide
+ * shared mapping window, and warns that holding it across a long
+ * operation risks an interrupt handler or another driver's own
+ * temporary mapping silently stealing it from under us - after which
+ * every further read in this loop would be looking at some other
+ * device's registers, not V3D's, and would spin until the outer
+ * timeout regardless of what the GPU actually did. Re-mapping fresh
+ * every `burst` iterations keeps any single hold on the shared window
+ * short. Same total iteration ceiling as the original single-mapping
+ * version (500 * 10000 = 5,000,000), just no longer in one unbroken
+ * hold.
+ */
+static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
+                                          _kernel_oserror *timeout_err)
+{
+    unsigned int outer;
+
+    for (outer = 0; outer < 500u; outer++)
+    {
+        io_mapping_t v3d;
+        unsigned int burst;
+        _kernel_oserror *err = io_map(V3D_MB_BASE, &v3d);
+        if (err)
+            return err;
+
+        for (burst = 0; burst < 10000u; burst++)
+        {
+            if ((IO_WORD(v3d, reg) & 0xFFu) != initial)
+            {
+                io_unmap(&v3d);
+                return NULL;
+            }
+        }
+
+        io_unmap(&v3d);
+    }
+
+    return timeout_err;
+}
+
 _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
                                  unsigned int clear_color_rgba,
                                  unsigned int *render_target_phys_out,
@@ -362,7 +406,7 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     cl_buf_t bcl, rcl;
     unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
     io_mapping_t v3d;
-    unsigned int last_bfc, last_rfc, spin;
+    unsigned int last_bfc, last_rfc;
     unsigned int page = base_page;
 
     err = pmp_alloc(pmp, page, CL_PAGE_COUNT, &cl_phys, &cl_log);
@@ -448,9 +492,8 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     emit_end_of_rendering(&rcl);
     rcl_end = cl_paddr(&rcl);
 
-    /* --- submit + wait, bounded (not the reference's infinite loop -
-     * a module hanging the desktop on a GPU stall is worse than an
-     * honest timeout error) --- */
+    /* --- kick off binning (short-held mapping - see v3d_poll_counter's
+     * comment for why long-held ones are dangerous) --- */
     err = io_map(V3D_MB_BASE, &v3d);
     if (err) return err;
 
@@ -463,20 +506,21 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
     IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end; /* kicks off binning */
 
-    for (spin = 0; (IO_WORD(v3d, V3D_CLE_BFC) & 0xFFu) == last_bfc; spin++)
+    io_unmap(&v3d);
+
     {
-        if (spin > 5000000u)
-        {
-            static _kernel_oserror err_bin_timeout = {
-                7, "V3DDriver: timed out waiting for V3D_CLE_BFC to "
-                   "advance - binning did not complete (see the BCL "
-                   "risk note in cl_clear.c: it may need viewport/"
-                   "shader-state setup even with zero primitives)"
-            };
-            io_unmap(&v3d);
-            return &err_bin_timeout;
-        }
+        static _kernel_oserror err_bin_timeout = {
+            7, "V3DDriver: timed out waiting for V3D_CLE_BFC to "
+               "advance - binning did not complete"
+        };
+        err = v3d_poll_counter(V3D_CLE_BFC, last_bfc, &err_bin_timeout);
+        if (err)
+            return err;
     }
+
+    /* --- kick off rendering --- */
+    err = io_map(V3D_MB_BASE, &v3d);
+    if (err) return err;
 
     v3d_flush_caches(&v3d);
     last_rfc = IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu;
@@ -484,22 +528,19 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering */
 
-    for (spin = 0; (IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu) == last_rfc; spin++)
-    {
-        if (spin > 5000000u)
-        {
-            static _kernel_oserror err_render_timeout = {
-                8, "V3DDriver: timed out waiting for V3D_CLE_RFC to "
-                   "advance - rendering did not complete (binning did "
-                   "complete, so this is specifically an RCL/render-side "
-                   "issue, not the BCL)"
-            };
-            io_unmap(&v3d);
-            return &err_render_timeout;
-        }
-    }
-
     io_unmap(&v3d);
+
+    {
+        static _kernel_oserror err_render_timeout = {
+            8, "V3DDriver: timed out waiting for V3D_CLE_RFC to "
+               "advance - rendering did not complete (binning did "
+               "complete, so this is specifically an RCL/render-side "
+               "issue, not the BCL)"
+        };
+        err = v3d_poll_counter(V3D_CLE_RFC, last_rfc, &err_render_timeout);
+        if (err)
+            return err;
+    }
 
     *render_target_phys_out = render_phys;
     *readback_pixel_out = *(volatile unsigned int *) render_log;
