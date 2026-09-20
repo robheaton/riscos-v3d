@@ -118,8 +118,12 @@ static _kernel_oserror *v3d_power_on(void)
     {
         if (spin > 1000000)
         {
+            static _kernel_oserror err_asb_m = {
+                2, "V3DDriver: timed out waiting for ASB master gate ACK "
+                   "to clear during V3D power-on"
+            };
             io_unmap(&v3d);
-            return _kernel_last_oserror(); /* TODO: real error block, timeout */
+            return &err_asb_m;
         }
     }
 
@@ -128,8 +132,12 @@ static _kernel_oserror *v3d_power_on(void)
     {
         if (spin > 1000000)
         {
+            static _kernel_oserror err_asb_s = {
+                3, "V3DDriver: timed out waiting for ASB slave gate ACK "
+                   "to clear during V3D power-on"
+            };
             io_unmap(&v3d);
-            return _kernel_last_oserror(); /* TODO: real error block, timeout */
+            return &err_asb_s;
         }
     }
 
@@ -145,7 +153,12 @@ static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
     _kernel_oserror *err;
 
     if (!g_powered_on)
-        return _kernel_last_oserror(); /* TODO: "V3D not powered on" error */
+    {
+        static _kernel_oserror err_not_on = {
+            4, "V3DDriver: V3D_ReadIdent called before V3D_PowerOn"
+        };
+        return &err_not_on;
+    }
 
     /* V3D_HUB_IDENT0/1/2 and V3D_CTL_IDENT0 all sit in the same
      * megabyte window (V3D_MB_BASE) - one mapping covers all four. */
@@ -246,7 +259,12 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             _kernel_oserror *err;
 
             if (!g_powered_on)
-                return _kernel_last_oserror(); /* TODO: "V3D not powered on" error */
+            {
+                static _kernel_oserror err_not_on = {
+                    5, "V3DDriver: V3D_ClearTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
 
             err = ensure_pmp();
             if (err)
@@ -263,6 +281,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
         }
 
         default:
-            return _kernel_last_oserror();
+            /* error_BAD_SWI is cmunge's own generated macro (see
+             * V3DDriver.h) for exactly this case - the documented
+             * correct return value for a SWI number out of range for
+             * this module, not a made-up error. */
+            return error_BAD_SWI;
     }
 }

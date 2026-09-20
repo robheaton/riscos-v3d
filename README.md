@@ -170,6 +170,24 @@ on a GPU stall would be a worse failure mode than an honest error.
 render target's physical address (R0) and the read-back first pixel
 (R1) out. Requires `V3D_PowerOn` first.
 
+**Hardware result (2026-09-20): `Bad alignment request`.** Traced this
+down rather than taking it at face value - it turned out to be a red
+herring pointing at a bug in *this project's own error handling*, not
+at the real failure. Every `TODO: real error` placeholder throughout
+the code (timeouts, "not powered on", bad page counts) was returning
+`_kernel_last_oserror()` - which doesn't create an error, it reads back
+whatever error happened to be cached *anywhere* in the system last. A
+[ROOL bug thread](https://www.riscosopen.org/forum/forums/4/topics/17507)
+shows this exact message ("Bad alignment request", error 279) turning
+up in completely unrelated contexts for the same reason. So the actual
+failure is still unknown - only that it was misreported. Replaced every
+placeholder with a real, distinct, descriptive `_kernel_oserror` (see
+`module.c`, `phys_buffer.c`, `cl_clear.c`), and fixed the SWI handler's
+default case to return cmunge's own `error_BAD_SWI` instead of the same
+bad pattern. Re-testing now should report which specific step actually
+failed - most likely the BCL/BFC timeout given the known risk noted
+above, but no longer a guess.
+
 ## Layout
 
 ```

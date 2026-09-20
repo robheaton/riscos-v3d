@@ -301,8 +301,14 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     {
         if (spin > 5000000u)
         {
+            static _kernel_oserror err_bin_timeout = {
+                7, "V3DDriver: timed out waiting for V3D_CLE_BFC to "
+                   "advance - binning did not complete (see the BCL "
+                   "risk note in cl_clear.c: it may need viewport/"
+                   "shader-state setup even with zero primitives)"
+            };
             io_unmap(&v3d);
-            return _kernel_last_oserror(); /* TODO: real "bin timeout" error */
+            return &err_bin_timeout;
         }
     }
 
@@ -316,8 +322,14 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     {
         if (spin > 5000000u)
         {
+            static _kernel_oserror err_render_timeout = {
+                8, "V3DDriver: timed out waiting for V3D_CLE_RFC to "
+                   "advance - rendering did not complete (binning did "
+                   "complete, so this is specifically an RCL/render-side "
+                   "issue, not the BCL)"
+            };
             io_unmap(&v3d);
-            return _kernel_last_oserror(); /* TODO: real "render timeout" error */
+            return &err_render_timeout;
         }
     }
 

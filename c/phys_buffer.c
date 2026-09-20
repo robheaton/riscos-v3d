@@ -80,7 +80,12 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
     unsigned int i;
 
     if (num_pages == 0 || num_pages > MAX_PAGES_PER_CALL)
-        return _kernel_last_oserror(); /* TODO: real "bad page count" error */
+    {
+        static _kernel_oserror err_bad_count = {
+            6, "V3DDriver: pmp_alloc requested with an invalid page count"
+        };
+        return &err_bad_count;
+    }
 
     /* --- find physically-contiguous pages (OS_Memory 12) --- */
     regs.r[0] = Mem_RecommendPage;
