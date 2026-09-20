@@ -23,6 +23,7 @@
 #include "v3d_regs.h"
 #include "io_map.h"
 #include "phys_buffer.h"
+#include "cl_clear.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -32,10 +33,30 @@ static int g_powered_on = 0;
 
 /* M2 in progress: physical buffer infrastructure for control lists.
  * Created lazily on first use rather than in module_init, so a module
- * load with no buffer use touches no PMP state at all. */
+ * load with no buffer use touches no PMP state at all. Shared by every
+ * SWI that needs a physical buffer - each picks its own non-overlapping
+ * page range within it (see the page_index comments at each call site). */
 static pmp_area_t g_pmp;
 static int g_pmp_created = 0;
 
+static _kernel_oserror *ensure_pmp(void)
+{
+    _kernel_oserror *err;
+
+    if (g_pmp_created)
+        return NULL;
+
+    /* 64 pages (256KB) covers V3D_TestBuffer's 1 page plus
+     * v3d_clear_test's 9 pages with plenty of headroom to grow. */
+    err = pmp_create("V3DBuf", 1024u * 1024u, 64, &g_pmp);
+    if (err)
+        return err;
+
+    g_pmp_created = 1;
+    return NULL;
+}
+
+/* Uses PMP page 0. */
 static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
                                          unsigned int *readback_out,
                                          unsigned int *logical_addr_out)
@@ -45,13 +66,9 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
     unsigned int phys_addr;
     volatile unsigned int *word;
 
-    if (!g_pmp_created)
-    {
-        err = pmp_create("V3DBuf", 1024u * 1024u, 16, &g_pmp);
-        if (err)
-            return err;
-        g_pmp_created = 1;
-    }
+    err = ensure_pmp();
+    if (err)
+        return err;
 
     err = pmp_alloc(&g_pmp, 0, 1, &phys_addr, &log_ptr);
     if (err)
@@ -65,6 +82,9 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
     *logical_addr_out = (unsigned int) log_ptr;
     return NULL;
 }
+
+/* Uses PMP pages 16-24 (9 pages) - well clear of V3D_TestBuffer's page 0. */
+#define CLEAR_TEST_BASE_PAGE 16u
 
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
@@ -176,6 +196,7 @@ enum
     SWI_V3D_PowerOn = 0,
     SWI_V3D_ReadIdent = 1,
     SWI_V3D_TestBuffer = 2,
+    SWI_V3D_ClearTest = 3,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -216,6 +237,28 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[0] = phys_addr;
             r->r[1] = readback;
             r->r[2] = logical_addr;
+            return NULL;
+        }
+
+        case SWI_V3D_ClearTest:
+        {
+            unsigned int phys_addr, readback;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+                return _kernel_last_oserror(); /* TODO: "V3D not powered on" error */
+
+            err = ensure_pmp();
+            if (err)
+                return err;
+
+            err = v3d_clear_test(&g_pmp, CLEAR_TEST_BASE_PAGE, r->r[0],
+                                  &phys_addr, &readback);
+            if (err)
+                return err;
+
+            r->r[0] = phys_addr;
+            r->r[1] = readback;
             return NULL;
         }
 

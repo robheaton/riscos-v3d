@@ -65,10 +65,17 @@
 
 #define V3D_CLE_CT0QBA    (V3D_CORE0 + 0x160u) /* bin CL start address    */
 #define V3D_CLE_CT1QBA    (V3D_CORE0 + 0x164u) /* render CL start address */
-#define V3D_CLE_CT0QEA    (V3D_CORE0 + 0x168u) /* bin CL end address      */
-#define V3D_CLE_CT1QEA    (V3D_CORE0 + 0x16Cu) /* render CL end address   */
+#define V3D_CLE_CT0QEA    (V3D_CORE0 + 0x168u) /* bin CL end address (writing
+                                                  * this register is what
+                                                  * kicks off binning)     */
+#define V3D_CLE_CT1QEA    (V3D_CORE0 + 0x16Cu) /* render CL end address
+                                                  * (kicks off rendering)  */
 #define V3D_CLE_BFC       (V3D_CORE0 + 0x134u) /* bin frame count         */
 #define V3D_CLE_RFC       (V3D_CORE0 + 0x138u) /* render frame count      */
+#define V3D_CLE_CT0QTS    (V3D_CORE0 + 0x15Cu) /* bin tile-state addr      */
+#define V3D_CLE_CT0QMA    (V3D_CORE0 + 0x170u) /* bin tile-alloc mem addr  */
+#define V3D_CLE_CT0QMS    (V3D_CORE0 + 0x174u) /* bin tile-alloc mem size  */
+#define V3D_CLE_CT0QTS_ENABLE (1u << 1)
 
 #define V3D_L2TCACTL_L2TFLS      (1u << 0)
 #define V3D_L2TCACTL_FLM_FLUSH   (0u << 2) /* field, bits[3:2] = 0 = flush */
