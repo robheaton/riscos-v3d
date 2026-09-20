@@ -22,12 +22,49 @@
 #include "swis.h"
 #include "v3d_regs.h"
 #include "io_map.h"
+#include "phys_buffer.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
                          * error, not a silent ABI bug. */
 
 static int g_powered_on = 0;
+
+/* M2 in progress: physical buffer infrastructure for control lists.
+ * Created lazily on first use rather than in module_init, so a module
+ * load with no buffer use touches no PMP state at all. */
+static pmp_area_t g_pmp;
+static int g_pmp_created = 0;
+
+static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
+                                         unsigned int *readback_out,
+                                         unsigned int *logical_addr_out)
+{
+    _kernel_oserror *err;
+    void *log_ptr;
+    unsigned int phys_addr;
+    volatile unsigned int *word;
+
+    if (!g_pmp_created)
+    {
+        err = pmp_create("V3DBuf", 1024u * 1024u, 16, &g_pmp);
+        if (err)
+            return err;
+        g_pmp_created = 1;
+    }
+
+    err = pmp_alloc(&g_pmp, 0, 1, &phys_addr, &log_ptr);
+    if (err)
+        return err;
+
+    word = (volatile unsigned int *) log_ptr;
+    *word = 0xDEADBEEFu;
+
+    *phys_addr_out = phys_addr;
+    *readback_out = *word;
+    *logical_addr_out = (unsigned int) log_ptr;
+    return NULL;
+}
 
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
@@ -138,6 +175,7 @@ enum
 {
     SWI_V3D_PowerOn = 0,
     SWI_V3D_ReadIdent = 1,
+    SWI_V3D_TestBuffer = 2,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -165,6 +203,19 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = ident[1];
             r->r[2] = ident[2];
             r->r[3] = ident[3];
+            return NULL;
+        }
+
+        case SWI_V3D_TestBuffer:
+        {
+            unsigned int phys_addr, readback, logical_addr;
+            _kernel_oserror *err =
+                v3d_test_buffer(&phys_addr, &readback, &logical_addr);
+            if (err)
+                return err;
+            r->r[0] = phys_addr;
+            r->r[1] = readback;
+            r->r[2] = logical_addr;
             return NULL;
         }
 

@@ -13,7 +13,7 @@ CMUNGEFLAGS := -tgcc -32bit -p
 
 CFLAGS   := -mmodule -O2 -Wall -Wextra -Ic -Icmhg
 
-OBJS     := c/module.o cmhg/V3DDriver.o
+OBJS     := c/module.o c/phys_buffer.o cmhg/V3DDriver.o
 
 all: V3DDriver,ffa
 
@@ -25,14 +25,18 @@ cmhg/V3DDriver.h: cmhg/V3DDriver.cmhg
 cmhg/V3DDriver.o: cmhg/V3DDriver.cmhg
 	$(CMUNGE) $(CMUNGEFLAGS) -o $@ $<
 
-# module.c includes the generated header, so it must exist first.
-c/module.o: c/module.c c/v3d_regs.h c/io_map.h cmhg/V3DDriver.h
+# module.c and phys_buffer.c both include the generated header, so it
+# must exist first.
+c/module.o: c/module.c c/v3d_regs.h c/io_map.h c/phys_buffer.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/module.c -o c/module.o
+
+c/phys_buffer.o: c/phys_buffer.c c/phys_buffer.h cmhg/V3DDriver.h
+	$(CC) $(CFLAGS) -c c/phys_buffer.c -o c/phys_buffer.o
 
 V3DDriver,ffa: $(OBJS)
 	$(CC) -mmodule -o $@ $(OBJS)
 
 clean:
-	rm -f c/module.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
+	rm -f c/module.o c/phys_buffer.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
 
 .PHONY: all clean
