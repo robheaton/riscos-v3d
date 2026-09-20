@@ -65,10 +65,29 @@ driver as a dependency, RISC OS included.
   - Apostrophes in `.cmhg` comments produce (non-fatal) parser warnings
     — avoided in the header now.
 
-**Not yet done — hardware test is next:**
-- Build succeeding is not the milestone; `*RMLoad`-ing it on the CM4 and
-  getting a sane `V3D_ReadIdent` result is. See "Testing on hardware"
-  below.
+**Hardware-verified (2026-09-20, real CM4, RISC OS):** module loads,
+`V3D_PowerOn` succeeds, `V3D_ReadIdent` returns:
+
+```
+R0 (V3D_HUB_IDENT0) = 0x42554856
+R1 (V3D_HUB_IDENT1) = 0x000E1124
+R2 (V3D_HUB_IDENT2) = 0x00000100
+R3 (V3D_CTL_IDENT0) = 0x04443356
+```
+
+Decoded against the real Linux kernel `v3d_regs.h` bitfields (not
+guessed):
+- `V3D_CTL_IDENT0`: bytes 0-2 spell ASCII `V3D`, byte 3 (VER) = `4`.
+- `V3D_HUB_IDENT1`: TVER=4, REV=2 → reports itself as **V3D 4.2**,
+  the documented version for the Pi 4/CM4. NCORES=1, WITH_TFU=1,
+  WITH_TSY=1 - all correct for this SoC.
+- `V3D_HUB_IDENT2`: WITH_MMU=1, L3C=0KB - consistent with the above
+  and with the V3D 3.3+ MMU noted in the original feasibility research.
+
+This is the real milestone, not just the build: the power-on sequence
+and register reads are genuinely talking to the physical GPU, and the
+values are internally consistent and match public Pi 4 specs, not
+noise. M0/M1 is done.
 
 ## Layout
 
