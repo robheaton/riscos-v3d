@@ -35,4 +35,23 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
                                  unsigned int *render_target_phys_out,
                                  unsigned int *readback_pixel_out);
 
+/*
+ * M3: same clear-to-colour job as v3d_clear_test, but the render
+ * target buffer is prefixed with a valid RISC OS sprite area+header
+ * (see sprite.h) so the returned buffer is directly usable with
+ * OS_SpriteOp - no copy needed, the GPU writes straight into the
+ * sprite's pixel data.
+ *
+ * *sprite_area_log_out is a *logical* address. That's usable directly
+ * from any other task's context without copying: PMP dynamic areas
+ * (see phys_buffer.h) live in RISC OS's shared logical address space,
+ * not a per-task Application Space, so this pointer means the same
+ * thing to a separate BASIC/Wimp program as it does to this module.
+ */
+_kernel_oserror *v3d_clear_to_sprite(pmp_area_t *pmp, unsigned int base_page,
+                                      unsigned int clear_color_rgba,
+                                      unsigned int *sprite_area_phys_out,
+                                      void **sprite_area_log_out,
+                                      unsigned int *readback_pixel_out);
+
 #endif /* CL_CLEAR_H */

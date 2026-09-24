@@ -86,6 +86,9 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
 /* Uses PMP pages 16-24 (9 pages) - well clear of V3D_TestBuffer's page 0. */
 #define CLEAR_TEST_BASE_PAGE 16u
 
+/* Uses PMP pages 32-41 (10 pages) - well clear of ClearTest's range. */
+#define CLEAR_SPRITE_BASE_PAGE 32u
+
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
  * reference (pm.cpp) - direct PM_GRAFX reset deassert + ASB master/slave
@@ -232,6 +235,7 @@ enum
     SWI_V3D_ReadIdent = 1,
     SWI_V3D_TestBuffer = 2,
     SWI_V3D_ClearTest = 3,
+    SWI_V3D_ClearToSprite = 4,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -299,6 +303,35 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
             r->r[0] = phys_addr;
             r->r[1] = readback;
+            return NULL;
+        }
+
+        case SWI_V3D_ClearToSprite:
+        {
+            unsigned int phys_addr, readback;
+            void *log_addr;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    9, "V3DDriver: V3D_ClearToSprite called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp();
+            if (err)
+                return err;
+
+            err = v3d_clear_to_sprite(&g_pmp, CLEAR_SPRITE_BASE_PAGE, r->r[0],
+                                       &phys_addr, &log_addr, &readback);
+            if (err)
+                return err;
+
+            r->r[0] = (unsigned int) log_addr; /* sprite area - pass to OS_SpriteOp */
+            r->r[1] = readback;
+            r->r[2] = phys_addr;
             return NULL;
         }
 

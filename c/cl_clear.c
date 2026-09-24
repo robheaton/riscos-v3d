@@ -44,6 +44,7 @@
 #include "cl_builder.h"
 #include "v3d_regs.h"
 #include "io_map.h"
+#include "sprite.h"
 
 #define CL_PAGE_COUNT           1u  /* BCL+RCL combined, both tiny */
 #define RENDER_TARGET_PAGE_COUNT 4u /* 64*64*4 bytes = 16384 = 4 pages */
@@ -52,6 +53,14 @@
 #define TILE_STATE_PAGE_COUNT    1u /* 256 bytes/tile (V3D>=40 - we're 4.2) */
 #define CLEAR_TEST_TOTAL_PAGES  (CL_PAGE_COUNT + RENDER_TARGET_PAGE_COUNT + \
                                   TILE_ALLOC_PAGE_COUNT + TILE_STATE_PAGE_COUNT)
+
+/* M3: same render target, prefixed with a sprite area+header (60
+ * bytes - SPRITE_HEADER_BYTES) so the GPU's own output buffer is
+ * directly usable as a RISC OS sprite, no copy needed. 64*64*4 +
+ * 60 = 16444 bytes, rounded up to whole pages. */
+#define SPRITE_RENDER_PAGE_COUNT \
+    (((CL_CLEAR_TEST_WIDTH * CL_CLEAR_TEST_HEIGHT * 4u) + SPRITE_HEADER_BYTES \
+      + PAGE_SIZE - 1u) / PAGE_SIZE)
 
 /* opcode(1) + [init/alloc block size=0, ntargets-1=0|maxbpp|msaa|dbuf=0,
  * unused, unused](4) + width-1(2) + height-1(2) = 9 bytes. */
@@ -556,16 +565,30 @@ static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
     return timeout_err;
 }
 
-_kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
-                                 unsigned int clear_color_rgba,
-                                 unsigned int *render_target_phys_out,
-                                 unsigned int *readback_pixel_out)
+/*
+ * Shared by v3d_clear_test and v3d_clear_to_sprite. `render_page_count`
+ * sizes the render-target buffer (callers needing extra room before
+ * the pixel data - e.g. a sprite header - pass more pages);
+ * `render_header_bytes` is how far into that buffer the GPU's actual
+ * pixel store target starts, letting a caller prefix the buffer with
+ * its own data (written through *render_log_out, which always points
+ * at the very start of the buffer, not the pixel data) without it
+ * being clobbered by the GPU.
+ */
+static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
+                                       unsigned int clear_color_rgba,
+                                       unsigned int render_page_count,
+                                       unsigned int render_header_bytes,
+                                       unsigned int *render_target_phys_out,
+                                       void **render_target_log_out,
+                                       unsigned int *readback_pixel_out)
 {
     unsigned int cl_phys, render_phys, tile_alloc_phys, tile_state_phys;
     void *cl_log, *render_log, *tile_alloc_log, *tile_state_log;
     _kernel_oserror *err;
     cl_buf_t bcl, rcl;
     unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
+    unsigned int pixel_phys;
     io_mapping_t v3d;
     unsigned int last_bfc, last_rfc;
     unsigned int page = base_page;
@@ -575,9 +598,10 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     if (err) return err;
     page += CL_PAGE_COUNT;
 
-    err = pmp_alloc(pmp, page, RENDER_TARGET_PAGE_COUNT, &render_phys, &render_log);
+    err = pmp_alloc(pmp, page, render_page_count, &render_phys, &render_log);
     if (err) return err;
-    page += RENDER_TARGET_PAGE_COUNT;
+    page += render_page_count;
+    pixel_phys = render_phys + render_header_bytes;
 
     err = pmp_alloc(pmp, page, TILE_ALLOC_PAGE_COUNT, &tile_alloc_phys, &tile_alloc_log);
     if (err) return err;
@@ -652,7 +676,7 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     emit_tile_coordinates(&rcl, 0, 0);
     emit_end_of_loads(&rcl);
     emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */,
-                                CL_CLEAR_TEST_WIDTH * 4, render_phys);
+                                CL_CLEAR_TEST_WIDTH * 4, pixel_phys);
     emit_end_of_tile_marker(&rcl);
 
     /* No SupertileCoordinates / StartAddressOfGenericTileList here -
@@ -719,6 +743,42 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     }
 
     *render_target_phys_out = render_phys;
-    *readback_pixel_out = *(volatile unsigned int *) render_log;
+    *render_target_log_out = render_log;
+    *readback_pixel_out =
+        *(volatile unsigned int *) ((unsigned char *) render_log + render_header_bytes);
+    return NULL;
+}
+
+_kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
+                                 unsigned int clear_color_rgba,
+                                 unsigned int *render_target_phys_out,
+                                 unsigned int *readback_pixel_out)
+{
+    void *render_log;
+    return v3d_clear_run(pmp, base_page, clear_color_rgba,
+                          RENDER_TARGET_PAGE_COUNT, 0,
+                          render_target_phys_out, &render_log,
+                          readback_pixel_out);
+}
+
+_kernel_oserror *v3d_clear_to_sprite(pmp_area_t *pmp, unsigned int base_page,
+                                      unsigned int clear_color_rgba,
+                                      unsigned int *sprite_area_phys_out,
+                                      void **sprite_area_log_out,
+                                      unsigned int *readback_pixel_out)
+{
+    _kernel_oserror *err = v3d_clear_run(
+        pmp, base_page, clear_color_rgba,
+        SPRITE_RENDER_PAGE_COUNT, SPRITE_HEADER_BYTES,
+        sprite_area_phys_out, sprite_area_log_out, readback_pixel_out);
+    if (err)
+        return err;
+
+    /* Headers only - the GPU already wrote the pixel data (at
+     * *sprite_area_log_out + SPRITE_HEADER_BYTES) as part of
+     * v3d_clear_run above. Written after, but there's no race: CPU and
+     * GPU touch disjoint byte ranges of the same buffer. */
+    sprite_write_header(*sprite_area_log_out, CL_CLEAR_TEST_WIDTH,
+                         CL_CLEAR_TEST_HEIGHT, "v3dtest");
     return NULL;
 }
