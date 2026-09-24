@@ -644,8 +644,32 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
 
     err = pmp_alloc(pmp, page, TILE_STATE_PAGE_COUNT, &tile_state_phys, &tile_state_log);
     if (err) return err;
-    (void) tile_alloc_log;
-    (void) tile_state_log;
+
+    /*
+     * Zero the tile-alloc and tile-state scratch buffers before the
+     * binner ever touches them. The bare-metal reference never does
+     * this - its memory comes straight from a fresh boot, pristine
+     * zero from power-on. RISC OS instead hands out recycled physical
+     * pages via OS_Memory 12, which can carry arbitrary leftover
+     * content from whatever last used them. If the binner's own
+     * bookkeeping in this scratch space is sensitive to its initial
+     * content, that would explain a hang whose presence depends on
+     * exactly which physical pages happen to get allocated - which
+     * fits: this was never reproducible with V3D_ClearTest's page
+     * range, only V3D_ClearToSprite's.
+     */
+    {
+        unsigned int i;
+        volatile unsigned int *p;
+
+        p = (volatile unsigned int *) tile_alloc_log;
+        for (i = 0; i < (TILE_ALLOC_PAGE_COUNT * PAGE_SIZE) / 4u; i++)
+            p[i] = 0;
+
+        p = (volatile unsigned int *) tile_state_log;
+        for (i = 0; i < (TILE_STATE_PAGE_COUNT * PAGE_SIZE) / 4u; i++)
+            p[i] = 0;
+    }
 
     diag_bufs.cl = cl_phys;
     diag_bufs.render_target = render_phys;

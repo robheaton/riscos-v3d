@@ -649,7 +649,38 @@ Added `V3D_MMU_CTL` (bit 0 says definitively whether the MMU is even
 active - the first and most important new fact), plus
 `V3D_HUB_INT_STS`/`V3D_MMU_VIO_ID`/`V3D_MMU_VIO_ADDR` (only read when
 the MMU is actually enabled, to keep the common case short) to
-`diagnose_timeout()`. Not yet re-tested on hardware.
+`diagnose_timeout()`.
+
+**Hardware result, attempt 5 (2026-09-24): `MMU=0x00000000` - ruled
+out too.** MMU genuinely disabled, so not an address-translation
+problem either.
+
+**Hardware result, attempt 6 (2026-09-24) - same call, run a second
+time without reloading the module: the most informative result yet.**
+`CA=0x03070000` and `EA=0x0307006B` - both matching `wQBA`/`wQEA`
+*exactly*. `QBA`/`QEA` write and readback also match exactly. No stale
+garbage, no zeroed registers, no fault pattern - the submission
+mechanics are completely correct, the thread is confirmed `RUN`ning,
+and it *still* never completes, with `CA` stuck precisely at the
+starting address the whole time - not advanced at all, not wandered
+off into unrelated memory. That rules out everything about *how* the
+job is submitted and points squarely at what the binner does once it
+starts reading the list.
+
+Found a real, previously-unused pair of variables while looking:
+`tile_alloc_log`/`tile_state_log` were fetched from `pmp_alloc` and
+then explicitly discarded (`(void) tile_alloc_log;`) - these scratch
+buffers were never actually zeroed before being handed to the GPU. The
+bare-metal reference gets away with this because its memory comes
+straight from a fresh boot, pristine zero from power-on; RISC OS
+instead hands out recycled physical pages via `OS_Memory 12`, which
+can carry arbitrary leftover content from whatever last used them. If
+the binner's own bookkeeping in that scratch space is sensitive to its
+initial content, that would explain a hang whose presence depends on
+*which* physical pages happen to get allocated - consistent with this
+never reproducing on `V3D_ClearTest`'s page range, only
+`V3D_ClearToSprite`'s. Zeroed both buffers before submission. Not yet
+re-tested on hardware.
 
 ## Testing on hardware
 
