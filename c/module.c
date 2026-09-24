@@ -24,6 +24,7 @@
 #include "io_map.h"
 #include "phys_buffer.h"
 #include "cl_clear.h"
+#include "memsplit.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -88,6 +89,9 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
 
 /* Uses PMP pages 32-41 (10 pages) - well clear of ClearTest's range. */
 #define CLEAR_SPRITE_BASE_PAGE 32u
+
+/* Uses PMP page 48 - well clear of everything else. */
+#define MEM_SPLIT_PAGE 48u
 
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
@@ -243,6 +247,7 @@ enum
     SWI_V3D_TestBuffer = 2,
     SWI_V3D_ClearTest = 3,
     SWI_V3D_ClearToSprite = 4,
+    SWI_V3D_MemSplit = 5,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -341,6 +346,25 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[0] = (unsigned int) log_addr; /* sprite area - pass to OS_SpriteOp */
             r->r[1] = readback;
             r->r[2] = phys_addr;
+            return NULL;
+        }
+
+        case SWI_V3D_MemSplit:
+        {
+            unsigned int arm_base, arm_size, vc_base, vc_size;
+            _kernel_oserror *err = ensure_pmp();
+            if (err)
+                return err;
+
+            err = v3d_read_mem_split(&g_pmp, MEM_SPLIT_PAGE,
+                                      &arm_base, &arm_size, &vc_base, &vc_size);
+            if (err)
+                return err;
+
+            r->r[0] = arm_base;
+            r->r[1] = arm_size;
+            r->r[2] = vc_base;
+            r->r[3] = vc_size;
             return NULL;
         }
 
