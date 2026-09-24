@@ -497,11 +497,19 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     io_mapping_t v3d;
     unsigned int sts = 0, cs = 0, ca = 0, ea = 0;
     unsigned int rb_qba = 0, rb_qea = 0;
+    unsigned int mmu_ctl = 0, hub_sts = 0, vio_id = 0, vio_addr = 0;
     unsigned int pos = 0;
 
     if (!io_map(V3D_MB_BASE, &v3d))
     {
         sts = IO_WORD(v3d, V3D_CTL_INT_STS);
+        mmu_ctl = IO_WORD(v3d, V3D_MMU_CTL);
+        hub_sts = IO_WORD(v3d, V3D_HUB_INT_STS);
+        if (mmu_ctl & V3D_MMU_CTL_ENABLE)
+        {
+            vio_id = IO_WORD(v3d, V3D_MMU_VIO_ID);
+            vio_addr = IO_WORD(v3d, V3D_MMU_VIO_ADDR);
+        }
         if (is_bin)
         {
             cs = IO_WORD(v3d, V3D_CLE_CT0CS);
@@ -521,16 +529,24 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
         io_unmap(&v3d);
     }
 
-    append_str(out_err->errmess, &pos, "V3DDriver: timed out waiting for ");
+    append_str(out_err->errmess, &pos, "V3DDriver: timeout: ");
     append_str(out_err->errmess, &pos, what);
-    append_str(out_err->errmess, &pos, ". STS=");
-    append_hex32(out_err->errmess, &pos, sts);
     append_str(out_err->errmess, &pos, " CS=");
     append_hex32(out_err->errmess, &pos, cs);
-    append_str(out_err->errmess, &pos, " (");
-    append_str(out_err->errmess, &pos, (cs & V3D_CT_CS_CTRUN) ? "RUN" : "STOP");
+    append_str(out_err->errmess, &pos, (cs & V3D_CT_CS_CTRUN) ? "(RUN" : "(STOP");
     if (cs & V3D_CT_CS_CTERR) append_str(out_err->errmess, &pos, " ERR");
-    append_str(out_err->errmess, &pos, ") CA=");
+    append_str(out_err->errmess, &pos, ") MMU=");
+    append_hex32(out_err->errmess, &pos, mmu_ctl & 1u);
+    if (mmu_ctl & V3D_MMU_CTL_ENABLE)
+    {
+        append_str(out_err->errmess, &pos, " HUBSTS=");
+        append_hex32(out_err->errmess, &pos, hub_sts);
+        append_str(out_err->errmess, &pos, " VioID=");
+        append_hex32(out_err->errmess, &pos, vio_id);
+        append_str(out_err->errmess, &pos, " VioAddr=");
+        append_hex32(out_err->errmess, &pos, vio_addr);
+    }
+    append_str(out_err->errmess, &pos, " CA=");
     append_hex32(out_err->errmess, &pos, ca);
     append_str(out_err->errmess, &pos, " EA=");
     append_hex32(out_err->errmess, &pos, ea);
@@ -542,12 +558,13 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     append_hex32(out_err->errmess, &pos, qea);
     append_str(out_err->errmess, &pos, "/r");
     append_hex32(out_err->errmess, &pos, rb_qea);
-    append_str(out_err->errmess, &pos, " tAlloc=");
+    append_str(out_err->errmess, &pos, " tAl=");
     append_hex32(out_err->errmess, &pos, bufs->tile_alloc);
-    append_str(out_err->errmess, &pos, " rTgt=");
+    append_str(out_err->errmess, &pos, " rTg=");
     append_hex32(out_err->errmess, &pos, bufs->render_target);
-    append_str(out_err->errmess, &pos, " tState=");
+    append_str(out_err->errmess, &pos, " tSt=");
     append_hex32(out_err->errmess, &pos, bufs->tile_state);
+    (void) sts;
     out_err->errmess[pos] = '\0';
 }
 

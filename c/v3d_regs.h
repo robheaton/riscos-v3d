@@ -55,6 +55,32 @@
 #define V3D_HUB_IDENT1    (V3D_HUB + 0x0Cu)  /* core count, VPM size, etc  */
 #define V3D_HUB_IDENT2    (V3D_HUB + 0x10u)
 
+/*
+ * Hub-level interrupt status and MMU registers - checked for the first
+ * time after two hardware tests of V3D_ClearToSprite (never
+ * V3D_ClearTest) reproducibly showed CT0CA stuck near zero and CT0QEA
+ * reading back 0xFFFFFFFF (fault-like) while CTRUN showed genuinely
+ * running. V3D_CTL_INT_STS (per-core) has no MMU-related bits at all;
+ * MMU violations are reported at the HUB level instead, via
+ * V3D_HUB_INT_STS's MMU_WRV/MMU_PTI/MMU_CAP bits. The bare-metal
+ * reference never sets up the V3D MMU and assumes physical addresses
+ * pass straight through - true on a from-scratch boot, but RISC OS's
+ * own firmware/GPU init might have left the MMU enabled with a page
+ * table that doesn't cover arbitrary system RAM our PMP hands out,
+ * which would produce exactly this symptom. V3D_MMU_CTL bit 0 says
+ * definitively whether the MMU is even active - the first thing worth
+ * checking before anything else here.
+ * Source: real Linux kernel drivers/gpu/drm/v3d/v3d_regs.h.
+ */
+#define V3D_HUB_INT_STS     (V3D_HUB + 0x50u)
+#define V3D_HUB_INT_MMU_CAP (1u << 3)
+#define V3D_HUB_INT_MMU_PTI (1u << 4)
+#define V3D_HUB_INT_MMU_WRV (1u << 5)
+#define V3D_MMU_CTL         (V3D_HUB + 0x1200u)
+#define V3D_MMU_CTL_ENABLE  (1u << 0)
+#define V3D_MMU_VIO_ID      (V3D_HUB + 0x122Cu)
+#define V3D_MMU_VIO_ADDR    (V3D_HUB + 0x1234u)
+
 /* ---- V3D core 0 control / CLE (control-list executor) ---- */
 #define V3D_CORE0         (PERIPHERAL_BASE + 0xC04000u)
 #define V3D_CTL_IDENT0    (V3D_CORE0 + 0x00u)

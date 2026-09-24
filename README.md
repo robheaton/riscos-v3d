@@ -617,10 +617,39 @@ faulting `EA` readback) at once.
 Rather than patch this on another guess, extended `V3D_ReadIdent` to
 also return `CT0CS`/`CT1CS` (R4/R5) - a way to check the post-reset
 thread state directly, using an already-proven-working SWI, without
-ever attempting a submission. Not yet re-tested on hardware - next
-step is running `V3D_PowerOn` then `V3D_ReadIdent` *alone* first, to
-get real data before touching `V3D_ClearTest`/`V3D_ClearToSprite`
-again.
+ever attempting a submission.
+
+**Hardware result, attempt 3 (2026-09-24): `CT0CS=0`/`CT1CS=0` right
+after power-on.** Both threads cleanly idle - no `CTRUN`, no halt, no
+error. This directly disproved the "fresh thread defaults to running"
+theory: the conditional-restart logic was correctly reading a clean
+state and correctly skipping the restart write. That path was never
+the bug.
+
+**Hardware result, attempt 4 (2026-09-24): reran `V3D_ClearToSprite`
+on the same clean session - identical `CA≈1`/`QEA=0xFFFFFFFF`
+symptom, reproducibly.** Not session-dependent noise - something
+structural about this specific path causes it, every time. That
+pointed at a gap in the diagnostics rather than another guess at the
+fix: every timeout so far had only ever checked `V3D_CTL_INT_STS`, the
+*per-core* interrupt status - which has no MMU-related bits at all.
+MMU violations are reported separately, at the *hub* level
+(`V3D_HUB_INT_STS`'s `MMU_WRV`/`MMU_PTI`/`MMU_CAP` bits, confirmed from
+the real Linux kernel header). The bare-metal reference never sets up
+the V3D MMU and assumes physical addresses pass straight through to
+the GPU untranslated - true for it, since it boots from scratch with
+nothing else touching the chip, but not necessarily true here: if RISC
+OS's own firmware/GPU init left the MMU enabled with a page table that
+doesn't cover arbitrary system RAM our PMP hands out, a perfectly
+valid CPU-side physical address could be one the GPU simply can't
+reach - which would produce exactly this symptom (thread genuinely
+running, but unable to fetch anything coherent).
+
+Added `V3D_MMU_CTL` (bit 0 says definitively whether the MMU is even
+active - the first and most important new fact), plus
+`V3D_HUB_INT_STS`/`V3D_MMU_VIO_ID`/`V3D_MMU_VIO_ADDR` (only read when
+the MMU is actually enabled, to keep the common case short) to
+`diagnose_timeout()`. Not yet re-tested on hardware.
 
 ## Testing on hardware
 
