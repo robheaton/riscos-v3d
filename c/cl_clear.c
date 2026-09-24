@@ -360,31 +360,42 @@ static void v3d_flush_caches(io_mapping_t *v3d)
 
 /*
  * Writes the documented CTSUBS restart trigger to a CLE thread's CS
- * register, then gives the hardware a beat to actually process it
- * before returning.
+ * register, then waits for the hardware to actually finish processing
+ * that write before returning.
  *
  * Added after a hardware test showed CTSUBS clearing CA/EA to zero as
  * part of leaving halt - meaning the documented "restarts if CA != EA"
  * condition can never be true in that same instant, so the thread just
  * re-stops immediately. The new job's QMA/QMS/QTS/QBA/QEA were written
- * right after, with no gap at all, which is exactly the shape of a
- * write-after-write hazard against a hardware state machine still
- * mid-transition - and that same test's readback showed the new job's
- * registers were never latched. This isn't "wait for an async
- * operation to finish" (there's nothing meaningful to poll for until
- * we've actually queued new work), just a fixed settle delay before
- * hitting the same control register block with more writes - same
- * technique as the PM_GRAFX reset pulse delay in module.c, and the
- * same reasoning for why the loop counter must be volatile.
+ * right after, with no gap at all - a write-after-write hazard against
+ * a hardware state machine still mid-transition - and that test's
+ * readback showed the new job's registers were never latched.
+ *
+ * v1 of this fix used a fixed-count delay loop instead of polling
+ * anything, reasoning that there was "nothing meaningful to wait for
+ * until new work is queued". That conflated two different things: a
+ * job completing (genuinely nothing to poll for yet) and the hardware
+ * finishing its response to *this* write (CTSUBS clearing back to 0,
+ * which the PRM documents happens once the thread leaves "stopped at
+ * halt"). The fixed delay worked once, then the identical failure mode
+ * came back on a later run - exactly what you'd expect from timing
+ * that sometimes isn't long enough rather than a real fix. Poll the
+ * actual condition instead, bounded rather than assumed.
  */
 static void v3d_restart_thread(io_mapping_t *v3d, unsigned int cs_reg)
 {
-    volatile unsigned int spin;
+    unsigned int spin;
 
     IO_WORD(*v3d, cs_reg) = V3D_CT_CS_CTSUBS;
 
-    for (spin = 0; spin < 100000u; spin++)
-        ;
+    for (spin = 0; spin < 1000000u; spin++)
+    {
+        if (!(IO_WORD(*v3d, cs_reg) & V3D_CT_CS_CTSUBS))
+            return;
+    }
+    /* Gave it a bounded chance; proceed regardless and let the
+     * submission + BFC/RFC timeout (with full diagnostics) be the
+     * real verdict rather than silently looping forever here. */
 }
 
 /*

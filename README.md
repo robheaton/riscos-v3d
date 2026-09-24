@@ -455,7 +455,25 @@ Fixed: removed `SupertileCoordinates` (and the now-dead
 `emit_supertile_coordinates`) entirely. Both `TileCoordinates` blocks
 already do our real work (clear + store) inline; we have no supertiles
 to walk and don't need generic-tile-list indirection for one hardcoded
-tile. Not yet re-tested on hardware.
+tile.
+
+**Hardware result, attempt 12 (2026-09-24): binning failed again, and
+it's the *same* failure mode as before the settle-delay fix.** `CS=0x50`
+(stopped at halt, no error) with `CA=EA=0` and `QBA`/`QEA` readback not
+matching this run's submission - identical to what attempt 9 diagnosed,
+which the fixed-delay version of `v3d_restart_thread` was supposed to
+have already fixed, and which *did* work for the immediately preceding
+(successful) test. A fix that works once and then reproduces the exact
+pre-fix symptom on a later run is the signature of timing that
+sometimes isn't long enough, not a real fix - the original version
+reasoned there was "nothing meaningful to poll for" after the restart
+write and used a fixed-count delay loop instead. That conflated two
+different things: a job completing (genuinely nothing to wait for
+yet) and the hardware finishing its own response to the restart write
+itself (`CTSUBS` clearing back to 0, which the PRM documents happens
+once the thread actually leaves "stopped at halt"). Replaced the fixed
+delay with a bounded poll on that actual condition. Not yet re-tested
+on hardware.
 
 ## Layout
 
