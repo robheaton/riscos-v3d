@@ -21,8 +21,23 @@
  * Fix: reproduced the reference's full always-present viewport/clip/
  * raster state-setup block (ClipWindow through VcmCacheSize) verbatim,
  * values and all, minus only GlShaderState/VertexArrayPrims since we
- * draw nothing. Still not confirmed on hardware that this is sufficient
- * - only that the bare-minimum version wasn't.
+ * draw nothing.
+ *
+ * UPDATE (2026-09-24): that fixed binning - V3D_CTL_INT_STS read back
+ * V3D_INT_FLDONE (bin done) on a later hardware test, and BFC advanced
+ * correctly. Rendering then hung instead: CT1CA stuck at 0x00000000
+ * with CT1CS showing CTRTSD=1 (one level into a nested sub-list) and
+ * CTRUN=1 (genuinely running, not stalled/errored). The render thread
+ * had followed a branch into memory we never set up: our RCL called
+ * SupertileCoordinates (which the reference always pairs with a prior
+ * StartAddressOfGenericTileList, pointing at a small "indirect" list
+ * of its own) without ever writing that indirect-list address
+ * ourselves - so the branch target was left at its zero default.
+ * Removed the SupertileCoordinates call entirely: both TileCoordinates
+ * blocks above it already do our real work (clear + store) inline, so
+ * we have no supertiles to walk and don't need the generic-tile-list
+ * indirection at all for a single hardcoded tile. Not yet confirmed on
+ * hardware.
  */
 
 #include "cl_clear.h"
@@ -335,14 +350,6 @@ static void emit_clear_tile_buffers(cl_buf_t *b)
     cl_u8(b, 3);
 }
 
-/* opcode(1) + x(1) + y(1) = 3. */
-static void emit_supertile_coordinates(cl_buf_t *b, unsigned int x, unsigned int y)
-{
-    cl_u8(b, 23);
-    cl_u8(b, x & 0xFFu);
-    cl_u8(b, y & 0xFFu);
-}
-
 static void v3d_flush_caches(io_mapping_t *v3d)
 {
     IO_WORD(*v3d, V3D_CTL_L2TFLSTA) = 0;
@@ -637,7 +644,10 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
                                 CL_CLEAR_TEST_WIDTH * 4, render_phys);
     emit_end_of_tile_marker(&rcl);
 
-    emit_supertile_coordinates(&rcl, 0, 0);
+    /* No SupertileCoordinates / StartAddressOfGenericTileList here -
+     * see the "not verified" note above emit_supertile_coordinates.
+     * Both TileCoordinates blocks above already did our real work
+     * (clear + store) inline; we have no supertiles to walk. */
     emit_end_of_rendering(&rcl);
     rcl_end = cl_paddr(&rcl);
 

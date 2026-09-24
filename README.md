@@ -433,6 +433,30 @@ narrows things meaningfully: this now looks like a genuine control-list
 one - a different, narrower class of problem than anything the last
 nine attempts were chasing.
 
+**Hardware result, attempt 11 (2026-09-24) - binning is confirmed
+fully working.** `STS=0x00000002` decodes to `V3D_INT_FLDONE` (bin
+done) - `V3D_CLE_BFC` genuinely advanced this time, and the timeout
+moved to `RFC` (render) instead. Real, unambiguous progress: the whole
+BCL, buffer setup, restart sequence, and bin submission are correct.
+
+The render-side hang was sharply diagnostic: `CT1CA=0x00000000` with
+`CT1CS` showing `CTRTSD=1` (one level into a nested sub-list) and
+`CTRUN=1` (genuinely running). Comparing against the reference's real
+RCL: it always pairs `SupertileCoordinates` with a prior
+`StartAddressOfGenericTileList`, which points the hardware at a small
+"indirect" list of its own - we called `SupertileCoordinates` without
+ever writing that indirect-list address, leaving the branch target at
+its zero default. `CA` landing on exactly `0x00000000` while genuinely
+mid-execution matches that precisely. The logged buffer addresses from
+the previous commit confirmed it wasn't any of our own buffers either
+- ruling that specific guess in with data, not arithmetic.
+
+Fixed: removed `SupertileCoordinates` (and the now-dead
+`emit_supertile_coordinates`) entirely. Both `TileCoordinates` blocks
+already do our real work (clear + store) inline; we have no supertiles
+to walk and don't need generic-tile-list indirection for one hardcoded
+tile. Not yet re-tested on hardware.
+
 ## Layout
 
 ```
