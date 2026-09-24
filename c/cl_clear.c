@@ -390,10 +390,28 @@ static void v3d_flush_caches(io_mapping_t *v3d)
  * came back on a later run - exactly what you'd expect from timing
  * that sometimes isn't long enough rather than a real fix. Poll the
  * actual condition instead, bounded rather than assumed.
+ *
+ * v2 (this version) also stopped writing CTSUBS *unconditionally*
+ * before every submission. Hardware testing on a freshly-loaded module
+ * (thread never halted at all - CTRUN should already be sensible)
+ * reproduced the exact same failure this fix was meant to solve. The
+ * PRM only documents CTSUBS as clearing CA/EA when actually leaving
+ * "stopped at halt" - writing it to a thread that was never halted is
+ * outside what's documented, and evidently doesn't leave CA/EA alone
+ * either, inflicting the same CA==EA race onto a thread that had no
+ * need to be restarted at all. Now reads CS first and only issues the
+ * restart write (and its poll) when the thread is actually stopped
+ * with CTSUBS or CTERR set - a thread that's running, or cleanly
+ * stopped-at-end, is left alone.
  */
 static void v3d_restart_thread(io_mapping_t *v3d, unsigned int cs_reg)
 {
     unsigned int spin;
+    unsigned int cs = IO_WORD(*v3d, cs_reg);
+
+    if ((cs & V3D_CT_CS_CTRUN) ||
+        !(cs & (V3D_CT_CS_CTSUBS | V3D_CT_CS_CTERR)))
+        return; /* already running, or cleanly idle - nothing to do */
 
     IO_WORD(*v3d, cs_reg) = V3D_CT_CS_CTSUBS;
 

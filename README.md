@@ -578,11 +578,27 @@ against ROOL's own PRM pages rather than recalled, and the sprite
 header struct's byte layout is enforced with a compile-time size
 assertion rather than just trusted.
 
-**Not yet tested on hardware.** `ShowSprite.bas` needs `V3DDriver,ffa`
-already `*RMLoad`ed; it doesn't load the module itself. Run it and it
-should open a small window with a solid `&FF00FFFF`-coloured square
-in it - a GPU-rendered pixel actually visible on screen, not just read
-back into a register.
+**Hardware result, attempt 1 (2026-09-24): binning timeout again** -
+`CS=0x50` (stopped at halt, no error), the same symptom the M2
+restart-poll fix (commit a29ac06) was meant to have already solved.
+The difference this time: it happened on a **freshly-loaded module**,
+where the CLE thread should never have been halted to begin with.
+
+That distinction was the actual lead: `v3d_restart_thread` was writing
+the `CTSUBS` restart trigger *unconditionally* before every submission,
+not only when the thread actually needed restarting. The PRM only
+documents `CTSUBS` as clearing `CA`/`EA` when a thread genuinely leaves
+"stopped at halt" - writing it to a thread that was never halted (a
+freshly-reset, idle CT0) is outside what's documented, and evidently
+doesn't leave `CA`/`EA` alone either. So the fix that solved one race
+was, on a clean run, *creating the same race from scratch* by
+disturbing a thread that didn't need touching. Fixed: `CT0CS`/`CT1CS`
+are now read first, and the restart write only happens when the thread
+is actually stopped with `CTSUBS` or `CTERR` set - a running or
+cleanly-idle thread is left alone entirely. Not yet re-tested on
+hardware. (Separately: the BASIC-side infinite error-handler recursion
+bug that obscured this result on the first hardware attempt is fixed -
+see `test/ShowSprite.bas`'s history.)
 
 ## Testing on hardware
 
