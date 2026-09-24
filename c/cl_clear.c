@@ -432,11 +432,25 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
  * comment in v3d_regs.h for why a stalled-on-OOM binner would look
  * identical to a never-started one from BFC's perspective alone).
  */
+/*
+ * `bufs` lets us check CA/EA against every physical buffer this job
+ * actually used, not just what we wrote to QBA/QEA - added after EA
+ * read back a value that didn't match either of those, and matching
+ * it to a buffer address by hand (page-layout arithmetic, not a
+ * logged value) turned out to be exactly the kind of guess-disguised-
+ * as-a-fact this project has been trying to avoid.
+ */
+typedef struct diag_bufs
+{
+    unsigned int cl, render_target, tile_alloc, tile_state;
+} diag_bufs_t;
+
 static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
-                              int is_bin, unsigned int qba, unsigned int qea)
+                              int is_bin, unsigned int qba, unsigned int qea,
+                              const diag_bufs_t *bufs)
 {
     io_mapping_t v3d;
-    unsigned int sts = 0, cs = 0, ca = 0, ea = 0, ra = 0;
+    unsigned int sts = 0, cs = 0, ca = 0, ea = 0;
     unsigned int rb_qba = 0, rb_qea = 0;
     unsigned int pos = 0;
 
@@ -448,7 +462,6 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
             cs = IO_WORD(v3d, V3D_CLE_CT0CS);
             ca = IO_WORD(v3d, V3D_CLE_CT0CA);
             ea = IO_WORD(v3d, V3D_CLE_CT0EA);
-            ra = IO_WORD(v3d, V3D_CLE_CT0RA);
             rb_qba = IO_WORD(v3d, V3D_CLE_CT0QBA);
             rb_qea = IO_WORD(v3d, V3D_CLE_CT0QEA);
         }
@@ -457,7 +470,6 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
             cs = IO_WORD(v3d, V3D_CLE_CT1CS);
             ca = IO_WORD(v3d, V3D_CLE_CT1CA);
             ea = IO_WORD(v3d, V3D_CLE_CT1EA);
-            ra = IO_WORD(v3d, V3D_CLE_CT1RA);
             rb_qba = IO_WORD(v3d, V3D_CLE_CT1QBA);
             rb_qea = IO_WORD(v3d, V3D_CLE_CT1QEA);
         }
@@ -466,40 +478,39 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
 
     append_str(out_err->errmess, &pos, "V3DDriver: timed out waiting for ");
     append_str(out_err->errmess, &pos, what);
-    append_str(out_err->errmess, &pos, ". INT_STS=");
+    append_str(out_err->errmess, &pos, ". STS=");
     append_hex32(out_err->errmess, &pos, sts);
-    append_str(out_err->errmess, &pos, " (");
-    if (sts & V3D_INT_OUTOMEM)  append_str(out_err->errmess, &pos, "OUTOMEM ");
-    if (sts & V3D_INT_FLDONE)   append_str(out_err->errmess, &pos, "FLDONE ");
-    if (sts & V3D_INT_FRDONE)   append_str(out_err->errmess, &pos, "FRDONE ");
-    if (sts & V3D_INT_GMPV)     append_str(out_err->errmess, &pos, "GMPV ");
-    if (sts == 0)               append_str(out_err->errmess, &pos, "none");
-    append_str(out_err->errmess, &pos, ") CS=");
+    append_str(out_err->errmess, &pos, " CS=");
     append_hex32(out_err->errmess, &pos, cs);
     append_str(out_err->errmess, &pos, " (");
-    append_str(out_err->errmess, &pos, (cs & V3D_CT_CS_CTRUN) ? "RUN " : "STOP ");
-    if (cs & V3D_CT_CS_CTERR) append_str(out_err->errmess, &pos, "ERR ");
+    append_str(out_err->errmess, &pos, (cs & V3D_CT_CS_CTRUN) ? "RUN" : "STOP");
+    if (cs & V3D_CT_CS_CTERR) append_str(out_err->errmess, &pos, " ERR");
     append_str(out_err->errmess, &pos, ") CA=");
     append_hex32(out_err->errmess, &pos, ca);
     append_str(out_err->errmess, &pos, " EA=");
     append_hex32(out_err->errmess, &pos, ea);
-    append_str(out_err->errmess, &pos, " RA=");
-    append_hex32(out_err->errmess, &pos, ra);
-    append_str(out_err->errmess, &pos, " wQBA=");
+    append_str(out_err->errmess, &pos, " QBA=w");
     append_hex32(out_err->errmess, &pos, qba);
-    append_str(out_err->errmess, &pos, " rQBA=");
+    append_str(out_err->errmess, &pos, "/r");
     append_hex32(out_err->errmess, &pos, rb_qba);
-    append_str(out_err->errmess, &pos, " wQEA=");
+    append_str(out_err->errmess, &pos, " QEA=w");
     append_hex32(out_err->errmess, &pos, qea);
-    append_str(out_err->errmess, &pos, " rQEA=");
+    append_str(out_err->errmess, &pos, "/r");
     append_hex32(out_err->errmess, &pos, rb_qea);
+    append_str(out_err->errmess, &pos, " tAlloc=");
+    append_hex32(out_err->errmess, &pos, bufs->tile_alloc);
+    append_str(out_err->errmess, &pos, " rTgt=");
+    append_hex32(out_err->errmess, &pos, bufs->render_target);
+    append_str(out_err->errmess, &pos, " tState=");
+    append_hex32(out_err->errmess, &pos, bufs->tile_state);
     out_err->errmess[pos] = '\0';
 }
 
 static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
                                           _kernel_oserror *timeout_err,
                                           const char *what, int is_bin,
-                                          unsigned int qba, unsigned int qea)
+                                          unsigned int qba, unsigned int qea,
+                                          const diag_bufs_t *bufs)
 {
     unsigned int outer;
 
@@ -523,7 +534,7 @@ static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
         io_unmap(&v3d);
     }
 
-    diagnose_timeout(timeout_err, what, is_bin, qba, qea);
+    diagnose_timeout(timeout_err, what, is_bin, qba, qea, bufs);
     return timeout_err;
 }
 
@@ -540,6 +551,7 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     io_mapping_t v3d;
     unsigned int last_bfc, last_rfc;
     unsigned int page = base_page;
+    diag_bufs_t diag_bufs;
 
     err = pmp_alloc(pmp, page, CL_PAGE_COUNT, &cl_phys, &cl_log);
     if (err) return err;
@@ -557,6 +569,11 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     if (err) return err;
     (void) tile_alloc_log;
     (void) tile_state_log;
+
+    diag_bufs.cl = cl_phys;
+    diag_bufs.render_target = render_phys;
+    diag_bufs.tile_alloc = tile_alloc_phys;
+    diag_bufs.tile_state = tile_state_phys;
 
     /* --- BCL: empty bin (no primitives - see the reference's full
      * always-present state-setup block below, added after hardware
@@ -651,7 +668,8 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     {
         static _kernel_oserror err_bin_timeout = { 7, "" };
         err = v3d_poll_counter(V3D_CLE_BFC, last_bfc, &err_bin_timeout,
-                                "BFC (binning)", 1, bcl_start, bcl_end);
+                                "BFC (binning)", 1, bcl_start, bcl_end,
+                                &diag_bufs);
         if (err)
             return err;
     }
@@ -673,7 +691,8 @@ _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
     {
         static _kernel_oserror err_render_timeout = { 8, "" };
         err = v3d_poll_counter(V3D_CLE_RFC, last_rfc, &err_render_timeout,
-                                "RFC (render)", 0, rcl_start, rcl_end);
+                                "RFC (render)", 0, rcl_start, rcl_end,
+                                &diag_bufs);
         if (err)
             return err;
     }

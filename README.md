@@ -411,7 +411,27 @@ for why the counter must be volatile) before any further register
 writes. This isn't "wait for an async op to finish" - there's nothing
 meaningful to poll for until new work is actually queued - just room
 for the hardware to finish processing one control write before the
-next one arrives. Not yet re-tested on hardware.
+next one arrives.
+
+**Hardware result, attempt 10 (2026-09-24) - best state seen yet:**
+`CS=0x20` → `CTRUN=1`, no error, no halt - the CLE thread is genuinely
+**running**, for the first time across ten attempts. `CA=0x00000010`
+(suspiciously tiny - none of our real buffers are anywhere near this)
+and `EA=0x030A9000`, which matched neither `wQBA` nor `wQEA` from this
+submission. Rather than pattern-match `EA` against a *guessed* buffer
+address via page-layout arithmetic (exactly the kind of guess this
+project has repeatedly gotten burned trusting), extended the
+diagnostic to log `tile_alloc`/`render_target`/`tile_state`'s actual
+physical addresses alongside everything else
+(`diag_bufs_t` in `cl_clear.c`) so the next result answers this with
+data instead of arithmetic.
+
+The thread being confirmed alive and running (not wedged, not errored)
+for a full 5,000,000-iteration timeout without ever hitting `OP_FLUSH`
+narrows things meaningfully: this now looks like a genuine control-list
+*content* or infinite-loop/wait issue, not a setup/reset/infrastructure
+one - a different, narrower class of problem than anything the last
+nine attempts were chasing.
 
 ## Layout
 
