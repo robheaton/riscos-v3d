@@ -19,6 +19,14 @@ REM copy - it's a PMP dynamic area pointer (see cl_clear.h), which
 REM lives in RISC OS's shared logical address space rather than this
 REM task's own Application Space.
 
+task% = 0 : REM must exist before ON ERROR can safely reference it -
+            REM see PROCerror: a first version left this unset, and an
+            REM early error (before Wimp_Initialise assigns task%) sent
+            REM the handler into infinite recursion (referencing task%
+            REM inside a handler for "undefined variable" is itself an
+            REM "undefined variable" error), flooding the screen with
+            REM the SAME message and hiding whatever the real original
+            REM error was.
 ON ERROR PROCerror : END
 
 REM --- power on and get a sprite from the GPU ---
@@ -98,6 +106,9 @@ SYS "Wimp_CloseDown", task%, &4B534154
 END
 
 DEF PROCerror
-  REPORT : PRINT " (error "; ERR; ")"
+  ON ERROR OFF : REM disarm first - belt and braces against this
+                 REM handler ever recursing into itself again,
+                 REM regardless of what future edits do here
+  REPORT : PRINT " (error "; ERR; " at line "; ERL; ")"
   IF task% > 0 THEN SYS "Wimp_CloseDown", task%, &4B534154
 ENDPROC
