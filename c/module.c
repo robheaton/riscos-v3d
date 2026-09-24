@@ -195,6 +195,13 @@ static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
     if (n > 1) ident[1] = IO_WORD(v3d, V3D_HUB_IDENT1);
     if (n > 2) ident[2] = IO_WORD(v3d, V3D_HUB_IDENT2);
     if (n > 3) ident[3] = IO_WORD(v3d, V3D_CTL_IDENT0);
+    /* CT0CS/CT1CS added to check what a freshly-reset thread's state
+     * actually is *before* any submission ever happens - v3d_restart_
+     * thread's "skip restart if CTRUN already set" logic assumes a
+     * fresh thread reads CTRUN=0, and that assumption has never
+     * actually been checked in isolation like this. */
+    if (n > 4) ident[4] = IO_WORD(v3d, V3D_CLE_CT0CS);
+    if (n > 5) ident[5] = IO_WORD(v3d, V3D_CLE_CT1CS);
 
     io_unmap(&v3d);
     return NULL;
@@ -255,14 +262,16 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
         case SWI_V3D_ReadIdent:
         {
-            unsigned int ident[4] = { 0 };
-            _kernel_oserror *err = v3d_read_ident(ident, 4);
+            unsigned int ident[6] = { 0 };
+            _kernel_oserror *err = v3d_read_ident(ident, 6);
             if (err)
                 return err;
             r->r[0] = ident[0];
             r->r[1] = ident[1];
             r->r[2] = ident[2];
             r->r[3] = ident[3];
+            r->r[4] = ident[4]; /* CT0CS - diagnostic, see v3d_read_ident */
+            r->r[5] = ident[5]; /* CT1CS */
             return NULL;
         }
 
