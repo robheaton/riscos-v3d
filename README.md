@@ -1,4 +1,4 @@
-# V3DDriver — M0-M3 complete: GPU-rendered sprite displayed in a Wimp window, hardware-verified
+# V3DDriver — real desktop window fills now GPU-accelerated via GraphicsV, hardware-verified
 
 An independent RISC OS module driving the Raspberry Pi 4/CM4's
 VideoCore VI (V3D) GPU directly at the register level. As of
@@ -1695,9 +1695,10 @@ targeting the real framestore at a real rectangle, verified visually -
 `GraphicsV`, handle op 2 (fill) only, ECF-solid-only, behind an
 explicit opt-in (not auto-claimed on module load, given a silently
 wrong fill corrupts visible desktop state, which is worse than a
-crash) - **done** (build-verified, not yet hardware-tested), see
-`V3D_AccelStart`/`V3D_AccelStop`/`V3D_AccelStats` below; (5) op 1
-(copy), non-overlapping only, as a later pass.
+crash) - **done, hardware-verified** (2028/2028 real desktop fills
+accelerated, zero failures, desktop confirmed visually correct
+throughout), see `V3D_AccelStart`/`V3D_AccelStop`/`V3D_AccelStats`
+below; (5) op 1 (copy), non-overlapping only, as a later pass.
 
 ### Step 1: screen-mode groundwork (2026-09-26, hardware-verified)
 
@@ -1960,7 +1961,7 @@ the top of the screen in memory, not the bottom) - real evidence to
 reconcile against `GraphicsV`'s own bottom-left-origin convention when
 that work starts.
 
-### Step 4: claim GraphicsV for real (2026-09-26, build-verified, not yet hardware-tested)
+### Step 4: claim GraphicsV for real (2026-09-26, hardware-verified)
 
 `V3D_AccelStart`/`V3D_AccelStop`/`V3D_AccelStats` - new `c/gfxv_accel.h`/
 `.c`. This is the first code in the project that, once claimed, sits in
@@ -2061,4 +2062,16 @@ same swapped value either way and slip through - consistent with the
 successes skewing toward very small areas, 2 to 960 sq px).
 
 **Fixed**: swapped the decode to `top = params[1]`, `bottom =
-params[3]`. Not yet re-tested on hardware.
+params[3]`.
+
+**Confirmed fixed on hardware, 2026-09-26**: same `AccelTest.bas`
+exercise (drag/resize/scroll windows, open/close a directory display) -
+**2028/2028 (100%) of genuine solid-ECF fills were accelerated by the
+GPU, zero failures**, and the desktop looked completely normal
+throughout (explicitly confirmed, not just assumed from the absence of
+an obvious glitch). This is the milestone the whole "GraphicsV Render
+accelerator" effort was aimed at: real V3D GPU hardware is now
+transparently accelerating real Wimp desktop window-fill operations,
+indistinguishably from normal CPU rendering, entirely through the
+documented, sanctioned `GraphicsV` mechanism - no Wimp/WindowManager
+patching, no undocumented hooks.
