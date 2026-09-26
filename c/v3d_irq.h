@@ -46,14 +46,20 @@
  * waiting code can tell bin and render completion apart, matching what
  * the existing BFC/RFC register polling already distinguishes.
  *
- * Deliberately NOT yet the only way completion is detected:
- * cl_clear.c's v3d_poll_counter() now checks both the IRQ-driven
- * counter and the original BFC/RFC register in the same loop, either
- * one satisfying it - so if anything about the interrupt path is
- * subtly wrong, behaviour doesn't regress, it just falls back to
- * exactly what already worked, while still being observable whether
- * the interrupt fired correctly. Removing the register-based half
- * entirely is a later step, once that's been confirmed reliable.
+ * Originally shipped as a hybrid: cl_clear.c's v3d_poll_counter()
+ * checked both the IRQ-driven counter and the original BFC/RFC
+ * register in the same loop, either one satisfying it, so a subtly-
+ * wrong interrupt path couldn't regress reliability while it was still
+ * unproven. Two real, machine-freezing bugs were found and fixed this
+ * way (a shared hub/core GIC line left unacknowledged, and a missing
+ * module private-word in OS_ClaimDeviceVector's R2 - see the README's
+ * "Real IRQ handling" section for the full incident history), and
+ * hardware-confirmed reliable under sustained repetition (2026-09-26:
+ * StressTest.bas, 50/50 IRQ-driven completions on both V3D_ClearTest
+ * and V3D_ClearToSprite, zero fallback). The register-polling half has
+ * since been removed from v3d_poll_counter() - the interrupt path is
+ * what this driver actually relies on now, not a safety net kept
+ * "just in case" after it stopped earning its complexity.
  *
  * V3D_IRQTest remains a self-contained, isolated diagnostic (its own
  * claim/test/release cycle) - it must not be run after real submission

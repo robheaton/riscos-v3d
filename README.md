@@ -1428,6 +1428,26 @@ the 50 calls were genuinely IRQ-driven. Not yet re-run on hardware.
 Once confirmed 50/50, the register-polling half of `v3d_poll_counter()`
 can be dropped, now that the interrupt path is trusted.
 
+**Hardware result (2026-09-26) - CONFIRMED, 50/50.** `StressTest.bas`:
+50 clean iterations, `V3D_ClearTest` IRQ-driven on 50/50 calls,
+`V3D_ClearToSprite` IRQ-driven on 50/50 calls - zero fallback to
+register polling, on either SWI, across the whole run. Real interrupt-
+driven GPU completion is now proven reliable under sustained
+repetition, not just a one-off. Dropped the register-polling half of
+`v3d_poll_counter()` - the interrupt path is what this driver actually
+relies on now.
+
+**Real IRQ handling: complete.** Summary of the full path, since it
+took nineteen "attempt N" hardware round-trips across three separate
+bugs to get here (two of them genuine machine-freezing incidents, not
+just wrong answers): the bin/render wait no longer touches any V3D
+hardware register directly - it purely watches a memory counter the
+interrupt handler maintains, woken by a real `OS_ClaimDeviceVector`-
+claimed GIC interrupt, acknowledged correctly at both the hub and core
+level (the shared-GIC-line freeze), with the module's own private word
+correctly threaded through to the handler (the null-pointer-chain
+freeze). Next milestones below.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

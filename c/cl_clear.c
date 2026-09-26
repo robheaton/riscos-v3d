@@ -592,54 +592,34 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
 }
 
 /*
- * `irq_counter`/`irq_initial`: the real interrupt handler (v3d_irq.c)
- * now maintains its own bin/render-done counters independently of
- * this register poll - either signal satisfies this function
- * (register changing, or the IRQ counter advancing past its captured
- * "before" value), so a subtly-wrong interrupt path can't regress
- * reliability, it just falls back to exactly what already worked,
- * while still being observable whether the interrupt fired correctly.
- * Once that's confirmed reliable on hardware, a later change can drop
- * the register half and poll only the counter.
+ * Waits for the real interrupt handler (v3d_irq.c) to advance its own
+ * bin/render-done counter past the value captured before submission.
+ *
+ * This used to also poll V3D_CLE_BFC/RFC directly as a hybrid fallback
+ * (either signal satisfying it), deliberately, while the interrupt
+ * path was still unproven - a subtly-wrong interrupt couldn't regress
+ * reliability that way, it would just silently fall back to register
+ * polling. Hardware-confirmed reliable under sustained repetition
+ * (2026-09-26: StressTest.bas, 50/50 IRQ-driven completions on both
+ * V3D_ClearTest and V3D_ClearToSprite, zero fallback) - the register
+ * half added real complexity (a second, always-open V3D_MB_BASE
+ * mapping inside this loop) for a safety net that never triggered
+ * once trust was established, so it's gone now, not kept "just in
+ * case": the interrupt path is what this driver actually relies on.
  */
-static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
-                                          volatile unsigned int *irq_counter,
+static _kernel_oserror *v3d_poll_counter(volatile unsigned int *irq_counter,
                                           unsigned int irq_initial,
                                           _kernel_oserror *timeout_err,
                                           const char *what, int is_bin,
                                           unsigned int qba, unsigned int qea,
                                           const diag_bufs_t *bufs)
 {
-    unsigned int outer;
+    unsigned int spin;
 
-    for (outer = 0; outer < 500u; outer++)
+    for (spin = 0; spin < 5000000u; spin++)
     {
-        io_mapping_t v3d;
-        unsigned int burst;
-        _kernel_oserror *err;
-
         if (*irq_counter != irq_initial)
             return NULL;
-
-        err = io_map(V3D_MB_BASE, &v3d);
-        if (err)
-            return err;
-
-        for (burst = 0; burst < 10000u; burst++)
-        {
-            if ((IO_WORD(v3d, reg) & 0xFFu) != initial)
-            {
-                io_unmap(&v3d);
-                return NULL;
-            }
-            if (*irq_counter != irq_initial)
-            {
-                io_unmap(&v3d);
-                return NULL;
-            }
-        }
-
-        io_unmap(&v3d);
     }
 
     diagnose_timeout(timeout_err, what, is_bin, qba, qea, bufs);
@@ -671,7 +651,6 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
     unsigned int pixel_phys;
     io_mapping_t v3d;
-    unsigned int last_bfc, last_rfc;
     unsigned int last_bin_irq, last_render_irq;
     unsigned int page = base_page;
     diag_bufs_t diag_bufs;
@@ -804,7 +783,6 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_PTB_BPOS) = 0;
 
     v3d_flush_caches(&v3d);
-    last_bfc = IO_WORD(v3d, V3D_CLE_BFC) & 0xFFu;
     last_bin_irq = g_v3d_irq_bin_done_count;
 
     /* Matches the real Linux v3d driver's v3d_bin_job_run() exactly -
@@ -820,8 +798,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
 
     {
         static _kernel_oserror err_bin_timeout = { 7, "" };
-        err = v3d_poll_counter(V3D_CLE_BFC, last_bfc,
-                                &g_v3d_irq_bin_done_count, last_bin_irq,
+        err = v3d_poll_counter(&g_v3d_irq_bin_done_count, last_bin_irq,
                                 &err_bin_timeout,
                                 "BFC (binning)", 1, bcl_start, bcl_end,
                                 &diag_bufs);
@@ -834,7 +811,6 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     if (err) return err;
 
     v3d_flush_caches(&v3d);
-    last_rfc = IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu;
     last_render_irq = g_v3d_irq_render_done_count;
 
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
@@ -844,8 +820,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
 
     {
         static _kernel_oserror err_render_timeout = { 8, "" };
-        err = v3d_poll_counter(V3D_CLE_RFC, last_rfc,
-                                &g_v3d_irq_render_done_count, last_render_irq,
+        err = v3d_poll_counter(&g_v3d_irq_render_done_count, last_render_irq,
                                 &err_render_timeout,
                                 "RFC (render)", 0, rcl_start, rcl_end,
                                 &diag_bufs);
