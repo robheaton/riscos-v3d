@@ -604,6 +604,7 @@ enum
     SWI_V3D_ScreenCopyTest = 16,
     SWI_V3D_AccelCopyStats = 17,
     SWI_V3D_OverlapCopyTest = 18,
+    SWI_V3D_ScreenCopyOverlapTest = 19,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1167,6 +1168,75 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = stride;
             r->r[2] = tiles_x;
             r->r[3] = tiles_y;
+            return NULL;
+        }
+
+        case SWI_V3D_ScreenCopyOverlapTest:
+        {
+            /* Real-framestore counterpart to V3D_OverlapCopyTest -
+             * same escalation discipline as every other real-screen
+             * feature in this driver (synthetic buffer first, then
+             * the real framestore, before ever trusting it live -
+             * this one was already live-wired by the time this test
+             * was added, given handle_render_copy already calls
+             * v3d_copy_screen_overlapping; this closes that gap
+             * retroactively). R0=src_x, R1=src_y, R2=dest_x, R3=dest_y,
+             * R4=width, R5=height in - deliberately allowed to
+             * overlap (unlike V3D_ScreenCopyTest, which refuses).
+             * Writes DIRECTLY into the real, live screen framestore,
+             * same caution as every other ScreenFillTest/ScreenCopyTest.
+             * Returns tiles_x (R0), tiles_y (R1). */
+            unsigned int src_x = (unsigned int) r->r[0];
+            unsigned int src_y = (unsigned int) r->r[1];
+            unsigned int dest_x = (unsigned int) r->r[2];
+            unsigned int dest_y = (unsigned int) r->r[3];
+            unsigned int width = (unsigned int) r->r[4];
+            unsigned int height = (unsigned int) r->r[5];
+            unsigned int tiles_x, tiles_y;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    27, "V3DDriver: V3D_ScreenCopyOverlapTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_screen_framestore();
+            if (err)
+                return err;
+
+            if (width == 0u || height == 0u ||
+                src_x + width > g_screen_info.xwind_limit + 1u ||
+                src_y + height > g_screen_info.ywind_limit + 1u ||
+                dest_x + width > g_screen_info.xwind_limit + 1u ||
+                dest_y + height > g_screen_info.ywind_limit + 1u)
+            {
+                static _kernel_oserror err_out_of_bounds = {
+                    24, "V3DDriver: V3D_ScreenCopyOverlapTest rectangle is "
+                        "outside the current screen mode's bounds"
+                };
+                return &err_out_of_bounds;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+                                    src_x, src_y, dest_x, dest_y, width, height,
+                                    g_screen_phys_base, g_screen_info.line_length,
+                                    &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = tiles_x;
+            r->r[1] = tiles_y;
             return NULL;
         }
 
