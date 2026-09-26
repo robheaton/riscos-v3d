@@ -79,7 +79,8 @@ static void v3d_irq_call_clear(void)
 
 int v3d_irq_handler(_kernel_swi_regs *r, void *pw)
 {
-    unsigned int sts;
+    unsigned int sts, hub_sts;
+    int handled = 0;
 
     (void) r;
     (void) pw;
@@ -100,9 +101,28 @@ int v3d_irq_handler(_kernel_swi_regs *r, void *pw)
         /* Acknowledge exactly the bits found - standard write-1-to-
          * clear, matches the real Linux v3d driver's own IRQ handler. */
         IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_CLR) = sts;
-        v3d_irq_call_clear();
         if (sts & V3D_INT_FLDONE) g_v3d_irq_bin_done_count++;
         if (sts & V3D_INT_FRDONE) g_v3d_irq_render_done_count++;
+        handled = 1;
+    }
+
+    /* Hub and core share one GIC line on this hardware (V3D 4.2) - see
+     * the long comment on V3D_HUB_INT_STS in v3d_regs.h. Hub sources
+     * are masked off entirely (v3d_irq_unmask), but read+acknowledge
+     * unconditionally anyway, belt and braces: this is a level-
+     * triggered line, and anything left set and unacknowledged here
+     * would make the GIC re-assert forever the instant HAL_IRQClear
+     * runs - exactly what froze the machine before this was added. */
+    hub_sts = IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_STS);
+    if (hub_sts)
+    {
+        IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_CLR) = hub_sts;
+        handled = 1;
+    }
+
+    if (handled)
+    {
+        v3d_irq_call_clear();
         g_v3d_irq_claimed_count++;
         return 0; /* VECTOR_CLAIM */
     }
@@ -205,7 +225,11 @@ _kernel_oserror *v3d_irq_test_call_clear(void)
  * the real Linux v3d driver's own v3d_irq_enable() pattern
  * (drivers/gpu/drm/v3d/v3d_irq.c: V3D_CORE_WRITE(INT_MSK_SET,
  * ~V3D_CORE_IRQS) then V3D_CORE_WRITE(INT_MSK_CLR, V3D_CORE_IRQS)),
- * not guessed. Requires the permanent mapping to already exist.
+ * not guessed. Hub sources are masked off entirely and never
+ * unmasked - we don't need any of them (no MMU, no TFU) - see the long
+ * comment on V3D_HUB_INT_STS in v3d_regs.h for why this hardware makes
+ * that matter more than it otherwise would (shared GIC line with
+ * core). Requires the permanent mapping to already exist.
  */
 static _kernel_oserror *v3d_irq_unmask(void)
 {
@@ -217,10 +241,54 @@ static _kernel_oserror *v3d_irq_unmask(void)
         return &err_not_mapped;
     }
 
+    IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_MSK_SET) = 0xFFFFFFFFu;
     IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
     IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_CLR) =
         (V3D_INT_FLDONE | V3D_INT_FRDONE);
     return NULL;
+}
+
+/*
+ * V3D_IRQTest's own, fully isolated exercise of the real live-fire
+ * path: unmask, HAL_IRQEnable, then genuinely wait (not just enable-
+ * then-immediately-disable, which never gives real hardware time to
+ * actually latch and deliver anything) while watching the handler's
+ * own counters, then HAL_IRQDisable and re-mask everything off before
+ * returning. If nothing at all is pending or spuriously triggerable,
+ * both counts stay 0 for the whole wait. Never submits any GPU job -
+ * FLDONE/FRDONE cannot legitimately fire here, so *any* handler
+ * invocation during this window is exactly the class of problem this
+ * function exists to catch safely, in isolation, before real
+ * submission code ever calls v3d_irq_ensure_ready() for real.
+ */
+_kernel_oserror *v3d_irq_test_live_cycle(unsigned int *out_claimed,
+                                           unsigned int *out_spurious)
+{
+    _kernel_oserror *err;
+    unsigned int spin;
+
+    err = v3d_irq_unmask();
+    if (err)
+        return err;
+
+    err = v3d_irq_hal_enable();
+    if (err)
+        return err;
+
+    for (spin = 0; spin < 10000000u; spin++)
+        ; /* deliberately idle - see comment above */
+
+    *out_claimed = g_v3d_irq_claimed_count;
+    *out_spurious = g_v3d_irq_spurious_count;
+
+    err = v3d_irq_hal_disable();
+
+    /* Re-mask everything at the core level regardless of the disable
+     * result above, so we leave nothing enabled behind us. */
+    if (g_v3d_permanent_mapped)
+        IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
+
+    return err;
 }
 
 _kernel_oserror *v3d_irq_ensure_ready(void)

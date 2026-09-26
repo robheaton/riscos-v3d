@@ -117,6 +117,19 @@ _kernel_oserror *v3d_irq_resolve_clear(void);
 _kernel_oserror *v3d_irq_test_call_clear(void);
 
 /*
+ * Isolated live-fire test: unmask, HAL_IRQEnable, genuinely wait while
+ * watching the handler's counters, HAL_IRQDisable, re-mask. Never
+ * submits any GPU job. See v3d_irq.c for the full reasoning - this is
+ * what actually tests whether something can trigger a spurious/
+ * storming interrupt before any real submission code ever unmasks for
+ * real via v3d_irq_ensure_ready(). v3d_irq_claim() and
+ * v3d_irq_resolve_clear() must have been called first (V3D_IRQTest
+ * does this itself).
+ */
+_kernel_oserror *v3d_irq_test_live_cycle(unsigned int *out_claimed,
+                                           unsigned int *out_spurious);
+
+/*
  * Idempotent - claims the vector, resolves HAL_IRQClear, and unmasks
  * FLDONE|FRDONE, all exactly once no matter how many times called.
  * Real submission code must call this (lazily, before its first real

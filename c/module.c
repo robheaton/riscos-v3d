@@ -435,15 +435,20 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
         {
             /* Real IRQ handling test - see v3d_irq.h. Claims the
              * vector, resolves+exercises the raw HAL_IRQClear call
-             * (stage 2a - proves the address/static-base/branch
-             * sequence doesn't crash, from safe non-interrupt context),
-             * exercises HAL_IRQEnable/HAL_IRQDisable, releases the
-             * vector again (this is a one-shot test, not permanent
-             * wiring yet), and reports how many times the handler was
-             * actually invoked, claimed and spurious - both should be
-             * 0, since no V3D interrupt bit is unmasked anywhere in
-             * this stage. */
+             * (proves the address/static-base/branch sequence doesn't
+             * crash, from safe non-interrupt context), then runs the
+             * fully isolated live-fire cycle (unmask, HAL_IRQEnable,
+             * genuinely wait, HAL_IRQDisable, re-mask - see
+             * v3d_irq_test_live_cycle's own comment) - never submits
+             * any GPU job, so any handler invocation at all during the
+             * wait means something can trigger spuriously and must be
+             * understood before real submission code ever unmasks for
+             * real. Releases the vector again (this is a one-shot
+             * test, not permanent wiring), and reports the claimed/
+             * spurious counts observed *during the live-fire wait
+             * specifically* - both should be 0. */
             _kernel_oserror *err, *cleanup_err;
+            unsigned int live_claimed = 0, live_spurious = 0;
 
             g_v3d_irq_claimed_count = 0;
             g_v3d_irq_spurious_count = 0;
@@ -454,8 +459,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
             if (!err) err = v3d_irq_resolve_clear();
             if (!err) err = v3d_irq_test_call_clear();
-            if (!err) err = v3d_irq_hal_enable();
-            if (!err) err = v3d_irq_hal_disable();
+            if (!err) err = v3d_irq_test_live_cycle(&live_claimed, &live_spurious);
 
             /* Always release, even if something above failed - we did
              * successfully claim, so we must clean that up regardless
@@ -467,8 +471,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            r->r[0] = g_v3d_irq_claimed_count;
-            r->r[1] = g_v3d_irq_spurious_count;
+            r->r[0] = live_claimed;
+            r->r[1] = live_spurious;
             return NULL;
         }
 

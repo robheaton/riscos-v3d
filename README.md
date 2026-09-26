@@ -1303,6 +1303,57 @@ observability, to be removed once trust is established and the
 register-polling half can be dropped entirely. Not yet tested on
 hardware.
 
+**Hardware result (2026-09-26) - MACHINE FROZE. Real incident, root-
+caused, fixed.** Fresh reboot, `V3D_PowerOn` then `V3D_ClearTest`: the
+machine froze outright with `Internal error: abort on data transfer at
+&20F09D7C` - a genuine ARM data abort, unrecoverable, requiring a
+physical reset. This is exactly the risk class this whole feature was
+staged to catch early and safely; here it wasn't caught early enough,
+so it's recorded here in full rather than glossed over.
+
+Root cause, found by reading the real Linux v3d driver's own IRQ init
+code (`drivers/gpu/drm/v3d/v3d_irq.c`, `v3d_irq_init()`), not guessed:
+on V3D 4.2 (this hardware), hub and core interrupts can be wired to a
+**single shared GIC line** rather than two separate ones -
+`v3d->single_irq_line` is set whenever the device tree provides only
+one IRQ entry for the device, and BCM2711's real device tree
+(`arch/arm/boot/dts/broadcom/bcm2711.dtsi`) gives the `v3d` node
+exactly one: `interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>`. That's a
+**level-triggered** line. Our handler only ever read/acknowledged
+`V3D_CTL_INT_STS` (core) - it never touched `V3D_HUB_INT_STS` at all.
+If anything at the hub level was ever set and unacknowledged, the GIC
+would re-assert the same line again the instant it was acknowledged at
+the controller level (`HAL_IRQClear`), since the peripheral's output
+was still physically high - an interrupt storm, entered the moment
+`HAL_IRQEnable` ran. That fits the symptom exactly: not a crash inside
+our own submission logic (which never got the chance to run first -
+this froze immediately on the very first `V3D_ClearTest` after
+`PowerOn`, before any meaningful GPU work), but a runaway low-level
+condition consistent with repeated re-entry corrupting the IRQ stack.
+
+**Fix, two-pronged** (defence in depth, not just the more "obviously
+correct" half alone): (1) `v3d_irq_unmask()` now explicitly masks off
+*every* hub-level interrupt source (`V3D_HUB_INT_MSK_SET = 0xFFFFFFFF`)
+- nothing at the hub level is needed for a simple clear-to-colour job,
+so structurally prevent it from ever being the trigger at all; (2) the
+handler unconditionally reads and acknowledges `V3D_HUB_INT_STS`
+regardless, matching the real driver's own `v3d_hub_irq()` fallback for
+exactly this `single_irq_line` configuration - belt and braces, in
+case something is ever unmasked from outside this driver's control.
+
+Given a real freeze already happened once, added one more layer of
+caution before testing again rather than going straight back to full
+`V3D_ClearTest`: `V3D_IRQTest` now exercises the actual live-fire path
+in complete isolation - unmask, `HAL_IRQEnable`, genuinely wait (not
+just enable-then-immediately-disable, which never gave real hardware
+time to latch and deliver anything - the previous "clean" `V3D_IRQTest`
+result likely never actually tested this at all), watch the handler's
+counters, `HAL_IRQDisable`, re-mask - without ever submitting a GPU
+job, so `FLDONE`/`FRDONE` cannot legitimately fire and *any* handler
+invocation during the wait is exactly the class of problem this exists
+to catch safely, before real submission code ever unmasks for real.
+Not yet tested on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

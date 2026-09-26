@@ -85,9 +85,43 @@
  * Source: real Linux kernel drivers/gpu/drm/v3d/v3d_regs.h.
  */
 #define V3D_HUB_INT_STS     (V3D_HUB + 0x50u)
+#define V3D_HUB_INT_SET     (V3D_HUB + 0x54u)
+#define V3D_HUB_INT_CLR     (V3D_HUB + 0x58u)
+#define V3D_HUB_INT_MSK_STS (V3D_HUB + 0x5Cu)
+#define V3D_HUB_INT_MSK_SET (V3D_HUB + 0x60u)
+#define V3D_HUB_INT_MSK_CLR (V3D_HUB + 0x64u)
+#define V3D_HUB_INT_TFUF    (1u << 0)
+#define V3D_HUB_INT_TFUC    (1u << 1)
+#define V3D_HUB_INT_MSO     (1u << 2)
 #define V3D_HUB_INT_MMU_CAP (1u << 3)
 #define V3D_HUB_INT_MMU_PTI (1u << 4)
 #define V3D_HUB_INT_MMU_WRV (1u << 5)
+/*
+ * IMPORTANT (found the hard way, 2026-09-26 - a real hardware freeze,
+ * "Internal error: abort on data transfer", investigated via the real
+ * Linux v3d driver's own IRQ init code, not guessed): on V3D 4.2 (this
+ * hardware), the hub and core interrupts are wired to a SINGLE shared
+ * GIC line, not two separate ones - confirmed from two independent
+ * real sources: the upstream Linux driver's own v3d_irq_init()
+ * (drivers/gpu/drm/v3d/v3d_irq.c) sets single_irq_line=true whenever
+ * the device tree provides only one IRQ entry for this device, and
+ * BCM2711's real device tree (arch/arm/boot/dts/broadcom/
+ * bcm2711.dtsi) gives the v3d node exactly one: `interrupts = <GIC_SPI
+ * 74 IRQ_TYPE_LEVEL_HIGH>`. This is a LEVEL-triggered line - if a
+ * hub-level interrupt source is ever unmasked and its status bit sets
+ * without ever being read+acknowledged (V3D_HUB_INT_STS/CLR), the GIC
+ * will keep re-asserting the same line forever the instant it's
+ * acknowledged at the controller level, since the peripheral's output
+ * is still physically high - an interrupt storm, which is almost
+ * certainly what froze the machine: the handler only ever read/cleared
+ * V3D_CTL_INT_STS (core), never V3D_HUB_INT_STS. Fixed two ways: hub
+ * sources are now explicitly masked off entirely (nothing at the hub
+ * level is needed for a simple clear-to-colour job), and the handler
+ * unconditionally reads+acknowledges V3D_HUB_INT_STS regardless,
+ * matching the real driver's own v3d_hub_irq() fallback for exactly
+ * this single_irq_line configuration - belt and braces, not just the
+ * mask alone, in case something is unmasked from outside our control.
+ */
 #define V3D_MMU_CTL         (V3D_HUB + 0x1200u)
 #define V3D_MMU_CTL_ENABLE  (1u << 0)
 #define V3D_MMU_VIO_ID      (V3D_HUB + 0x122Cu)
