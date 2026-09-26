@@ -884,6 +884,30 @@ is real data rather than a fix layered on a guess. Refactored the
 mailbox-call helper out of `memsplit.c` into `bcmsupport.c` so both
 SWIs share it. Not yet tested on hardware.
 
+**Hardware result, attempt 12 (2026-09-26) - confirmed.**
+`V3D_ClockInfo` returned `state=0 rate=250000000 max_rate=500000000` -
+`state=0` means the firmware has V3D's clock gated *off* right now;
+`rate`/`max_rate` are just remembered/available values, not evidence
+of anything running. This is a clean, direct confirmation of attempt
+11's theory, not an inference: the GPU register block that has always
+answered plain reads/writes correctly (`V3D_ReadIdent`,
+`V3D_TestBuffer`) simply has no clock driving its CLE state machine,
+which explains every hang on record without needing address ranges,
+session history, or control-list content to be wrong at all.
+
+**Fix**: `v3d_power_on()` now calls `v3d_ensure_clock_on()`
+(`v3d_clock.c`) *before* the `PM_GRAFX` reset pulse - turning the clock
+on is a prerequisite for everything else this function does, not a
+follow-up. It requests `SetClockState(V3D, 1)`, then only calls
+`SetClockRate` if the firmware has no rate remembered at all (this
+hardware already had one - `250000000` - so that path won't even fire
+here, but it's there for a from-cold-boot firmware that hasn't been
+asked for a V3D rate yet). `V3D_PowerOn` now also returns the
+confirmed running clock rate in R1. Not yet tested on hardware - if
+this is right, `V3D_ClearTest` should now succeed on the very first
+call after `V3D_PowerOn`, on this exact board, without touching
+anything else.
+
 ## Testing on hardware
 
 1. Build with a working GCCSDK RISC OS cross-toolchain.

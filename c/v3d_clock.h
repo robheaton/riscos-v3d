@@ -31,4 +31,17 @@ _kernel_oserror *v3d_query_clock(unsigned int *state_out,
                                    unsigned int *rate_out,
                                    unsigned int *max_rate_out);
 
+/*
+ * Confirmed root cause (2026-09-26 hardware test): V3D_ClockInfo
+ * reported state=0 (clock gated off by firmware) with rate=250000000
+ * remembered but not applied - explaining every CLE hang logged so
+ * far (registers read/write fine with no clock; a state machine that
+ * needs that clock to advance never does, with no error flags, since
+ * nothing is actually malfunctioning). Turns the clock on
+ * (SetClockState) and, if the firmware has no rate remembered at all,
+ * requests one (SetClockRate, using GetMaxClockRate's answer) - a
+ * one-way "make sure it's on" call, not a toggle.
+ */
+_kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out);
+
 #endif

@@ -109,15 +109,26 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
  * stuck on an early malformed submission. Explicitly asserting reset
  * first, then deasserting it, forces a genuine pulse every call.
  */
-static _kernel_oserror *v3d_power_on(void)
+static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
 {
     io_mapping_t pm, v3d;
     _kernel_oserror *err;
-    unsigned int val;
+    unsigned int val, clock_rate;
     volatile unsigned int spin; /* volatile: the reset-pulse delay loop
                                   * below has no other side effect, and
                                   * -O2 is entitled to delete a plain
                                   * empty counting loop entirely */
+
+    /* --- firmware clock gate: confirmed root cause of every CLE hang
+     * logged so far (2026-09-26 hardware test: V3D_ClockInfo reported
+     * state=0, clock gated off) - see v3d_clock.h. Must happen before
+     * anything else touches V3D's own registers, not just before the
+     * CLE is used: a gated block can still be read/written (explaining
+     * why ReadIdent/TestBuffer always worked regardless), so this was
+     * never going to show up as a register-access failure. */
+    err = v3d_ensure_clock_on(&clock_rate);
+    if (err)
+        return err;
 
     /* --- PM_GRAFX: assert then deassert V3D reset (real pulse) --- */
     err = io_map(PM_MB_BASE, &pm);
@@ -171,6 +182,7 @@ static _kernel_oserror *v3d_power_on(void)
     io_unmap(&v3d);
 
     g_powered_on = 1;
+    *clock_rate_out = clock_rate;
     return NULL;
 }
 
@@ -257,10 +269,12 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
     {
         case SWI_V3D_PowerOn:
         {
-            _kernel_oserror *err = v3d_power_on();
+            unsigned int clock_rate;
+            _kernel_oserror *err = v3d_power_on(&clock_rate);
             if (err)
                 return err;
             r->r[0] = 1; /* success flag */
+            r->r[1] = clock_rate; /* Hz, confirmed on from v3d_ensure_clock_on */
             return NULL;
         }
 
