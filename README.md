@@ -1,4 +1,4 @@
-# V3DDriver — M0-M2 complete, GPU clear reliable again: real GPU-drawn pixels, hardware-verified
+# V3DDriver — M0-M3 complete: GPU-rendered sprite displayed in a Wimp window, hardware-verified
 
 An independent RISC OS module driving the Raspberry Pi 4/CM4's
 VideoCore VI (V3D) GPU directly at the register level. As of
@@ -962,11 +962,39 @@ happened to leave that clock in varied across boots/sessions. M3
    into BASIC (`LOAD "ShowSprite"` then `RUN`, with `V3DDriver,ffa`
    already `*RMLoad`ed) - see "M3" above for what to expect.
 
+**Hardware result, attempt 14 (2026-09-26) - M3 CONFIRMED.** Ran
+`ShowSprite.bas` by double-clicking it from the Filer (not from a Task
+Window - see below for why that distinction matters). A window opened
+showing a solid yellow 64x64 area, and closed cleanly with no error.
+Decoded the colour to make sure it was actually correct rather than a
+bug: the sprite is type 6 (32bpp **T-B-G-R**, per `sprite.c`) - alpha
+in bits 31-24, blue 23-16, green 15-8, red 7-0. `&FF00FFFF` in that
+layout is alpha=FF, blue=00, green=FF, red=FF - full red and green, no
+blue - which is exactly yellow. The GPU wrote precisely what was
+asked for and the Wimp displayed it correctly; the earlier
+expectation of a different colour was just an unmatched assumption
+about hex-to-channel mapping, not a bug. Full pipeline confirmed
+end-to-end on real hardware: `V3D_PowerOn` (clock-enable + reset) ->
+`V3D_ClearToSprite` -> `OS_SpriteOp` plot in a redraw handler ->
+correct on-screen colour -> clean window close.
+
+**One real gotcha found along the way, not a driver bug**: an earlier
+attempt to run this same script from inside a Task Window failed with
+"Window Manager is currently in use" (RISC OS error, sourced to
+`TaskWindow`'s own veto of `Service_WimpCloseDown` for what it
+considers its own child task - confirmed by reading
+`TaskWindow`'s real source, not guessed). Cross-checked against RISC
+OS's own documentation: Task Windows are explicitly for programs that
+*don't* call `Wimp_Poll`/`Wimp_Initialise` - a real Wimp application
+like `ShowSprite.bas` needs to run as an independent task (e.g. via
+the Filer, as done here, or `Wimp_StartTask`), not inside a Task
+Window. Noted here so this doesn't get re-investigated as a code bug
+in a future session.
+
 ## Next milestones
 
-M2 (clear-to-colour, hardware-verified) is done. M3 (display in a Wimp
-window) is build-verified but not yet hardware-tested - see "M3" above.
-Not yet attempted:
+M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
+and hardware-verified. Not yet attempted:
 
 - **Robustness**: `V3D_ClearTest` has been confirmed working on a
   freshly-loaded module; it hasn't been stress-tested across many

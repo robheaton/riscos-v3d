@@ -13,6 +13,14 @@ REM
 REM Before running: *RMLoad the built V3DDriver,ffa module yourself.
 REM This program does not load it for you.
 REM
+REM Run this by double-clicking it in the Filer (or LOAD+RUN from a
+REM BASIC session started that way), NOT from inside a Task Window.
+REM This is a real Wimp application (calls Wimp_Initialise/Wimp_Poll),
+REM and Task Windows are specifically for programs that don't - running
+REM one there fails with "Window Manager is currently in use" (a real
+REM RISC OS Wimp/TaskWindow veto, confirmed against ROOL's own source
+REM and docs - not a bug in this script).
+REM
 REM The sprite's logical address returned by V3D_ClearToSprite is
 REM directly usable here, in a completely separate task, without any
 REM copy - it's a PMP dynamic area pointer (see cl_clear.h), which
