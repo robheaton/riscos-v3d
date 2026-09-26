@@ -378,6 +378,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
         case SWI_V3D_ClearToSprite:
         {
             unsigned int phys_addr, readback;
+            unsigned int bin_irq_before, render_irq_before;
             void *log_addr;
             _kernel_oserror *err;
 
@@ -397,6 +398,13 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
+            /* See V3D_ClearTest's own comment - temporary, stage-2b-only
+             * observability. Packed into one register here (unlike
+             * ClearTest's separate R2/R3) since R0-R2 are already used
+             * for the sprite area/readback/physical address. */
+            bin_irq_before = g_v3d_irq_bin_done_count;
+            render_irq_before = g_v3d_irq_render_done_count;
+
             err = v3d_clear_to_sprite(&g_pmp, CLEAR_SPRITE_BASE_PAGE, r->r[0],
                                        &phys_addr, &log_addr, &readback);
             if (err)
@@ -405,6 +413,9 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[0] = (unsigned int) log_addr; /* sprite area - pass to OS_SpriteOp */
             r->r[1] = readback;
             r->r[2] = phys_addr;
+            r->r[3] = ((g_v3d_irq_bin_done_count - bin_irq_before) != 0
+                       && (g_v3d_irq_render_done_count - render_irq_before) != 0)
+                      ? 1u : 0u; /* 1 = both completions were IRQ-driven */
             return NULL;
         }
 

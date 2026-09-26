@@ -1413,10 +1413,20 @@ correctly detected both bin and render completion for this exact job,
 not a polling fallback. This closes out real IRQ handling's live-fire
 milestone: the private-word fix and the hub-masking fix together
 resolve both freezes, and the interrupt-driven completion path now
-works correctly on real hardware. Next: confirm it holds up under
-repetition (`StressTest.bas`, watching `R2`/`R3` stay at 1 across many
-calls, not just once), then drop the register-polling half of
-`v3d_poll_counter()` now that the interrupt path is trusted.
+works correctly on real hardware.
+
+**Hardware result (2026-09-26) - repetition confirmed, but not yet
+proven IRQ-specific.** `StressTest.bas` ran 50 clean iterations of
+`V3D_PowerOn`+`V3D_ClearTest`+`V3D_ClearToSprite` with exact readback
+checks throughout - but the script predated `V3D_ClearTest`'s IRQ
+observability fields, so it only confirmed overall (hybrid) correctness,
+not specifically that the interrupt fired on every call rather than the
+register-polling fallback occasionally winning the race. Extended it to
+check `bin_irq`/`render_irq` (and `V3D_ClearToSprite`'s new packed IRQ
+flag, `R3`) strictly on every iteration, and to summarise how many of
+the 50 calls were genuinely IRQ-driven. Not yet re-run on hardware.
+Once confirmed 50/50, the register-polling half of `v3d_poll_counter()`
+can be dropped, now that the interrupt path is trusted.
 
 ## Next milestones
 
