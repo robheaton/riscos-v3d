@@ -108,64 +108,85 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
         dst[(*pos)++] = hex[(v >> i) & 0xFu];
 }
 
-_kernel_oserror *v3d_verify_framestore_contiguous(const v3d_screen_info_t *info,
-                                                    unsigned int *phys_base_out)
-{
-    unsigned int total_bytes = info->total_screen_size;
-    unsigned int offset;
-    unsigned int prev_phys = 0;
-    unsigned int base_phys;
-    _kernel_oserror *err;
+#define SWI_OS_CallAVector 0x34
+#define VECTOR_GRAPHICSV   42u
+#define GRAPHICSV_REASON_FRAMESTORE_INFO 9u
 
-    err = v3d_logical_to_physical((void *) info->screen_start, &base_phys);
+/*
+ * REPLACED (2026-09-26, hardware-diagnosed): this used to walk every
+ * page of the screen via v3d_logical_to_physical (OS_Memory 0),
+ * starting from ScreenStart. That failed immediately on real hardware,
+ * "Address not recognised", on the very FIRST call - translating
+ * ScreenStart itself, before the loop (and its per-offset range) even
+ * came into it. OS_Memory 0's own PRM note explains why: "addresses
+ * must be in RAM... pages which the OS has assigned a valid physical
+ * page number to" - the Pi's screen framestore is evidently not
+ * presented as ordinary tracked RAM in the sense that call expects
+ * (plausibly a HAL-managed region locked down separately from the
+ * normal page-allocation bookkeeping OS_Memory 0 walks).
+ *
+ * `GraphicsV 9` ("Framestore information") is the actual, direct,
+ * PRM-documented mechanism for exactly this question - it exists
+ * specifically so a driver's framestore location doesn't need to be
+ * rediscovered via generic address translation: "the kernel will issue
+ * this call to determine the framestore size and location... R0 =
+ * Framestore physical base address, R1 = Framestore size". Called here
+ * as a plain vector call via OS_CallAVector (SWI &34: R9 = vector
+ * number, R0-R8 = vector parameters - confirmed against the real PRM,
+ * not guessed), not a claim - this driver is asking the CURRENTLY
+ * ACTIVE display driver directly, the same way the kernel itself would.
+ *
+ * The PRM notes this call is only answered if the active driver
+ * indicated (via GraphicsV 8) that it has a separate framestore -
+ * "Drivers which don't have separate framestores should ignore this
+ * call and leave it unclaimed." If that happens here (R4 still
+ * nonzero on return), this fails with a clear, specific error rather
+ * than silently trusting stale/zeroed R0-R1.
+ */
+_kernel_oserror *v3d_get_framestore_phys(const v3d_screen_info_t *info,
+                                          unsigned int *phys_base_out)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+    unsigned int fs_size;
+
+    regs.r[0] = 0;
+    regs.r[1] = 0;
+    regs.r[2] = 0;
+    regs.r[3] = 0;
+    regs.r[4] = (int) (GRAPHICSV_REASON_FRAMESTORE_INFO | (0u << 24)); /* driver 0 */
+    regs.r[9] = (int) VECTOR_GRAPHICSV;
+
+    err = _kernel_swi(SWI_OS_CallAVector, &regs, &regs);
     if (err)
         return err;
 
-    prev_phys = base_phys;
-    for (offset = SCREEN_PAGE_SIZE; offset < total_bytes; offset += SCREEN_PAGE_SIZE)
+    if (regs.r[4] != 0)
     {
-        unsigned int this_phys;
-
-        err = v3d_logical_to_physical((void *) (info->screen_start + offset), &this_phys);
-        if (err)
-        {
-            /* Wrap whatever the OS said (e.g. "Address not recognised")
-             * with exactly which offset triggered it - a first hardware
-             * test hit this with no such context, which cost real
-             * debugging time working out that total_screen_size (not
-             * line_length*(ywind_limit+1), this function's original,
-             * wrong assumption) was the range actually worth trusting. */
-            static _kernel_oserror err_wrapped = { 19, "" };
-            unsigned int pos = 0;
-            append_str(err_wrapped.errmess, &pos, "V3DDriver: framestore "
-                       "contiguity check failed at offset ");
-            append_hex32(err_wrapped.errmess, &pos, offset);
-            append_str(err_wrapped.errmess, &pos, " of ");
-            append_hex32(err_wrapped.errmess, &pos, total_bytes);
-            append_str(err_wrapped.errmess, &pos, " (OS said: ");
-            append_str(err_wrapped.errmess, &pos, err->errmess);
-            append_str(err_wrapped.errmess, &pos, ")");
-            err_wrapped.errmess[pos] = '\0';
-            return &err_wrapped;
-        }
-
-        if (this_phys != prev_phys + SCREEN_PAGE_SIZE)
-        {
-            static _kernel_oserror err_discontig = { 15, "" };
-            unsigned int pos = 0;
-            append_str(err_discontig.errmess, &pos, "V3DDriver: screen "
-                       "framestore is NOT physically contiguous at offset ");
-            append_hex32(err_discontig.errmess, &pos, offset);
-            append_str(err_discontig.errmess, &pos, " - GraphicsV Render "
-                       "acceleration is not safe against this mode's "
-                       "memory layout");
-            err_discontig.errmess[pos] = '\0';
-            return &err_discontig;
-        }
-
-        prev_phys = this_phys;
+        static _kernel_oserror err_unclaimed = {
+            20, "V3DDriver: GraphicsV 9 (framestore information) was not "
+                "claimed by the active display driver - it may not report "
+                "a separate framestore this way"
+        };
+        return &err_unclaimed;
     }
 
-    *phys_base_out = base_phys;
+    *phys_base_out = (unsigned int) regs.r[0];
+    fs_size = (unsigned int) regs.r[1];
+
+    if (fs_size < info->total_screen_size)
+    {
+        static _kernel_oserror err_too_small = { 21, "" };
+        unsigned int pos = 0;
+        append_str(err_too_small.errmess, &pos, "V3DDriver: GraphicsV 9 "
+                   "reported framestore size ");
+        append_hex32(err_too_small.errmess, &pos, fs_size);
+        append_str(err_too_small.errmess, &pos, " smaller than "
+                   "TotalScreenSize ");
+        append_hex32(err_too_small.errmess, &pos, info->total_screen_size);
+        err_too_small.errmess[pos] = '\0';
+        return &err_too_small;
+    }
+
     return NULL;
 }

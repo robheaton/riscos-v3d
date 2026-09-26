@@ -134,7 +134,7 @@ static _kernel_oserror *ensure_pmp_fill(void)
 /*
  * Step 3 of the planned GraphicsV Render accelerator: caches the
  * screen's confirmed physical framestore base (see
- * v3d_verify_framestore_contiguous's own comment for why this is
+ * v3d_get_framestore_phys's own comment for why this is
  * checked for real, not assumed) plus the mode info needed to target
  * it, computed once and reused - re-verifying contiguity across the
  * whole screen on every single fill call would be wasteful, and the
@@ -163,7 +163,7 @@ static _kernel_oserror *ensure_screen_framestore(void)
         return &err_bad_bpp;
     }
 
-    err = v3d_verify_framestore_contiguous(&g_screen_info, &g_screen_phys_base);
+    err = v3d_get_framestore_phys(&g_screen_info, &g_screen_phys_base);
     if (err)
         return err;
 

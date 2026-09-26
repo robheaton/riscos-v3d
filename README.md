@@ -1888,4 +1888,37 @@ contiguity check to use it instead. Also wrapped the OS's error (and
 any future discontiguity found) with the exact byte offset that failed
 - the original error gave no clue *where* in the range it happened,
 which cost real debugging time working out that the range itself, not
-a specific page, was the actual problem. Not yet re-tested on hardware.
+a specific page, was the actual problem.
+
+**Second hardware round, same fix's real target found to be wrong at a
+more fundamental level**: with the `TotalScreenSize` fix applied,
+`V3D_ScreenFillTest` failed identically - `"Address not recognised"`,
+and (per the added diagnostic) with no offset prefix at all, meaning it
+failed on the very *first* translation attempt (`ScreenStart` itself,
+before the range even mattered). This ruled out "wrong range" as the
+problem and pointed at something more fundamental: `OS_Memory 0`
+apparently cannot translate the Pi's screen framestore's logical
+address to a physical one at all - its own PRM text explains why ("the
+addresses must correspond to pages which the OS has assigned a valid
+physical page number to"), implying this framestore isn't ordinary
+OS_Memory-0-trackable RAM, plausibly a HAL-managed region locked down
+outside normal page-allocation bookkeeping.
+
+**Fix**: abandoned `OS_Memory 0` for this purpose entirely, in favour
+of `GraphicsV 9` ("Framestore information") - the actual, direct,
+PRM-documented mechanism for exactly this question, returning the
+framestore's physical base address and size directly from the active
+display driver, no generic address translation involved. Called via
+`OS_CallAVector` (SWI `&34`) as a genuine vector call (not a claim) -
+this driver asking the currently active driver directly, the same way
+the kernel itself would. This also happens to settle the contiguity
+question more cleanly than the original page-walk approach ever did: a
+driver reporting one `(base, size)` pair is implicitly asserting that's
+one contiguous region, so there's nothing left to separately verify.
+`v3d_verify_framestore_contiguous` was renamed to `v3d_get_framestore_phys`
+to match what it actually does now. One real risk carried over from the
+PRM's own text, not yet observed: the call only succeeds if the active
+driver indicates (via `GraphicsV 8`) that it has a *separate*
+framestore - if the Pi's driver doesn't, this fails with a clear,
+specific error (`R4` still nonzero on return) rather than silently
+trusting stale register contents. Not yet re-tested on hardware.

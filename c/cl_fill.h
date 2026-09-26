@@ -74,7 +74,7 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
  *
  * Callers MUST have already confirmed the framestore is physically
  * contiguous across the full rectangle (see screen_info.h's
- * v3d_verify_framestore_contiguous) - this function does not check
+ * v3d_get_framestore_phys) - this function does not check
  * that itself, since re-checking per call would be wasteful once the
  * whole screen has already been verified once.
  */

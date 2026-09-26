@@ -38,7 +38,7 @@ typedef struct v3d_screen_info
                                    * turned out to be a real, hardware-
                                    * confirmed wrong assumption to check
                                    * memory validity against (see
-                                   * v3d_verify_framestore_contiguous). */
+                                   * v3d_get_framestore_phys). */
 } v3d_screen_info_t;
 
 /*
@@ -68,33 +68,42 @@ _kernel_oserror *v3d_read_screen_info(v3d_screen_info_t *out);
 _kernel_oserror *v3d_logical_to_physical(void *log_addr, unsigned int *phys_addr_out);
 
 /*
- * Verifies the screen framestore described by `info` is physically
- * contiguous across its ENTIRE genuinely-allocated size
- * (info->total_screen_size bytes from screen_start - NOT
- * line_length*(ywind_limit+1), which a first hardware test (2026-09-26)
- * showed is the wrong range to trust: it hit "Address not recognised"
- * from OS_Memory 0, meaning that derived estimate reaches beyond what
- * the OS actually considers valid, backed RAM. total_screen_size is
- * the OS's own authoritative VDU variable for exactly this, and is
- * what's used now), by translating every single page boundary within
- * that range and confirming each consecutive pair's physical addresses
- * differ by exactly PAGE_SIZE. This is NOT a formality: a Dynamic
- * Area's logical window has no general guarantee of physically
- * contiguous backing, and the planned GraphicsV Render accelerator's
- * whole approach (a single physical base address + stride, matching
- * how V3D's tile store addressing works - see cl_fill.c) silently
- * breaks if that assumption is wrong for even one page in the range,
- * writing GPU output to the wrong physical memory entirely. In
- * practice this is expected to hold (display hardware scanout
- * generally needs a contiguous framestore too), but "expected" is
- * exactly the kind of assumption this project has been burned by
- * before (see README's power-on/reset history) - so it's checked for
- * real, once, rather than trusted.
+ * Gets the screen framestore's physical base address, needed for the
+ * same reason as always: V3D's tile store addressing needs one plain
+ * physical base + stride (see cl_fill.c), and screen memory is
+ * described to the rest of this driver only by its logical address
+ * (ScreenStart) - something has to bridge that gap.
  *
- * On success, *phys_base_out is the confirmed physical address
- * corresponding to info->screen_start.
+ * ORIGINAL APPROACH (replaced 2026-09-26, hardware-diagnosed): walked
+ * every page of the screen via v3d_logical_to_physical (OS_Memory 0),
+ * starting from ScreenStart, checking each consecutive pair's physical
+ * addresses differed by exactly one page - genuine contiguity
+ * verification, not an assumption. Failed immediately on real
+ * hardware ("Address not recognised") on the very FIRST call, meaning
+ * the Pi's screen framestore isn't presented as ordinary
+ * OS_Memory-0-trackable RAM at all (plausibly a HAL-managed region
+ * locked down outside normal page-allocation bookkeeping).
+ *
+ * CURRENT APPROACH: `GraphicsV 9` ("Framestore information") is the
+ * actual, direct, PRM-documented mechanism for this exact question -
+ * "R0 = Framestore physical base address, R1 = Framestore size".
+ * Called via OS_CallAVector (SWI &34) as a plain vector call, not a
+ * claim - asking the currently active display driver directly, the
+ * same way the kernel itself would. See v3d_get_framestore_phys's own
+ * comment in screen_info.c for the full detail, including what happens
+ * if the active driver doesn't answer this call at all (some drivers
+ * legitimately don't - see the PRM's own note on GraphicsV 8/9).
+ *
+ * This also settles the "is it contiguous" question differently than
+ * the original approach: a driver reporting a single (base, size) pair
+ * is implicitly asserting that's one contiguous region - there's no
+ * separate contiguity check to make once GraphicsV 9 has answered.
+ *
+ * On success, *phys_base_out is the framestore's physical base
+ * address, sanity-checked against info->total_screen_size (fails if
+ * the reported size is smaller than expected).
  */
-_kernel_oserror *v3d_verify_framestore_contiguous(const v3d_screen_info_t *info,
-                                                    unsigned int *phys_base_out);
+_kernel_oserror *v3d_get_framestore_phys(const v3d_screen_info_t *info,
+                                          unsigned int *phys_base_out);
 
 #endif /* SCREEN_INFO_H */
