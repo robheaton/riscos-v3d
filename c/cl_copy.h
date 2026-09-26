@@ -91,8 +91,9 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * tile - see this header's top comment and cl_copy.c's own comment on
  * v3d_copy_screen_overlapping for the full reasoning.
  *
- * Bounded to pmp_alloc's 64-page/call cap for the scratch buffer -
- * large overlapping copies (e.g. a full-screen scroll) are refused
+ * Bounded to pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL,
+ * phys_buffer.h) for the scratch buffer - a copy larger than that is
+ * refused
  * with a clear error rather than silently chunked, so the caller's own
  * fallback (leaving the GraphicsV call unclaimed, same as everywhere
  * else in this driver) takes over instead.

@@ -178,18 +178,18 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
     rcl_bytes = 64u + n_tiles * 40u + 64u;
     rcl_pages = bytes_to_pages(rcl_bytes);
 
-    /* pmp_alloc caps a single call at 64 pages (MAX_PAGES_PER_CALL in
+    /* pmp_alloc caps a single call at PMP_MAX_PAGES_PER_CALL pages (see
      * phys_buffer.c - a fixed-size stack array, not a real hardware
      * limit). tile_alloc/tile_state/rcl stay comfortably under that
      * even at full 1920x1080 (32/3/5 pages respectively) - this only
      * ever bites the CALLER if it also PMP-allocates a huge render
      * buffer (v3d_fill_test's synthetic-buffer case), not here. */
-    if (tile_alloc_pages > 64u || tile_state_pages > 64u || rcl_pages > 64u)
+    if (tile_alloc_pages > PMP_MAX_PAGES_PER_CALL || tile_state_pages > PMP_MAX_PAGES_PER_CALL || rcl_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
             14, "V3DDriver: fill rectangle too large - tile_alloc/"
                 "tile_state/RCL scratch buffers exceed pmp_alloc's "
-                "64-page/call cap"
+                "pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL)"
         };
         return &err_too_big;
     }
@@ -397,16 +397,16 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
     render_bytes = stride * padded_h;
     render_pages = bytes_to_pages(render_bytes);
 
-    /* Same 64-page/call cap discussed in run_fill - this one specifically
+    /* Same pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL) discussed in run_fill - this one specifically
      * bounds how big a rectangle THIS TEST HARNESS can exercise via its
      * synthetic PMP render buffer (a full 1920x1088 padded buffer alone
      * is ~2040 pages). Does not bound the real feature (v3d_fill_screen
      * never PMP-allocates a render target at all). */
-    if (render_pages > 64u)
+    if (render_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
             14, "V3DDriver: V3D_FillTest rectangle too large for this test "
-                "harness (pmp_alloc's 64-page/call cap) - try a smaller "
+                "harness (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL)) - try a smaller "
                 "width/height. Not a limit of the fill algorithm itself."
         };
         return &err_too_big;

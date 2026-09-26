@@ -111,6 +111,31 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
 static pmp_area_t g_pmp_fill;
 static int g_pmp_fill_created = 0;
 
+/*
+ * Base-page layout within g_pmp_fill: one reservation per SWI/accel
+ * path, each a full PMP_FILL_BLOCK_PAGES-page block, so no two can
+ * ever overlap - trivially verifiable (every reservation is just
+ * `block_index * PMP_FILL_BLOCK_PAGES`), rather than requiring hand-
+ * checked arithmetic against each path's own precise worst-case need.
+ *
+ * PMP_FILL_BLOCK_PAGES=8192 (32MB) was picked as roughly double the
+ * single biggest worst-case need of any one path (~4137 pages - two
+ * PMP_MAX_PAGES_PER_CALL-sized buffers plus a small scratch, e.g.
+ * V3D_CopyTest's source+dest or V3D_OverlapCopyTest's bounding buffer
+ * + its own scratch-buffer pass), leaving comfortable headroom without
+ * needing to size each block individually.
+ *
+ * RAISED (2026-09-26, alongside PMP_MAX_PAGES_PER_CALL): before this,
+ * SCREEN_COPY_BASE_PAGE hosted BOTH the tiny direct-copy scratch
+ * (~41 pages) AND the overlap-copy scratch (now up to ~2089 pages) at
+ * the SAME base, spilling straight into the next reservation 200
+ * pages later - found by inspection while raising that cap, before it
+ * became a real hardware bug. This uniform-block scheme is deliberately
+ * harder to get subtly wrong the same way again.
+ */
+#define PMP_FILL_BLOCK_PAGES 8192u
+#define PMP_FILL_BLOCK_COUNT 6u
+
 static _kernel_oserror *ensure_pmp_fill(void)
 {
     _kernel_oserror *err;
@@ -118,7 +143,12 @@ static _kernel_oserror *ensure_pmp_fill(void)
     if (g_pmp_fill_created)
         return NULL;
 
-    err = pmp_create("V3DFill", 16u * 1024u * 1024u, 4096u, &g_pmp_fill);
+    /* PMP logical-window reservation is cheap (no real memory
+     * committed until pages are actually claimed via pmp_alloc), so
+     * there's no cost to sizing this generously. */
+    err = pmp_create("V3DFill", PMP_FILL_BLOCK_COUNT * PMP_FILL_BLOCK_PAGES
+                      * PAGE_SIZE, PMP_FILL_BLOCK_COUNT * PMP_FILL_BLOCK_PAGES,
+                      &g_pmp_fill);
     if (err)
         return err;
 
@@ -126,32 +156,12 @@ static _kernel_oserror *ensure_pmp_fill(void)
     return NULL;
 }
 
-/* Well clear of V3D_FillTest's own PMP usage in g_pmp_fill (which can
- * use up to ~2040 pages for a full-screen-sized synthetic render
- * buffer) - V3D_ScreenFillTest only ever needs scratch space (CL/
- * tile_alloc/tile_state), up to ~41 pages even at full 1920x1080, so
- * this leaves generous headroom either way. */
-#define SCREEN_FILL_BASE_PAGE 3000u
-
-/* Well clear of SCREEN_FILL_BASE_PAGE's own small usage (3000-3041) -
- * V3D_CopyTest needs two full padded buffers (source+dest) plus
- * scratch, more than ScreenFillTest but still comfortably inside
- * g_pmp_fill's 4096-page/16MB window for realistic test sizes. */
-#define COPY_TEST_BASE_PAGE 3200u
-
-/* Well clear of COPY_TEST_BASE_PAGE's own worst-case usage (two
- * padded buffers up to 64 pages each, plus scratch) - V3D_ScreenCopyTest
- * only needs scratch space (CL/tile_alloc/tile_state), no PMP
- * allocation for source/dest at all (real screen memory already
- * exists), same reasoning as SCREEN_FILL_BASE_PAGE. */
-#define SCREEN_COPY_BASE_PAGE 3500u
-
-/* Well clear of SCREEN_COPY_BASE_PAGE's own worst-case usage (scratch
- * buffer up to 64 pages, plus run_copy's own scratch ~41 pages more -
- * up to ~105 pages from 3500). V3D_OverlapCopyTest needs a bounding
- * buffer (up to 64 pages) plus everything v3d_copy_screen_overlapping
- * itself needs, so it gets its own well-separated range too. */
-#define OVERLAP_COPY_TEST_BASE_PAGE 3700u
+#define FILL_TEST_BASE_PAGE            (0u * PMP_FILL_BLOCK_PAGES) /* V3D_FillTest */
+#define SCREEN_FILL_BASE_PAGE          (1u * PMP_FILL_BLOCK_PAGES) /* V3D_ScreenFillTest / accel fill */
+#define COPY_TEST_BASE_PAGE            (2u * PMP_FILL_BLOCK_PAGES) /* V3D_CopyTest */
+#define SCREEN_COPY_BASE_PAGE          (3u * PMP_FILL_BLOCK_PAGES) /* V3D_ScreenCopyTest / accel direct copy */
+#define OVERLAP_COPY_TEST_BASE_PAGE    (4u * PMP_FILL_BLOCK_PAGES) /* V3D_OverlapCopyTest */
+#define SCREEN_COPY_OVERLAP_BASE_PAGE  (5u * PMP_FILL_BLOCK_PAGES) /* V3D_ScreenCopyOverlapTest / accel overlap copy */
 
 /*
  * Step 3 of the planned GraphicsV Render accelerator: caches the
@@ -439,11 +449,11 @@ _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_b
  * initialisation and coordinate-flip reasoning, but routes through
  * v3d_copy_screen_overlapping's scratch-buffer pass instead of a
  * direct single-pass copy (see cl_copy.h/.c for why a direct pass
- * isn't safe once source and destination overlap). Reuses
- * SCREEN_COPY_BASE_PAGE - safe since this and v3d_accel_render_copy/
- * V3D_ScreenCopyTest are never invoked concurrently (RISC OS foreground
- * calls are single-threaded and this driver always blocks until its
- * own submission completes before returning).
+ * isn't safe once source and destination overlap). Uses its own
+ * SCREEN_COPY_OVERLAP_BASE_PAGE, not SCREEN_COPY_BASE_PAGE - the
+ * scratch buffer this path needs (up to PMP_MAX_PAGES_PER_CALL pages)
+ * is far bigger than the direct path's ~41-page scratch, so the two
+ * need separate reservations (see the base-page layout comment above).
  */
 _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsigned int src_bottom,
                                                      unsigned int dest_left, unsigned int dest_bottom,
@@ -473,7 +483,7 @@ _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsign
     src_y_top_down = g_screen_info.ywind_limit - (src_bottom + height - 1u);
     dest_y_top_down = g_screen_info.ywind_limit - (dest_bottom + height - 1u);
 
-    return v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+    return v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
                              src_left, src_y_top_down, dest_left, dest_y_top_down,
                              width, height,
                              g_screen_phys_base, g_screen_info.line_length,
@@ -1228,7 +1238,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            err = v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+            err = v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
                                     src_x, src_y, dest_x, dest_y, width, height,
                                     g_screen_phys_base, g_screen_info.line_length,
                                     &tiles_x, &tiles_y);

@@ -2325,3 +2325,63 @@ framestore, and (from the moment it was wired in) the live desktop
 handler. This closes the last gap in the original 5-step plan - window
 scrolling, the most common real-world copy case, is now genuinely
 GPU-accelerable, not just non-overlapping copies.
+
+## Scratch-buffer size cap raised, and a real bug found along the way (2026-09-26, build-verified, not yet hardware-tested)
+
+A live `AccelTest.bas` run with the overlap-copy path active showed
+**651/778 (84%) of real window-scroll copies too large for the
+scratch buffer's 64-page (256KB) cap**, falling back to normal CPU
+rendering - safely (the fail-safe design worked exactly as intended),
+but with far less acceleration coverage than hoped (only 16% of real
+scrolls fit). A modest window scroll alone (800x600) needs ~470 pages;
+64 was never going to cover realistic cases.
+
+**Raised `pmp_alloc`'s per-call cap from 64 to 2048 pages (256KB to
+8MB)** - comfortably covers even a full 1920x1080 screen-sized scroll
+(~2026 pages) - now exposed as `PMP_MAX_PAGES_PER_CALL` in
+`phys_buffer.h` rather than hardcoded `64u` checks scattered across
+`cl_fill.c`/`cl_copy.c` (which is exactly how the next problem below
+went unnoticed for as long as it did).
+
+**Not a safe change to make by just bumping the constant.** The two
+arrays `pmp_alloc()` fills in (`claim_list`/`map_list`) were local
+stack variables - at 2048 entries x 12 bytes each, that's 24KB of
+SVC-mode kernel stack per array, and RISC OS's SVC stack is a
+genuinely limited, easy-to-overflow resource. A stack overflow in a
+kernel module crashes the whole machine - a far worse failure mode
+than anything else in this project. Fixed by moving `claim_list`/
+`map_list` (and `pmp_release`'s own `list`) from stack-local to
+function-static arrays instead - static/BSS workspace isn't remotely
+constrained the way SVC stack is, and these arrays are only ever
+touched from ordinary foreground SVC-mode SWI calls (both functions do
+real SWI calls throughout, never safe from IRQ context anyway), so
+there's no reentrancy hazard from making them static.
+
+**While making that change, found a real, separate, pre-existing bug**:
+`pmp_release()` had no bounds check on `num_pages` at all, unlike
+`pmp_alloc()`. `module_final` calls it with a whole area's `max_pages`
+in one go - 4096 for `g_pmp_fill` - which already exceeded even the
+OLD 64-page array bound, every time a session that had created
+`g_pmp_fill` was unloaded. Fixed by making `pmp_release()` chunk
+internally in `PMP_MAX_PAGES_PER_CALL`-sized batches, so its own
+contract ("works for any `num_pages`") is actually upheld regardless
+of how big or small that cap is set to - a correctness fix independent
+of the cap-raising work that surfaced it.
+
+**Also had to rework the base-page layout** in `module.c`: several
+reservations that used to need only ~41-105 pages of scratch space can
+now need up to ~4137 (two `PMP_MAX_PAGES_PER_CALL`-sized buffers plus
+a small scratch - e.g. `V3D_CopyTest`'s source+dest, or
+`V3D_OverlapCopyTest`'s bounding buffer + its own scratch-buffer pass).
+The old hand-computed gaps (200-500 pages) would have silently
+collided. Replaced with a uniform scheme instead of more careful
+arithmetic: every SWI/accel path gets its own full 8192-page (32MB)
+block (`block_index * PMP_FILL_BLOCK_PAGES`), roughly double the
+single biggest worst-case need, trivially non-overlapping without
+needing to verify each gap by hand. `g_pmp_fill`'s own logical window
+grew accordingly (16MB to 192MB) - cheap, since PMP logical-window
+reservation commits no real memory until pages are actually claimed.
+
+Not yet hardware-tested - the fixes above are real and each
+individually well-reasoned, but the whole point of this project's own
+practice is not to trust that without running it for real.

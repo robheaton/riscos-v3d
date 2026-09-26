@@ -26,6 +26,19 @@
 
 #define PAGE_SIZE 4096u
 
+/*
+ * The largest number of pages a single pmp_alloc() call can claim in
+ * one go (pmp_release() has no such limit - see phys_buffer.c's own
+ * comment, it chunks internally). Exposed here (not just as a private
+ * enum in phys_buffer.c) so every caller sizing a request against this
+ * cap - cl_fill.c, cl_copy.c - references the one real value instead
+ * of a hardcoded number that can silently drift out of sync with it,
+ * which is exactly what happened when this was raised from 64 to 2048
+ * (2026-09-26, see phys_buffer.c's own comment for why) and several
+ * `> 64u` checks elsewhere had to be found and updated by hand.
+ */
+#define PMP_MAX_PAGES_PER_CALL 2048u
+
 typedef struct pmp_area
 {
     unsigned int area_num;

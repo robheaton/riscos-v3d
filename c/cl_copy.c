@@ -129,12 +129,12 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
     rcl_bytes = 64u + n_tiles * 40u + 64u;
     rcl_pages = bytes_to_pages(rcl_bytes);
 
-    if (tile_alloc_pages > 64u || tile_state_pages > 64u || rcl_pages > 64u)
+    if (tile_alloc_pages > PMP_MAX_PAGES_PER_CALL || tile_state_pages > PMP_MAX_PAGES_PER_CALL || rcl_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
             14, "V3DDriver: copy rectangle too large - tile_alloc/"
                 "tile_state/RCL scratch buffers exceed pmp_alloc's "
-                "64-page/call cap"
+                "pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL)"
         };
         return &err_too_big;
     }
@@ -309,11 +309,11 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
     buf_bytes = stride * padded_h;
     buf_pages = bytes_to_pages(buf_bytes);
 
-    if (buf_pages > 64u)
+    if (buf_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
             14, "V3DDriver: V3D_CopyTest rectangle too large for this "
-                "test harness (pmp_alloc's 64-page/call cap)"
+                "test harness (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL))"
         };
         return &err_too_big;
     }
@@ -383,7 +383,7 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * using), so both passes reuse run_copy's already-proven, unmodified
  * core with zero new tile-ordering logic to get wrong.
  *
- * Bounded to pmp_alloc's 64-page/call cap for the scratch buffer
+ * Bounded to pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL) for the scratch buffer
  * itself (same cap already governing every synthetic-buffer test in
  * this project) - large overlapping copies (e.g. a full-screen
  * scroll) are refused with a clear error rather than silently
@@ -422,11 +422,11 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
     scratch_bytes = scratch_stride * padded_h;
     scratch_pages = bytes_to_pages(scratch_bytes);
 
-    if (scratch_pages > 64u)
+    if (scratch_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
             14, "V3DDriver: overlapping copy too large for a scratch-"
-                "buffer pass (pmp_alloc's 64-page/call cap)"
+                "buffer pass (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL))"
         };
         return &err_too_big;
     }
@@ -482,7 +482,7 @@ _kernel_oserror *v3d_copy_overlap_test(pmp_area_t *pmp, unsigned int base_page,
      * dest rect at (shift_x, shift_y), padded to a whole tile grid -
      * same safety-margin reasoning as v3d_fill_test's own padding
      * (this is a test buffer we control the size of; the real screen
-     * target has no such margin, which is exactly why the 64-page cap
+     * target has no such margin, which is exactly why the per-call cap
      * matters more there). */
     bound_w = width + shift_x;
     bound_h = height + shift_y;
@@ -494,11 +494,11 @@ _kernel_oserror *v3d_copy_overlap_test(pmp_area_t *pmp, unsigned int base_page,
     buf_bytes = stride * padded_h;
     buf_pages = bytes_to_pages(buf_bytes);
 
-    if (buf_pages > 64u)
+    if (buf_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
             14, "V3DDriver: V3D_OverlapCopyTest rectangle+shift too "
-                "large for this test harness (pmp_alloc's 64-page/call cap)"
+                "large for this test harness (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL))"
         };
         return &err_too_big;
     }

@@ -82,7 +82,36 @@ _kernel_oserror *pmp_create(const char *name, unsigned int max_logical_bytes,
     return NULL;
 }
 
-enum { MAX_PAGES_PER_CALL = 64 };
+/*
+ * RAISED (2026-09-26, hardware-diagnosed): was 64 (256KB) - a real
+ * live-desktop test of the overlapping-copy scratch-buffer path
+ * (see cl_copy.c) showed 651/778 (84%) of real window-scroll copies
+ * too large for that cap, falling back to normal CPU rendering
+ * (safely - the fail-safe design worked exactly as intended - but
+ * with far less acceleration coverage than hoped: only 16% of real
+ * scrolls fit). A modest window scroll alone (800x600) needs ~470
+ * pages; 64 was never going to cover realistic cases.
+ *
+ * Raised to 2048 (8MB) - comfortably covers even a full 1920x1080
+ * screen-sized scroll (~2026 pages) - but NOT by just bumping this
+ * constant with claim_list/map_list still on the stack: 2048*12 bytes
+ * per array (see below) would be 24KB of SVC-mode kernel stack per
+ * array, and RISC OS's SVC stack is a genuinely limited, easy-to-
+ * overflow resource - a stack overflow in a kernel module crashes the
+ * whole machine, a far worse failure mode than anything this project
+ * has hit so far. So claim_list/map_list (in pmp_alloc) and list (in
+ * pmp_release) were moved from stack-local arrays to function-static
+ * ones instead - static/BSS workspace is not remotely constrained the
+ * way SVC stack is, and these arrays are never touched from anywhere
+ * but ordinary foreground SVC-mode SWI calls (pmp_alloc/pmp_release do
+ * real SWI calls throughout, which are never safe from IRQ context
+ * anyway - matching how every other call site in this codebase already
+ * only ever calls these from foreground code), so there's no
+ * reentrancy hazard from making them static.
+ */
+#define MAX_PAGES_PER_CALL PMP_MAX_PAGES_PER_CALL /* see phys_buffer.h -
+                                                     * the one real value,
+                                                     * not redefined here */
 
 /*
  * Releases (unmaps, then unclaims) any pages currently held at
@@ -104,41 +133,72 @@ enum { MAX_PAGES_PER_CALL = 64 };
  * released first. Without this, a reloaded module's OS_Memory 12
  * calls could be recommended pages a still-existing, still-locked
  * zombie area from the previous instance already owns.
+ *
+ * NUM_PAGES IS NOT BOUNDED BY MAX_PAGES_PER_CALL, UNLIKE pmp_alloc -
+ * found 2026-09-26, while raising MAX_PAGES_PER_CALL for the
+ * overlapping-copy scratch buffer: module_final calls this with a
+ * whole area's `max_pages` in one go (4096 for g_pmp_fill), which
+ * already exceeded even the OLD 64-page cap. Without internal
+ * chunking, that write loop would run 4096 iterations into an array
+ * sized for far fewer entries - a real, latent buffer overflow (past
+ * the end of a stack array in the original version, now past the end
+ * of a static one), not merely a theoretical one. Fixed by chunking
+ * internally in MAX_PAGES_PER_CALL-sized batches, so this function's
+ * own contract ("works for any num_pages") is actually upheld
+ * regardless of how big or small that cap is set to.
  */
 _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
                               unsigned int num_pages)
 {
-    unsigned int list[MAX_PAGES_PER_CALL][3];
+    static unsigned int list[MAX_PAGES_PER_CALL][3]; /* static, not stack
+                                                        * - see MAX_PAGES_
+                                                        * PER_CALL's own
+                                                        * comment */
     _kernel_swi_regs regs;
     _kernel_oserror *err;
-    unsigned int i;
+    unsigned int done = 0;
 
-    /* unmap first - releasing a still-mapped page is refused */
-    for (i = 0; i < num_pages; i++)
+    while (done < num_pages)
     {
-        list[i][0] = page_index + i; /* DA page number */
-        list[i][1] = (unsigned int) -1; /* unmap */
-        list[i][2] = 0;
-    }
-    regs.r[0] = DA_MapPages;
-    regs.r[1] = (int) area->area_num;
-    regs.r[2] = (int) list;
-    regs.r[3] = (int) num_pages;
-    err = _kernel_swi(SWI_OS_DynamicArea, &regs, &regs);
-    if (err)
-        return err;
+        unsigned int chunk = num_pages - done;
+        unsigned int i;
 
-    for (i = 0; i < num_pages; i++)
-    {
-        list[i][0] = page_index + i; /* PMP page index */
-        list[i][1] = (unsigned int) -1; /* release */
-        list[i][2] = 0;
+        if (chunk > MAX_PAGES_PER_CALL)
+            chunk = MAX_PAGES_PER_CALL;
+
+        /* unmap first - releasing a still-mapped page is refused */
+        for (i = 0; i < chunk; i++)
+        {
+            list[i][0] = page_index + done + i; /* DA page number */
+            list[i][1] = (unsigned int) -1; /* unmap */
+            list[i][2] = 0;
+        }
+        regs.r[0] = DA_MapPages;
+        regs.r[1] = (int) area->area_num;
+        regs.r[2] = (int) list;
+        regs.r[3] = (int) chunk;
+        err = _kernel_swi(SWI_OS_DynamicArea, &regs, &regs);
+        if (err)
+            return err;
+
+        for (i = 0; i < chunk; i++)
+        {
+            list[i][0] = page_index + done + i; /* PMP page index */
+            list[i][1] = (unsigned int) -1; /* release */
+            list[i][2] = 0;
+        }
+        regs.r[0] = DA_ClaimPages;
+        regs.r[1] = (int) area->area_num;
+        regs.r[2] = (int) list;
+        regs.r[3] = (int) chunk;
+        err = _kernel_swi(SWI_OS_DynamicArea, &regs, &regs);
+        if (err)
+            return err;
+
+        done += chunk;
     }
-    regs.r[0] = DA_ClaimPages;
-    regs.r[1] = (int) area->area_num;
-    regs.r[2] = (int) list;
-    regs.r[3] = (int) num_pages;
-    return _kernel_swi(SWI_OS_DynamicArea, &regs, &regs);
+
+    return NULL;
 }
 
 _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
@@ -146,11 +206,11 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
                             unsigned int *phys_addr_out,
                             void **logical_ptr_out)
 {
-    /* Small, fixed cap: this milestone only needs a handful of pages
-     * (control lists, tile state, small buffers). A bigger cap would
-     * need heap allocation instead of a stack array. */
-    unsigned int claim_list[MAX_PAGES_PER_CALL][3];
-    unsigned int map_list[MAX_PAGES_PER_CALL][3];
+    /* Static, not stack - see MAX_PAGES_PER_CALL's own comment. Still
+     * a fixed cap (a single call can't exceed MAX_PAGES_PER_CALL - see
+     * the check below), but a generous one now, with no SVC-stack risk. */
+    static unsigned int claim_list[MAX_PAGES_PER_CALL][3];
+    static unsigned int map_list[MAX_PAGES_PER_CALL][3];
     _kernel_swi_regs regs;
     _kernel_oserror *err;
     unsigned int phys_page;
