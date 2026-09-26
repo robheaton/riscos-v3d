@@ -2326,7 +2326,7 @@ handler. This closes the last gap in the original 5-step plan - window
 scrolling, the most common real-world copy case, is now genuinely
 GPU-accelerable, not just non-overlapping copies.
 
-## Scratch-buffer size cap raised, and a real bug found along the way (2026-09-26, build-verified, not yet hardware-tested)
+## Scratch-buffer size cap raised, and a real bug found along the way (2026-09-26, hardware-verified)
 
 A live `AccelTest.bas` run with the overlap-copy path active showed
 **651/778 (84%) of real window-scroll copies too large for the
@@ -2375,13 +2375,32 @@ a small scratch - e.g. `V3D_CopyTest`'s source+dest, or
 `V3D_OverlapCopyTest`'s bounding buffer + its own scratch-buffer pass).
 The old hand-computed gaps (200-500 pages) would have silently
 collided. Replaced with a uniform scheme instead of more careful
-arithmetic: every SWI/accel path gets its own full 8192-page (32MB)
-block (`block_index * PMP_FILL_BLOCK_PAGES`), roughly double the
-single biggest worst-case need, trivially non-overlapping without
-needing to verify each gap by hand. `g_pmp_fill`'s own logical window
-grew accordingly (16MB to 192MB) - cheap, since PMP logical-window
-reservation commits no real memory until pages are actually claimed.
+arithmetic: every SWI/accel path gets its own full block
+(`block_index * PMP_FILL_BLOCK_PAGES`), trivially non-overlapping
+without needing to verify each gap by hand.
 
-Not yet hardware-tested - the fixes above are real and each
-individually well-reasoned, but the whole point of this project's own
-practice is not to trust that without running it for real.
+**First hardware round found a real, separate bug**: `V3D_OverlapCopyTest`
+failed immediately with `"Bad page number"` - a genuine OS error, not
+one of this driver's own. `OVERLAP_COPY_TEST_BASE_PAGE` was exactly
+`32768` (2^15) with the block size initially set to 8192 pages (49152
+total) - and every base at or above it failed identically, while every
+base below it (used by fills and direct copies, both still at 100%
+success in the same live test run) kept working. Two explanations are
+both plausible - an internal limit on PMP page indices, or
+`OS_DynamicArea 0` silently clamping the requested `max_pages` below
+what was asked for (`pmp_create`'s own comment already flagged this as
+possible; never actually checked) - but the fix is the same either
+way: **shrunk the block size from 8192 (a padded ~2x-worst-case guess)
+to 4608 (the real worst-case need of ~4137 pages plus ~470 pages of
+actual margin)**, bringing the total window from 49152 pages down to
+27648, comfortably clear of the boundary that failed.
+
+**Confirmed fixed on real hardware, 2026-09-26**: isolated synthetic
+test (`V3D_OverlapCopyTest`) - all 8 sample points matched. Real
+framestore test (`V3D_ScreenCopyOverlapTest`) - visually confirmed
+correct. Live desktop test (`AccelTest.bas`) - **1705/1705 fills,
+1211/1211 direct copies, and 224/224 (100%) overlap-path copies
+accelerated, zero failures across all three paths**, desktop visually
+confirmed correct throughout including scrolling. Real, working,
+GPU-accelerated window scrolling, confirmed clean at every level from
+an isolated unit test up to sustained real desktop load.
