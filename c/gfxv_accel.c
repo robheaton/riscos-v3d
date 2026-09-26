@@ -52,6 +52,32 @@ volatile unsigned int g_gfxv_solid_count = 0;
 volatile unsigned int g_gfxv_claimed_count = 0;
 volatile unsigned int g_gfxv_error_count = 0;
 
+/*
+ * ADDED (2026-09-26, hardware-diagnosed): a first live-desktop run
+ * showed only 217/13123 (1.7%) of real solid fills actually
+ * accelerated - the rest failed at GPU submission (e.g. a timeout in
+ * v3d_fill_screen). The fail-safe worked as designed (nothing on
+ * screen looked wrong - failures fall back to normal CPU rendering),
+ * but a 98% failure rate needs real diagnosis, not a guess. Rather
+ * than assume it's about rectangle size (tiny fills vs huge ones) or
+ * call frequency (throughput), both are captured for real: the exact
+ * rectangle and error number of the LAST failure, and the min/max
+ * pixel area seen among failures vs successes - if failures cluster
+ * at one extreme of size while successes cluster at the other, that's
+ * real evidence pointing at a size-dependent bug (or a genuine
+ * throughput ceiling); if both ranges overlap heavily, size isn't the
+ * differentiator and something else is. Exposed via V3D_AccelFailInfo.
+ */
+volatile unsigned int g_gfxv_last_fail_errnum = 0;
+volatile unsigned int g_gfxv_last_fail_left = 0;
+volatile unsigned int g_gfxv_last_fail_bottom = 0;
+volatile unsigned int g_gfxv_last_fail_right = 0;
+volatile unsigned int g_gfxv_last_fail_top = 0;
+volatile unsigned int g_gfxv_fail_min_area = 0xFFFFFFFFu;
+volatile unsigned int g_gfxv_fail_max_area = 0;
+volatile unsigned int g_gfxv_success_min_area = 0xFFFFFFFFu;
+volatile unsigned int g_gfxv_success_max_area = 0;
+
 void v3d_gfxv_set_private_word(void *pw)
 {
     g_gfxv_private_word = pw;
@@ -164,14 +190,29 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
 
     g_gfxv_solid_count++;
 
-    err = v3d_accel_render_fill(left, bottom, right, top, colour);
-    if (err)
     {
-        g_gfxv_error_count++;
-        return 1; /* GPU fill failed (e.g. timeout) - leave unclaimed so
-                    * the OS's own CPU fallback still draws correctly;
-                    * see gfxv_accel.h's top comment on why silently
-                    * wrong output is worse than falling back here. */
+        unsigned int area = (right - left + 1u) * (top - bottom + 1u);
+
+        err = v3d_accel_render_fill(left, bottom, right, top, colour);
+        if (err)
+        {
+            g_gfxv_error_count++;
+            g_gfxv_last_fail_errnum = (unsigned int) err->errnum;
+            g_gfxv_last_fail_left = left;
+            g_gfxv_last_fail_bottom = bottom;
+            g_gfxv_last_fail_right = right;
+            g_gfxv_last_fail_top = top;
+            if (area < g_gfxv_fail_min_area) g_gfxv_fail_min_area = area;
+            if (area > g_gfxv_fail_max_area) g_gfxv_fail_max_area = area;
+            return 1; /* GPU fill failed (e.g. timeout) - leave unclaimed
+                        * so the OS's own CPU fallback still draws
+                        * correctly; see gfxv_accel.h's top comment on
+                        * why silently wrong output is worse than
+                        * falling back here. */
+        }
+
+        if (area < g_gfxv_success_min_area) g_gfxv_success_min_area = area;
+        if (area > g_gfxv_success_max_area) g_gfxv_success_max_area = area;
     }
 
     g_gfxv_claimed_count++;

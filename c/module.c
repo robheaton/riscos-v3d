@@ -483,6 +483,7 @@ enum
     SWI_V3D_AccelStart = 11,
     SWI_V3D_AccelStop = 12,
     SWI_V3D_AccelStats = 13,
+    SWI_V3D_AccelFailInfo = 14,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -841,6 +842,24 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[3] = g_gfxv_solid_count;
             r->r[4] = g_gfxv_claimed_count;
             r->r[5] = g_gfxv_error_count;
+            return NULL;
+
+        case SWI_V3D_AccelFailInfo:
+            /* Failure diagnostics for a first live-desktop run that
+             * showed a high accelerated-fill failure rate - see
+             * gfxv_accel.c's own comment. Last failure's error number
+             * (R0) and exact rectangle (R1-R4: left/bottom/right/top),
+             * plus min/max pixel area seen among failures (R5/R6) and
+             * successes (R7/R8) - 0xFFFFFFFF for a min means "none seen". */
+            r->r[0] = g_gfxv_last_fail_errnum;
+            r->r[1] = g_gfxv_last_fail_left;
+            r->r[2] = g_gfxv_last_fail_bottom;
+            r->r[3] = g_gfxv_last_fail_right;
+            r->r[4] = g_gfxv_last_fail_top;
+            r->r[5] = g_gfxv_fail_min_area;
+            r->r[6] = g_gfxv_fail_max_area;
+            r->r[7] = g_gfxv_success_min_area;
+            r->r[8] = g_gfxv_success_max_area;
             return NULL;
 
         default:

@@ -44,6 +44,19 @@ extern volatile unsigned int g_gfxv_solid_count;
 extern volatile unsigned int g_gfxv_claimed_count;
 extern volatile unsigned int g_gfxv_error_count;
 
+/* Failure diagnostics - see gfxv_accel.c's own comment on why these
+ * were added (a 98% real-desktop failure rate needs real evidence,
+ * not a guess). Exposed for V3D_AccelFailInfo. */
+extern volatile unsigned int g_gfxv_last_fail_errnum;
+extern volatile unsigned int g_gfxv_last_fail_left;
+extern volatile unsigned int g_gfxv_last_fail_bottom;
+extern volatile unsigned int g_gfxv_last_fail_right;
+extern volatile unsigned int g_gfxv_last_fail_top;
+extern volatile unsigned int g_gfxv_fail_min_area;
+extern volatile unsigned int g_gfxv_fail_max_area;
+extern volatile unsigned int g_gfxv_success_min_area;
+extern volatile unsigned int g_gfxv_success_max_area;
+
 /*
  * OS_Claim/OS_Release on vector 42 (GraphicsV), using this module's
  * own private word - same veneer mechanism already proven correct for

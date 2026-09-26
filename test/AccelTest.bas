@@ -52,9 +52,28 @@ PRINT "  actually accelerated by the GPU: "; claimed%
 PRINT "  attempted but failed:            "; errors%
 PRINT
 
+IF errors% > 0 THEN PROCfailinfo
+
 SYS "V3D_AccelStop"
 PRINT "Released (V3D_AccelStop) - back to normal software rendering."
 PRINT
-IF calls% = 0 THEN PRINT "No GraphicsV traffic seen at all - try more desktop interaction, or this may indicate something isn't reaching this vector." : END
-IF claimed% > 0 THEN PRINT "At least one real accelerated fill happened - check the desktop looked correct throughout." ELSE PRINT "GraphicsV traffic was seen, but nothing matched (reason 13 + op 2 + solid ECF) - could be genuinely correct (no plain solid fills happened to occur) or could mean the ECF/coordinate decoding needs a closer look."
+IF calls% = 0 THEN PRINT "No GraphicsV traffic seen at all - try more" : PRINT "desktop interaction, or this may indicate something" : PRINT "isn't reaching this vector." : END
+
+IF claimed% > 0 THEN PRINT "At least one real accelerated fill happened - check the desktop looked correct throughout." : END
+
+PRINT "GraphicsV traffic was seen, but nothing matched (reason 13 +"
+PRINT "op 2 + solid ECF). Could be genuinely correct (no plain solid"
+PRINT "fills happened to occur), or could mean the ECF/coordinate"
+PRINT "decoding needs a closer look."
 END
+
+DEF PROCfailinfo
+  SYS "V3D_AccelFailInfo" TO errnum%, left%, bottom%, right%, top%, failmin%, failmax%, okmin%, okmax%
+  PRINT "Failure diagnostics:"
+  PRINT "  Last failure error number: "; errnum%
+  PRINT "  Last failure rectangle: left="; left%; " bottom="; bottom%; " right="; right%; " top="; top%
+  PRINT "  Last failure size: "; (right%-left%+1); "x"; (top%-bottom%+1)
+  IF failmax% > 0 THEN PRINT "  Failed fill area range: "; failmin%; " to "; failmax%; " sq px" ELSE PRINT "  No failed fill area recorded"
+  IF okmax% > 0 THEN PRINT "  Succeeded fill area range: "; okmin%; " to "; okmax%; " sq px" ELSE PRINT "  No succeeded fill area recorded"
+  PRINT
+ENDPROC
