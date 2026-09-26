@@ -404,37 +404,35 @@ static void v3d_flush_caches(io_mapping_t *v3d)
  * with CTSUBS or CTERR set - a thread that's running, or cleanly
  * stopped-at-end, is left alone.
  *
- * v3 (this version): v2's "cleanly stopped-at-end, leave it alone"
- * case turned out to be exactly wrong for a *second* submission in one
- * session. Hardware testing (2026-09-26) found a job that completes
- * normally (CTRUN clears itself, CS reads right back to 0x00000000 -
- * indistinguishable from a truly virgin thread by CS alone) leaves CA
- * sitting at that job's own address. The next submission's fresh
- * QBA/QEA write is never picked up - CA/EA at the following timeout
- * still showed the *previous* job's addresses, not the new one, even
- * though V3D_PowerOn's reset had already been confirmed clean via
- * V3D_ReadIdent (CT0CS=CT1CS=0) and the new job used entirely
- * different, never-before-used physical pages (ruling out a stale-
- * address or cache-reuse explanation). CS alone can't tell "never run
- * a job" from "just finished one" - but CA can: V3D_ReadIdent already
- * showed CA reads 0 on a genuinely virgin thread. So: never touch a
- * running thread (CTRUN); skip the kick only when CA is still 0 *and*
- * CS shows nothing already latched (the v2 case, preserved as-is);
- * otherwise - any thread that has run a job before, however it
- * stopped - always issue the kick.
+ * v3: tried gating the kick on CA!=0 (virgin-vs-used) instead of
+ * CTSUBS/CTERR, called at the same point as v1/v2 - *before* the new
+ * job's QBA/QEA are written. Hardware testing (2026-09-26) showed this
+ * made no difference at all: identical failure, identical addresses.
+ * The reasoning was right that CS can't tell "never run" from "just
+ * finished", but the fix still didn't work because of *when* it ran.
+ *
+ * v4 (this version) - the actual bug was call order, not the gating
+ * condition. CTSUBS is documented to restart the thread "if CA != EA".
+ * Right after a job completes normally, CA and EA both sit at that same
+ * job's own end address - equal. Calling this *before* writing the new
+ * QBA/QEA (as v1-v3 all did) means CTSUBS's one-shot check evaluates
+ * two equal, stale addresses and correctly does nothing - the new
+ * QBA/QEA get written moments later, but the restart condition already
+ * failed to fire. Moved the kick to *after* the new QBA/QEA are
+ * written instead (see call sites in v3d_clear_run): by then EA holds
+ * the *new* job's end address while CA is still stuck on the previous
+ * job's - genuinely different - so CTSUBS's documented condition
+ * actually holds when it's evaluated. The virgin-thread case (CA==0,
+ * proven separately to need no kick at all, and to break if given one
+ * unconditionally - see v2) is now decided by the caller beforehand,
+ * from a plain CA read, rather than folded into this function.
  */
-static void v3d_restart_thread(io_mapping_t *v3d, unsigned int cs_reg,
-                                 unsigned int ca_reg)
+static void v3d_kick_thread(io_mapping_t *v3d, unsigned int cs_reg)
 {
     unsigned int spin;
-    unsigned int cs = IO_WORD(*v3d, cs_reg);
-    unsigned int ca = IO_WORD(*v3d, ca_reg);
 
-    if (cs & V3D_CT_CS_CTRUN)
-        return; /* running - never write CTSUBS to a running thread */
-
-    if (!ca && !(cs & (V3D_CT_CS_CTSUBS | V3D_CT_CS_CTERR)))
-        return; /* genuinely virgin (CA==0, nothing latched) - nothing to do */
+    if (IO_WORD(*v3d, cs_reg) & V3D_CT_CS_CTRUN)
+        return; /* already running - never write CTSUBS to a running thread */
 
     IO_WORD(*v3d, cs_reg) = V3D_CT_CS_CTSUBS;
 
@@ -500,18 +498,18 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
  * comment in v3d_regs.h for why a stalled-on-OOM binner would look
  * identical to a never-started one from BFC's perspective alone).
  *
- * Also attempts recovery, not just diagnosis: v3d_restart_thread()
- * deliberately leaves a thread alone whenever CS shows CTRUN set,
- * treating that as "already running, nothing to do" (see its own
- * comment - writing the CTSUBS restart to a thread that was never
- * halted reproduced the very race it exists to fix). But CTRUN just
- * means "running" per the PRM - it doesn't distinguish "genuinely
- * making progress" from "hung mid-job", and a timed-out poll is
- * exactly the case where a thread reporting CTRUN=1 is almost
+ * Also attempts recovery, not just diagnosis: v3d_kick_thread() (and
+ * its predecessors) deliberately leave a thread alone whenever CS
+ * shows CTRUN set, treating that as "already running, nothing to do"
+ * (see its own comment - writing the CTSUBS restart to a thread that
+ * was never halted reproduced the very race it exists to fix). But
+ * CTRUN just means "running" per the PRM - it doesn't distinguish
+ * "genuinely making progress" from "hung mid-job", and a timed-out
+ * poll is exactly the case where a thread reporting CTRUN=1 is almost
  * certainly the latter. Left alone, that thread stays wedged in this
- * state for the rest of the session: restart_thread() keeps declining
- * to touch it on every later submission (any SWI, any buffer address),
- * since CTRUN never clears on its own. That fits everything logged in
+ * state for the rest of the session: the kick keeps declining to touch
+ * it on every later submission (any SWI, any buffer address), since
+ * CTRUN never clears on its own. That fits everything logged in
  * "attempt 7"/"attempt 8" far better than an address-range theory
  * does: BCMSupport's real ARM/VC split (queried in attempt 8) sits at
  * 0x3C000000 (960MB) but every failing CA/EA/QBA/QEA on record has
@@ -704,6 +702,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     unsigned int pixel_phys;
     io_mapping_t v3d;
     unsigned int last_bfc, last_rfc;
+    int ct0_virgin, ct1_virgin;
     unsigned int page = base_page;
     diag_bufs_t diag_bufs;
 
@@ -831,19 +830,25 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     v3d_flush_caches(&v3d);
     last_bfc = IO_WORD(v3d, V3D_CLE_BFC) & 0xFFu;
 
-    /* Explicit, documented restart (Broadcom PRM Table 49): clears any
-     * "stopped at halt"/error condition left over from a previous run
-     * before relying on QBA/QEA to kick things off. Never write
-     * V3D_CT_CS_CTRUN here - that bit STOPS a thread, it doesn't start
-     * one. See v3d_restart_thread's comment for why there's a settle
-     * delay before the writes that follow. */
-    v3d_restart_thread(&v3d, V3D_CLE_CT0CS, V3D_CLE_CT0CA);
+    /* CA==0 identifies a genuinely virgin thread (see v3d_kick_thread's
+     * comment) - read it *before* the new job's addresses go anywhere
+     * near QBA/QEA. A virgin thread starts correctly from the bare
+     * QBA/QEA write below and must not be kicked (proven separately -
+     * see v2's history); any other thread needs the explicit kick
+     * below, issued only after QBA/QEA already hold the new job's
+     * addresses. Never write V3D_CT_CS_CTRUN anywhere here - that bit
+     * STOPS a thread, it doesn't start one. */
+    ct0_virgin = (IO_WORD(v3d, V3D_CLE_CT0CA) == 0);
 
     IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
     IO_WORD(v3d, V3D_CLE_CT0QMS) = TILE_ALLOC_PAGE_COUNT * PAGE_SIZE;
     IO_WORD(v3d, V3D_CLE_CT0QTS) = tile_state_phys | V3D_CLE_CT0QTS_ENABLE;
     IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
-    IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end; /* kicks off binning */
+    IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end; /* kicks off binning - for a
+                                              * virgin thread only */
+
+    if (!ct0_virgin)
+        v3d_kick_thread(&v3d, V3D_CLE_CT0CS);
 
     io_unmap(&v3d);
 
@@ -863,10 +868,14 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     v3d_flush_caches(&v3d);
     last_rfc = IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu;
 
-    v3d_restart_thread(&v3d, V3D_CLE_CT1CS, V3D_CLE_CT1CA); /* see thread 0's comment */
+    ct1_virgin = (IO_WORD(v3d, V3D_CLE_CT1CA) == 0); /* see thread 0's comment */
 
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
-    IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering */
+    IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering - for a
+                                              * virgin thread only */
+
+    if (!ct1_virgin)
+        v3d_kick_thread(&v3d, V3D_CLE_CT1CS);
 
     io_unmap(&v3d);
 

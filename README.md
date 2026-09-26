@@ -1053,6 +1053,31 @@ any thread that has run a job before, however it stopped, always gets
 the kick regardless of which `CS` bits happen to be set. Not yet
 tested on hardware.
 
+**Hardware result, attempt 17 (2026-09-26) - that fix made zero
+difference, byte-for-byte identical failure (confirmed the newly-sent
+module was actually the one running, then re-verified with an explicit
+`V3D_ReadIdent` check between the two calls: `CT0CS=0` right before the
+second submission - so the guard's logic really was being exercised as
+designed, and still didn't help).** That ruled out the *condition*
+being wrong and pointed at *when* it runs instead. `V3D_CT_CS_CTSUBS`
+is documented to restart the thread "if `CA != EA`" - and right after a
+job completes normally, `CA` and `EA` both already sit at that same
+job's own end address: equal. Calling the kick *before* writing the
+new `QBA`/`QEA` (as every version so far did, attempt 16's fix
+included) means `CTSUBS`'s one-shot check evaluates two equal, stale
+addresses and correctly does nothing - the new addresses arrive
+moments later, but the restart condition already failed to fire.
+
+Moved the kick to run *after* the new `QBA`/`QEA` are written instead:
+by then `EA` holds the new job's end address while `CA` is still stuck
+on the previous job's - genuinely different - so `CTSUBS`'s documented
+condition actually holds when it's evaluated. The virgin-thread check
+(`CA==0`, still needed - see v2's history) is now taken by the caller
+before the job-setup writes, since that's the only point where "has
+this thread ever run before" is still knowable; the kick itself moved
+to `v3d_kick_thread()`, called only for non-virgin threads, after
+`QBA`/`QEA`. Not yet tested on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
