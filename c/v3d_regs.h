@@ -115,6 +115,18 @@
 #define V3D_INT_OUTOMEM   (1u << 2)  /* binner stalled, needs more tile-alloc memory */
 #define V3D_INT_GMPV      (1u << 5)  /* GPU memory protection violation */
 
+/* Binner overflow-memory pointer/size (PTB = "Primitive Tile Buffer").
+ * The real Linux v3d driver writes BPOS=0 before *every* bin job,
+ * unconditionally, with the comment "Clear out the overflow
+ * allocation, so we don't reuse the overflow attached to a previous
+ * job" (drivers/gpu/drm/v3d/v3d_sched.c, v3d_bin_job_run, fetched
+ * 2026-09-26) - exactly the "second job in a session" scenario this
+ * driver was hanging on before this was added. */
+#define V3D_PTB_BPCA      (V3D_CORE0 + 0x300u) /* overflow current addr   */
+#define V3D_PTB_BPCS      (V3D_CORE0 + 0x304u) /* overflow current size   */
+#define V3D_PTB_BPOA      (V3D_CORE0 + 0x308u) /* overflow alloc addr     */
+#define V3D_PTB_BPOS      (V3D_CORE0 + 0x30Cu) /* overflow alloc size     */
+
 #define V3D_CLE_CT0QBA    (V3D_CORE0 + 0x160u) /* bin CL start address    */
 #define V3D_CLE_CT1QBA    (V3D_CORE0 + 0x164u) /* render CL start address */
 #define V3D_CLE_CT0QEA    (V3D_CORE0 + 0x168u) /* bin CL end address (writing

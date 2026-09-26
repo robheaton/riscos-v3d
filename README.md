@@ -1117,6 +1117,30 @@ the entire kick mechanism (`v3d_kick_thread` and everything before it)
 and the virgin-thread `CA` check - `v3d_clear_run` now does exactly
 what the real driver does, nothing more. Not yet tested on hardware.
 
+**Hardware result, attempt 19 (2026-09-26) - even with the restart
+mechanism fully removed, identical failure. Also ruled out the SWI
+identity mattering**: tested `ClearToSprite` twice in a row (no
+`ClearTest` involved at all) - first call succeeds exactly as always,
+second call hangs identically. So it's not "`ClearTest` specifically as
+job 1", not the restart/kick logic (gone entirely now), not addresses,
+not the clock - purely "any second real GPU submission in a session,
+regardless of which SWI either call was."
+
+Looked again at the real Linux v3d driver's `v3d_bin_job_run()` for
+anything this driver doesn't do that it does, unconditionally, for
+every job. Found `V3D_PTB_BPOS` (`0x30c` from the core base, confirmed
+against the real kernel header) - written to 0 before *anything else*
+in the bin submission, including the cache flush, with the driver's
+own comment: *"Clear out the overflow allocation, so we don't reuse the
+overflow attached to a previous job."* This driver never wrote this
+register at all - not once, ever. "The overflow attached to a previous
+job" is exactly the scenario stuck on for nineteen attempts now, and
+this is the first concrete, named mechanism in the real driver that's
+specifically about job-to-job state, rather than per-job setup. Added
+the same unconditional `BPOS=0` write in the same place (before the
+cache flush, before `QMA`/`QMS`/`QTS`/`QBA`/`QEA`). Not yet tested on
+hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

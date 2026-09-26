@@ -772,6 +772,12 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     err = io_map(V3D_MB_BASE, &v3d);
     if (err) return err;
 
+    /* Clear out any overflow allocation left attached to a previous
+     * job - see V3D_PTB_BPOS's comment in v3d_regs.h. Real driver does
+     * this before anything else in the bin submission, cache flush
+     * included. */
+    IO_WORD(v3d, V3D_PTB_BPOS) = 0;
+
     v3d_flush_caches(&v3d);
     last_bfc = IO_WORD(v3d, V3D_CLE_BFC) & 0xFFu;
 
