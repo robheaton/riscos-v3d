@@ -69,7 +69,7 @@ PRINT "Overlap (scratch-buffer) path:"
 PRINT "  overlapping calls seen:             "; copy_overlap%
 PRINT "  actually accelerated by the GPU:    "; copy_overlap_claimed%
 PRINT "  attempted but failed/too large:     "; copy_overlap_errors%
-IF copy_errors% > 0 OR copy_overlap_errors% > 0 THEN PRINT "  last copy failure error number:   "; copy_errnum%
+IF copy_errors% > 0 OR copy_overlap_errors% > 0 THEN PROCcopyerrorinfo
 PRINT
 
 SYS "V3D_AccelStop"
@@ -94,4 +94,10 @@ DEF PROCfailinfo
   IF failmax% > 0 THEN PRINT "  Failed fill area range: "; failmin%; " to "; failmax%; " sq px" ELSE PRINT "  No failed fill area recorded"
   IF okmax% > 0 THEN PRINT "  Succeeded fill area range: "; okmin%; " to "; okmax%; " sq px" ELSE PRINT "  No succeeded fill area recorded"
   PRINT
+ENDPROC
+
+DEF PROCcopyerrorinfo
+  SYS "V3D_AccelCopyLastError" TO msgaddr%
+  PRINT "  Last copy failure error number: "; copy_errnum%
+  PRINT "  Last copy failure message: "; $msgaddr%
 ENDPROC

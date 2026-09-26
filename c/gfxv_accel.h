@@ -70,6 +70,11 @@ extern volatile unsigned int g_gfxv_copy_last_fail_errnum;
 extern volatile unsigned int g_gfxv_copy_overlap_claimed_count;
 extern volatile unsigned int g_gfxv_copy_overlap_error_count;
 
+/* Real OS error message text for the last copy failure (either path),
+ * not just its number - see gfxv_accel.c's own comment on why a bare
+ * number wasn't enough. Exposed for V3D_AccelCopyLastError. */
+const char *v3d_gfxv_copy_last_fail_msg(void);
+
 /*
  * OS_Claim/OS_Release on vector 42 (GraphicsV), using this module's
  * own private word - same veneer mechanism already proven correct for

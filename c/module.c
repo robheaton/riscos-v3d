@@ -615,6 +615,7 @@ enum
     SWI_V3D_AccelCopyStats = 17,
     SWI_V3D_OverlapCopyTest = 18,
     SWI_V3D_ScreenCopyOverlapTest = 19,
+    SWI_V3D_AccelCopyLastError = 20,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1249,6 +1250,15 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = tiles_y;
             return NULL;
         }
+
+        case SWI_V3D_AccelCopyLastError:
+            /* Real OS error message text for the last copy failure
+             * (either path) - see gfxv_accel.c's own comment on why a
+             * bare error number wasn't enough. Returns the address of
+             * a null-terminated string (R0) - read directly in BASIC
+             * via `$addr%`. Empty string if no failure has occurred. */
+            r->r[0] = (unsigned int) v3d_gfxv_copy_last_fail_msg();
+            return NULL;
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see

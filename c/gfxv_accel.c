@@ -121,6 +121,32 @@ volatile unsigned int g_gfxv_copy_last_fail_errnum = 0;
 volatile unsigned int g_gfxv_copy_overlap_claimed_count = 0;
 volatile unsigned int g_gfxv_copy_overlap_error_count = 0;
 
+/*
+ * ADDED (2026-09-26, hardware-diagnosed): all 376 overlap-copy attempts
+ * in a live-desktop run failed with error number 465 - not the "too
+ * big" check's own number (14), so genuinely new territory, and a
+ * bare number wasn't enough to know what actually went wrong (the
+ * same diagnostic gap that hid the earlier top/bottom-swap bug until
+ * the error's exact rectangle was captured, not just a count). Copies
+ * the real OS error MESSAGE text (err->errmess), not just err->errnum,
+ * for both copy paths - exposed via V3D_AccelCopyLastError's returned
+ * address, readable directly in BASIC via `$addr%`.
+ */
+static char g_gfxv_copy_last_fail_msg[252] = "";
+
+static void copy_last_fail_msg(const char *msg)
+{
+    unsigned int i;
+    for (i = 0; i < sizeof(g_gfxv_copy_last_fail_msg) - 1u && msg[i]; i++)
+        g_gfxv_copy_last_fail_msg[i] = msg[i];
+    g_gfxv_copy_last_fail_msg[i] = '\0';
+}
+
+const char *v3d_gfxv_copy_last_fail_msg(void)
+{
+    return g_gfxv_copy_last_fail_msg;
+}
+
 void v3d_gfxv_set_private_word(void *pw)
 {
     g_gfxv_private_word = pw;
@@ -300,6 +326,7 @@ static void handle_render_copy(_kernel_swi_regs *r)
         {
             g_gfxv_copy_overlap_error_count++;
             g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
+            copy_last_fail_msg(err->errmess);
             return; /* too large for the scratch-buffer path, or a GPU
                       * failure - leave unclaimed, same fail-safe
                       * reasoning as everywhere else in this driver. */
@@ -316,6 +343,7 @@ static void handle_render_copy(_kernel_swi_regs *r)
     {
         g_gfxv_copy_error_count++;
         g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
+        copy_last_fail_msg(err->errmess);
         return; /* GPU copy failed - leave unclaimed, same fail-safe
                   * reasoning as handle_render_fill. */
     }
