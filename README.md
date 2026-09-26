@@ -1405,6 +1405,19 @@ real hazard - a shared GIC line with unacknowledged hub-level sources
 - and stays in place), this is a second, independent bug that
 happened to be masked by the first one until it was fixed.
 
+**Hardware result (2026-09-26) - CONFIRMED WORKING END TO END.** Fresh
+reboot, `V3D_IRQTest` clean (`claimed=0 spurious=0`), then
+`V3D_ClearTest &DEADBEEF`: no freeze, `readback=DEADBEEF` as always,
+and **`bin_irq=1 render_irq=1`** - the handler genuinely fired and
+correctly detected both bin and render completion for this exact job,
+not a polling fallback. This closes out real IRQ handling's live-fire
+milestone: the private-word fix and the hub-masking fix together
+resolve both freezes, and the interrupt-driven completion path now
+works correctly on real hardware. Next: confirm it holds up under
+repetition (`StressTest.bas`, watching `R2`/`R3` stay at 1 across many
+calls, not just once), then drop the register-polling half of
+`v3d_poll_counter()` now that the interrupt path is trusted.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
