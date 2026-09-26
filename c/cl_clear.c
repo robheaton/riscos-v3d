@@ -587,6 +587,10 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     append_str(out_err->errmess, &pos, ")");
     if (recover_attempted)
         append_str(out_err->errmess, &pos, recover_ok ? " REC=stopped" : " REC=timeout");
+    append_str(out_err->errmess, &pos, " STS=");
+    append_hex32(out_err->errmess, &pos, sts);
+    if (sts & V3D_INT_OUTOMEM) append_str(out_err->errmess, &pos, "(OOM)");
+    if (sts & V3D_INT_GMPV) append_str(out_err->errmess, &pos, "(GMPV)");
     append_str(out_err->errmess, &pos, " MMU=");
     append_hex32(out_err->errmess, &pos, mmu_ctl & 1u);
     if (mmu_ctl & V3D_MMU_CTL_ENABLE)
@@ -616,7 +620,6 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     append_hex32(out_err->errmess, &pos, bufs->render_target);
     append_str(out_err->errmess, &pos, " tSt=");
     append_hex32(out_err->errmess, &pos, bufs->tile_state);
-    (void) sts;
     out_err->errmess[pos] = '\0';
 }
 

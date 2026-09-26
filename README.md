@@ -805,6 +805,42 @@ folded into the existing diagnostic message. Not yet tested on
 hardware - if this is right, a `V3D_ClearTest` run immediately after a
 timeout should now succeed instead of failing identically.
 
+**Hardware result, attempt 10 (2026-09-26): the CTRUN-recovery fix got
+its first real test, and the result rules out the theory behind it
+too.** `V3D_ClearToSprite &FF00FF00` on a *freshly-loaded module's
+first-ever GPU call this session* (no prior invocation could have
+wedged anything) timed out on binning:
+`CS=0x00000020(RUN) REC=timeout MMU=0x00000000 CA=0x03049000
+EA=0x0304906B QBA=w0x03049000/r0x03049000 QEA=w0x0304906B/r0x0304906B
+tAl=0x0304F000 rTg=0x0304A000 tSt=0x03052000`. Two things this rules
+out directly:
+
+- `CA`/`EA` **exactly match** the `QBA`/`QEA` just written - this is
+  not the stale-old-job symptom the recovery fix targeted (that would
+  show `CA`/`EA` from a *previous* run, not this one). The thread
+  picked up the fresh job and immediately stalled on it.
+- This was the first GPU call since `*RMLoad`, so there is no "earlier
+  timeout left it wedged" history to recover from - the session-wedge
+  theory from attempt 9 cannot explain a hang on the very first call.
+- `REC=timeout`: the stop-request itself didn't take within its poll
+  bound. Whatever this is, it isn't a soft leftover CS flag - it's a
+  core that isn't even servicing a stop request, consistent with a
+  genuine stall rather than an idle-but-mislabelled thread.
+
+That last point matches a gap this project's own diagnostics already
+flagged but never actually wired up: `diagnose_timeout()` was reading
+`V3D_CTL_INT_STS` into `sts` the whole time, then silently discarding
+it (`(void) sts;`) instead of printing it - and this file's own
+pre-existing comment on `V3D_INT_OUTOMEM` (source: the real Linux
+kernel driver) says exactly this: *"a bin stalled on OOM looks
+identical from BFC's perspective to one that never started at all"* -
+i.e. exactly `CA==QBA`, `BFC` never advancing. That's a real,
+previously-unread piece of hardware-reported evidence sitting right
+there, not a new guess. Fixed `diagnose_timeout()` to actually print
+`STS=` (with `(OOM)`/`(GMPV)` decoded) instead of throwing it away. Not
+yet tested on hardware - next timeout's message will say whether the
+binner is out of tile-allocation memory or something else entirely.
+
 ## Testing on hardware
 
 1. Build with a working GCCSDK RISC OS cross-toolchain.
