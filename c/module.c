@@ -90,9 +90,6 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
 /* Uses PMP pages 32-41 (10 pages) - well clear of ClearTest's range. */
 #define CLEAR_SPRITE_BASE_PAGE 32u
 
-/* Uses PMP page 48 - well clear of everything else. */
-#define MEM_SPLIT_PAGE 48u
-
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
  * reference (pm.cpp) - direct PM_GRAFX reset deassert + ASB master/slave
@@ -352,12 +349,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
         case SWI_V3D_MemSplit:
         {
             unsigned int arm_base, arm_size, vc_base, vc_size;
-            _kernel_oserror *err = ensure_pmp();
-            if (err)
-                return err;
-
-            err = v3d_read_mem_split(&g_pmp, MEM_SPLIT_PAGE,
-                                      &arm_base, &arm_size, &vc_base, &vc_size);
+            _kernel_oserror *err = v3d_read_mem_split(&arm_base, &arm_size,
+                                                        &vc_base, &vc_size);
             if (err)
                 return err;
 

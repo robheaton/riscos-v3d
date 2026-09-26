@@ -17,14 +17,26 @@
 
 #define PERIPHERAL_BASE   0xFE000000u
 
-/* ---- VideoCore mailbox (property-tag interface, channel 8) ---- */
+/* ---- VideoCore mailbox (property-tag interface, channel 8) ----
+ * There are two independent mailbox peripherals here, not one:
+ * MAIL0 (VC -> ARM, offsets 0x00-0x1C) is what we READ replies from,
+ * and MAIL1 (ARM -> VC, offsets 0x20-0x3C) is what we WRITE requests
+ * to. Each has its own status register - MBOX_STATUS (MAIL0_STA) must
+ * only be used to test MBOX_EMPTY before reading MBOX_READ; the FULL
+ * check before writing MBOX_WRITE must instead poll MBOX_SEND_STATUS
+ * (MAIL1_STA). An earlier version of this header used MBOX_STATUS for
+ * both, which polls the wrong peripheral's flag before sending.
+ * Verified against the Linux kernel's own mailbox driver,
+ * drivers/mailbox/bcm2835-mailbox.c (MAIL0_STA=0x18, MAIL1_WRT=0x20,
+ * MAIL1_STA=0x38), fetched from git.kernel.org 2026-09-24. */
 #define VIDEOCORE_MBOX    (PERIPHERAL_BASE + 0x0000B880u)
 #define MBOX_READ         (VIDEOCORE_MBOX + 0x00u)
 #define MBOX_POLL         (VIDEOCORE_MBOX + 0x10u)
 #define MBOX_SENDER       (VIDEOCORE_MBOX + 0x14u)
-#define MBOX_STATUS       (VIDEOCORE_MBOX + 0x18u)
+#define MBOX_STATUS       (VIDEOCORE_MBOX + 0x18u)  /* MAIL0_STA: use only for MBOX_EMPTY before reading MBOX_READ */
 #define MBOX_CONFIG       (VIDEOCORE_MBOX + 0x1Cu)
-#define MBOX_WRITE        (VIDEOCORE_MBOX + 0x20u)
+#define MBOX_WRITE        (VIDEOCORE_MBOX + 0x20u)  /* MAIL1_WRT */
+#define MBOX_SEND_STATUS  (VIDEOCORE_MBOX + 0x38u)  /* MAIL1_STA: use for MBOX_FULL before writing MBOX_WRITE */
 #define MBOX_FULL         0x80000000u
 #define MBOX_EMPTY        0x40000000u
 /* NOTE: RISC OS's own Firmware module already implements this channel

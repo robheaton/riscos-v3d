@@ -719,6 +719,50 @@ boundary empirically through trial and error. Not yet tested on
 hardware - this is the answer we've been chasing indirectly for seven
 attempts, so worth getting real numbers before changing any more code.
 
+**Hardware result, attempt 8 (2026-09-24): `V3D_MemSplit` itself hung -
+"mailbox stayed empty waiting for memory-split reply".** Our own raw
+mailbox request got no reply at all - a third, independent problem
+(the mailbox protocol implementation itself) surfaced by trying to
+diagnose the second one. Root-caused by reading RISC OS's own
+`BCMSupport` module source (real code, fetched from
+gitlab.riscosopen.org/RiscOS/Sources/HWSupport/BCMSupport 2026-09-24,
+not guessed): `BCMSupport` already claims this mailbox's hardware IRQ
+at boot (`c/mailbox.c`, `OS_ClaimDeviceVector` + `HAL_IRQEnable`), and
+its interrupt handler drains *every* reply out of the read FIFO the
+instant the GPU firmware raises the interrupt - silently discarding
+any reply it doesn't recognise, i.e. anything not sent through its own
+API. A second poller reading the same registers directly cannot win
+this race (IRQ latency is far below any poll granularity), so our
+request's reply was being eaten by `BCMSupport` before our own polling
+loop ever ran. This confirms and finally explains the pre-existing
+caveat comment that was already sitting in `v3d_regs.h` ("RISC OS's own
+Firmware module already implements this channel... prefer calling into
+it"). It also means the direction, not just the symptom, was wrong:
+raw mailbox access from a second module is fundamentally unsafe here,
+not merely mistimed.
+
+**Fix**: `BCMSupport` exports a SWI for exactly this,
+`BCMSupport_SendTempPropertyBuffer` (same source: `c/BCMSupport.c`,
+`case SWINO(SendTempPropertyBuffer)`) - R0/R1 = request/response buffer
+pointers (standard property-tag message format, word-aligned), R2 = 0.
+It copies the request into its own buffer, sends it, blocks on its
+*own* IRQ-driven response queue (so it's guaranteed to see the reply,
+unlike us), copies the result back, and frees the buffer. Rewrote
+`memsplit.c` to look up this SWI at runtime via
+`OS_SWINumberFromString` (verified against OSLib's own
+`xos_swi_number_from_string` binding rather than guessed) instead of
+touching `VIDEOCORE_MBOX` registers at all - no physical/NCNB buffer of
+our own is needed any more, so `memsplit.c` no longer depends on
+`phys_buffer.h`. Not yet tested on hardware.
+
+(Also fixed, while investigating: the raw mailbox code, before it was
+deleted, had been polling the wrong status register - `MAIL0_STA`
+before writing, when the send side is `MAIL1_STA` at a different
+offset - confirmed against the Linux kernel's own
+`drivers/mailbox/bcm2835-mailbox.c`. Moot now that nothing touches the
+mailbox directly, but left documented in `v3d_regs.h` in case anything
+here ever needs raw mailbox access again.)
+
 ## Testing on hardware
 
 1. Build with a working GCCSDK RISC OS cross-toolchain.

@@ -38,7 +38,7 @@ c/cl_clear.o: c/cl_clear.c c/cl_clear.h c/cl_builder.h c/v3d_regs.h c/io_map.h c
 c/sprite.o: c/sprite.c c/sprite.h
 	$(CC) $(CFLAGS) -c c/sprite.c -o c/sprite.o
 
-c/memsplit.o: c/memsplit.c c/memsplit.h c/v3d_regs.h c/io_map.h c/phys_buffer.h
+c/memsplit.o: c/memsplit.c c/memsplit.h
 	$(CC) $(CFLAGS) -c c/memsplit.c -o c/memsplit.o
 
 V3DDriver,ffa: $(OBJS)
