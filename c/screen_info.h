@@ -28,6 +28,17 @@ typedef struct v3d_screen_info
                                    * of the screen bank currently being
                                    * written to (may differ from screen_start
                                    * under hardware scrolling/double-buffering) */
+    unsigned int total_screen_size; /* os_VDUVAR_TOTAL_SCREEN_SIZE - the
+                                   * OS's own authoritative size of the
+                                   * genuinely allocated screen memory,
+                                   * in bytes. Deliberately NOT the same
+                                   * thing as line_length*(ywind_limit+1)
+                                   * - that's this driver's own derived
+                                   * estimate of the VISIBLE area, which
+                                   * turned out to be a real, hardware-
+                                   * confirmed wrong assumption to check
+                                   * memory validity against (see
+                                   * v3d_verify_framestore_contiguous). */
 } v3d_screen_info_t;
 
 /*
@@ -58,11 +69,17 @@ _kernel_oserror *v3d_logical_to_physical(void *log_addr, unsigned int *phys_addr
 
 /*
  * Verifies the screen framestore described by `info` is physically
- * contiguous across its ENTIRE size (line_length * (ywind_limit+1)
- * bytes from screen_start), by translating every single page boundary
- * within that range and confirming each consecutive pair's physical
- * addresses differ by exactly PAGE_SIZE. This is NOT a formality: a
- * Dynamic Area's logical window has no general guarantee of physically
+ * contiguous across its ENTIRE genuinely-allocated size
+ * (info->total_screen_size bytes from screen_start - NOT
+ * line_length*(ywind_limit+1), which a first hardware test (2026-09-26)
+ * showed is the wrong range to trust: it hit "Address not recognised"
+ * from OS_Memory 0, meaning that derived estimate reaches beyond what
+ * the OS actually considers valid, backed RAM. total_screen_size is
+ * the OS's own authoritative VDU variable for exactly this, and is
+ * what's used now), by translating every single page boundary within
+ * that range and confirming each consecutive pair's physical addresses
+ * differ by exactly PAGE_SIZE. This is NOT a formality: a Dynamic
+ * Area's logical window has no general guarantee of physically
  * contiguous backing, and the planned GraphicsV Render accelerator's
  * whole approach (a single physical base address + stride, matching
  * how V3D's tile store addressing works - see cl_fill.c) silently

@@ -643,6 +643,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[4] = info.ywind_limit;
             r->r[5] = info.screen_start;
             r->r[6] = info.display_start;
+            r->r[7] = info.total_screen_size;
             return NULL;
         }
 

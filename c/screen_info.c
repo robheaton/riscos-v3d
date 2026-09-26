@@ -22,15 +22,16 @@
 #define VDUVAR_YWIND_LIMIT   0x0Cu
 #define VDUVAR_SCREEN_START  0x94u
 #define VDUVAR_DISPLAY_START 0x95u
+#define VDUVAR_TOTAL_SCREEN_SIZE 0x96u
 
 _kernel_oserror *v3d_read_screen_info(v3d_screen_info_t *out)
 {
-    static const int vars[8] = {
+    static const int vars[9] = {
         VDUVAR_MODE_FLAGS, VDUVAR_LOG2_BPP, VDUVAR_LINE_LENGTH,
         VDUVAR_XWIND_LIMIT, VDUVAR_YWIND_LIMIT, VDUVAR_SCREEN_START,
-        VDUVAR_DISPLAY_START, -1
+        VDUVAR_DISPLAY_START, VDUVAR_TOTAL_SCREEN_SIZE, -1
     };
-    int results[7];
+    int results[8];
     _kernel_swi_regs regs;
     _kernel_oserror *err;
 
@@ -48,6 +49,7 @@ _kernel_oserror *v3d_read_screen_info(v3d_screen_info_t *out)
     out->ywind_limit    = (unsigned int) results[4];
     out->screen_start   = (unsigned int) results[5];
     out->display_start  = (unsigned int) results[6];
+    out->total_screen_size = (unsigned int) results[7];
     return NULL;
 }
 
@@ -83,10 +85,33 @@ _kernel_oserror *v3d_logical_to_physical(void *log_addr, unsigned int *phys_addr
     return NULL;
 }
 
+/* Same 252-byte cap and append helpers as cl_clear.c's diagnose_timeout
+ * - duplicated here rather than shared, this is a small enough amount
+ * of code that pulling in cl_clear.c's dependency graph isn't worth it. */
+#define ERRMESS_CAPACITY 252u
+
+static void append_str(char *dst, unsigned int *pos, const char *s)
+{
+    while (*s && *pos < ERRMESS_CAPACITY - 1u)
+        dst[(*pos)++] = *s++;
+}
+
+static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    int i;
+    if (*pos + 10u >= ERRMESS_CAPACITY)
+        return;
+    dst[(*pos)++] = '0';
+    dst[(*pos)++] = 'x';
+    for (i = 28; i >= 0; i -= 4)
+        dst[(*pos)++] = hex[(v >> i) & 0xFu];
+}
+
 _kernel_oserror *v3d_verify_framestore_contiguous(const v3d_screen_info_t *info,
                                                     unsigned int *phys_base_out)
 {
-    unsigned int total_bytes = info->line_length * (info->ywind_limit + 1u);
+    unsigned int total_bytes = info->total_screen_size;
     unsigned int offset;
     unsigned int prev_phys = 0;
     unsigned int base_phys;
@@ -103,15 +128,38 @@ _kernel_oserror *v3d_verify_framestore_contiguous(const v3d_screen_info_t *info,
 
         err = v3d_logical_to_physical((void *) (info->screen_start + offset), &this_phys);
         if (err)
-            return err;
+        {
+            /* Wrap whatever the OS said (e.g. "Address not recognised")
+             * with exactly which offset triggered it - a first hardware
+             * test hit this with no such context, which cost real
+             * debugging time working out that total_screen_size (not
+             * line_length*(ywind_limit+1), this function's original,
+             * wrong assumption) was the range actually worth trusting. */
+            static _kernel_oserror err_wrapped = { 19, "" };
+            unsigned int pos = 0;
+            append_str(err_wrapped.errmess, &pos, "V3DDriver: framestore "
+                       "contiguity check failed at offset ");
+            append_hex32(err_wrapped.errmess, &pos, offset);
+            append_str(err_wrapped.errmess, &pos, " of ");
+            append_hex32(err_wrapped.errmess, &pos, total_bytes);
+            append_str(err_wrapped.errmess, &pos, " (OS said: ");
+            append_str(err_wrapped.errmess, &pos, err->errmess);
+            append_str(err_wrapped.errmess, &pos, ")");
+            err_wrapped.errmess[pos] = '\0';
+            return &err_wrapped;
+        }
 
         if (this_phys != prev_phys + SCREEN_PAGE_SIZE)
         {
-            static _kernel_oserror err_discontig = {
-                15, "V3DDriver: screen framestore is NOT physically "
-                    "contiguous - GraphicsV Render acceleration is not "
-                    "safe against this mode's memory layout"
-            };
+            static _kernel_oserror err_discontig = { 15, "" };
+            unsigned int pos = 0;
+            append_str(err_discontig.errmess, &pos, "V3DDriver: screen "
+                       "framestore is NOT physically contiguous at offset ");
+            append_hex32(err_discontig.errmess, &pos, offset);
+            append_str(err_discontig.errmess, &pos, " - GraphicsV Render "
+                       "acceleration is not safe against this mode's "
+                       "memory layout");
+            err_discontig.errmess[pos] = '\0';
             return &err_discontig;
         }
 
