@@ -308,6 +308,37 @@ static inline void emit_clear_tile_buffers(cl_buf_t *b)
     cl_u8(b, 3);
 }
 
+/* LoadTileBufferGeneral (opcode 30) - the mirror of StoreTileBufferGeneral
+ * above, for GraphicsV Render op 1 (copy): loads pixel data FROM memory
+ * INTO the on-chip tile buffer (as opposed to Store, which dumps the
+ * tile buffer TO memory). A copy is then just Load(source)+Store(dest)
+ * per tile, no shader/texture-sampling machinery needed at all - see
+ * README's "GraphicsV Render accelerator" section for the reasoning.
+ *
+ * Byte layout transcribed from the reference's LoadTileBufferGeneral
+ * struct (v3d_cl.hpp) the same way every other packet in this file was -
+ * structurally identical to StoreTileBufferGeneral's own layout (same
+ * 13-byte total, same field ordering/positions for buffer type/memory
+ * format/flip in byte0, decimate_mode/image_format at bits2-9 of the
+ * following u16, unused(4)+stride(20) in the 24-bit field after that),
+ * just with buffer_to_load(4 bits) named differently for its semantic
+ * meaning (population source vs. output destination) rather than any
+ * actual layout difference. Never exercised in the reference's own
+ * example code (defined but unused there) - genuinely new territory
+ * for this project, to be proven on real hardware before trusting it. */
+static inline void emit_load_tile_buffer_rt0(cl_buf_t *b, unsigned int input_format,
+                                       unsigned int stride, unsigned int addr)
+{
+    cl_u8(b, 30);
+    cl_u8(b, 0); /* BUFFER_RENDER_TARGET_0=0, memory_format=RASTER=0, flip=0 */
+    cl_u16(b, (input_format & 0x3Fu) << 4);
+    cl_u24(b, (stride & 0xFFFFFu) << 4);
+    cl_u16(b, 0); /* height: 0 = derive from TileRenderingModeCfgCommon,
+                    * matching Store's own analogous field - unconfirmed
+                    * for Load specifically until tested on hardware. */
+    cl_u32(b, addr);
+}
+
 static inline void v3d_flush_caches(io_mapping_t *v3d)
 {
     IO_WORD(*v3d, V3D_CTL_L2TFLSTA) = 0;

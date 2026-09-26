@@ -29,6 +29,7 @@
 #include "v3d_irq.h"
 #include "screen_info.h"
 #include "cl_fill.h"
+#include "cl_copy.h"
 #include "gfxv_accel.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
@@ -131,6 +132,12 @@ static _kernel_oserror *ensure_pmp_fill(void)
  * tile_alloc/tile_state), up to ~41 pages even at full 1920x1080, so
  * this leaves generous headroom either way. */
 #define SCREEN_FILL_BASE_PAGE 3000u
+
+/* Well clear of SCREEN_FILL_BASE_PAGE's own small usage (3000-3041) -
+ * V3D_CopyTest needs two full padded buffers (source+dest) plus
+ * scratch, more than ScreenFillTest but still comfortably inside
+ * g_pmp_fill's 4096-page/16MB window for realistic test sizes. */
+#define COPY_TEST_BASE_PAGE 3200u
 
 /*
  * Step 3 of the planned GraphicsV Render accelerator: caches the
@@ -484,6 +491,7 @@ enum
     SWI_V3D_AccelStop = 12,
     SWI_V3D_AccelStats = 13,
     SWI_V3D_AccelFailInfo = 14,
+    SWI_V3D_CopyTest = 15,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -861,6 +869,51 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[7] = g_gfxv_success_min_area;
             r->r[8] = g_gfxv_success_max_area;
             return NULL;
+
+        case SWI_V3D_CopyTest:
+        {
+            /* First step of op 1 (copy) - see README.md and
+             * c/cl_copy.c. R0=width, R1=height in; copies from a
+             * synthetic source buffer (filled with a per-pixel test
+             * pattern) to a synthetic dest buffer (not the real screen
+             * yet). Returns the source logical address (R0), dest
+             * logical address (R1), shared stride in bytes (R2),
+             * tiles_x (R3), tiles_y (R4) - a test script samples both
+             * buffers directly to confirm the copy matched pixel for
+             * pixel. Requires V3D_PowerOn. */
+            void *src_log, *dest_log;
+            unsigned int stride, tiles_x, tiles_y;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    22, "V3DDriver: V3D_CopyTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_copy_test(&g_pmp_fill, COPY_TEST_BASE_PAGE,
+                                  (unsigned int) r->r[0], (unsigned int) r->r[1],
+                                  &src_log, &dest_log, &stride, &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = (unsigned int) src_log;
+            r->r[1] = (unsigned int) dest_log;
+            r->r[2] = stride;
+            r->r[3] = tiles_x;
+            r->r[4] = tiles_y;
+            return NULL;
+        }
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see
