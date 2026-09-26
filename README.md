@@ -1024,6 +1024,35 @@ completely normal. Fixed `v3d_ensure_clock_on()` to check
 `GetClockState` first and only call `SetClockState` when the clock is
 actually confirmed off. Not yet tested on hardware.
 
+**Hardware result, attempt 16 (2026-09-26) - both clock theories ruled
+out; found the real bug.** The idempotent-clock-enable fix made no
+difference - byte-for-byte identical failure, identical addresses.
+Then tested with the second call using entirely different, never-
+before-used physical pages (`ClearToSprite`'s page range instead of
+`ClearTest`'s): still hung, but this time with `CA`/`EA` showing the
+*first* call's own addresses, not the second call's freshly-written
+`QBA`/`QEA` at all. That's decisive: the CLE thread was never picking
+up the new job - it was still sitting exactly where the first job left
+it, regardless of which physical pages the new job used.
+
+Root cause: `v3d_restart_thread()`'s guard treats "CS reads
+`0x00000000`" as "nothing to do," but `CTRUN` clears itself the moment
+a job completes normally - a job that just finished leaves `CS` reading
+identically to a thread that has never run anything at all, while `CA`
+sits at that completed job's own address rather than 0. The guard
+can't tell the two states apart from `CS` alone, and picked the wrong
+one: it left a completed-but-stale thread alone, so the next
+submission's `QBA`/`QEA` write was never latched into `CA` at all.
+
+Fixed using a discriminant `CS` genuinely doesn't have but `CA` does:
+`V3D_ReadIdent` already showed `CA` reads exactly 0 on a truly virgin
+thread. `v3d_restart_thread()` now only skips the kick when `CA==0`
+*and* nothing is already latched in `CS` (preserving the historical v2
+finding that unconditional `CTSUBS` breaks a genuinely fresh thread) -
+any thread that has run a job before, however it stopped, always gets
+the kick regardless of which `CS` bits happen to be set. Not yet
+tested on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

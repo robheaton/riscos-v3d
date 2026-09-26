@@ -403,15 +403,38 @@ static void v3d_flush_caches(io_mapping_t *v3d)
  * restart write (and its poll) when the thread is actually stopped
  * with CTSUBS or CTERR set - a thread that's running, or cleanly
  * stopped-at-end, is left alone.
+ *
+ * v3 (this version): v2's "cleanly stopped-at-end, leave it alone"
+ * case turned out to be exactly wrong for a *second* submission in one
+ * session. Hardware testing (2026-09-26) found a job that completes
+ * normally (CTRUN clears itself, CS reads right back to 0x00000000 -
+ * indistinguishable from a truly virgin thread by CS alone) leaves CA
+ * sitting at that job's own address. The next submission's fresh
+ * QBA/QEA write is never picked up - CA/EA at the following timeout
+ * still showed the *previous* job's addresses, not the new one, even
+ * though V3D_PowerOn's reset had already been confirmed clean via
+ * V3D_ReadIdent (CT0CS=CT1CS=0) and the new job used entirely
+ * different, never-before-used physical pages (ruling out a stale-
+ * address or cache-reuse explanation). CS alone can't tell "never run
+ * a job" from "just finished one" - but CA can: V3D_ReadIdent already
+ * showed CA reads 0 on a genuinely virgin thread. So: never touch a
+ * running thread (CTRUN); skip the kick only when CA is still 0 *and*
+ * CS shows nothing already latched (the v2 case, preserved as-is);
+ * otherwise - any thread that has run a job before, however it
+ * stopped - always issue the kick.
  */
-static void v3d_restart_thread(io_mapping_t *v3d, unsigned int cs_reg)
+static void v3d_restart_thread(io_mapping_t *v3d, unsigned int cs_reg,
+                                 unsigned int ca_reg)
 {
     unsigned int spin;
     unsigned int cs = IO_WORD(*v3d, cs_reg);
+    unsigned int ca = IO_WORD(*v3d, ca_reg);
 
-    if ((cs & V3D_CT_CS_CTRUN) ||
-        !(cs & (V3D_CT_CS_CTSUBS | V3D_CT_CS_CTERR)))
-        return; /* already running, or cleanly idle - nothing to do */
+    if (cs & V3D_CT_CS_CTRUN)
+        return; /* running - never write CTSUBS to a running thread */
+
+    if (!ca && !(cs & (V3D_CT_CS_CTSUBS | V3D_CT_CS_CTERR)))
+        return; /* genuinely virgin (CA==0, nothing latched) - nothing to do */
 
     IO_WORD(*v3d, cs_reg) = V3D_CT_CS_CTSUBS;
 
@@ -814,7 +837,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
      * V3D_CT_CS_CTRUN here - that bit STOPS a thread, it doesn't start
      * one. See v3d_restart_thread's comment for why there's a settle
      * delay before the writes that follow. */
-    v3d_restart_thread(&v3d, V3D_CLE_CT0CS);
+    v3d_restart_thread(&v3d, V3D_CLE_CT0CS, V3D_CLE_CT0CA);
 
     IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
     IO_WORD(v3d, V3D_CLE_CT0QMS) = TILE_ALLOC_PAGE_COUNT * PAGE_SIZE;
@@ -840,7 +863,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     v3d_flush_caches(&v3d);
     last_rfc = IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu;
 
-    v3d_restart_thread(&v3d, V3D_CLE_CT1CS); /* see thread 0's comment */
+    v3d_restart_thread(&v3d, V3D_CLE_CT1CS, V3D_CLE_CT1CA); /* see thread 0's comment */
 
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering */
