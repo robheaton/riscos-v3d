@@ -27,6 +27,8 @@
 #include "memsplit.h"
 #include "v3d_clock.h"
 #include "v3d_irq.h"
+#include "screen_info.h"
+#include "cl_fill.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -93,6 +95,34 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
 
 /* Uses PMP pages 32-41 (10 pages) - well clear of ClearTest's range. */
 #define CLEAR_SPRITE_BASE_PAGE 32u
+
+/*
+ * Separate, much bigger PMP area for V3D_FillTest (step 2 of the
+ * planned GraphicsV Render accelerator - see README.md). The shared
+ * g_pmp above is sized for tiny fixed-64x64 test buffers (1MB/64 pages
+ * total); a multi-tile fill needs room to grow up to full-screen size
+ * (1920x1088 padded RGBA8 alone is ~8MB - see cl_fill.c's sizing
+ * comments), so this gets its own 16MB logical window instead of
+ * enlarging g_pmp and risking the already-proven allocator/DA config
+ * every other SWI here depends on. Created lazily, same as g_pmp.
+ */
+static pmp_area_t g_pmp_fill;
+static int g_pmp_fill_created = 0;
+
+static _kernel_oserror *ensure_pmp_fill(void)
+{
+    _kernel_oserror *err;
+
+    if (g_pmp_fill_created)
+        return NULL;
+
+    err = pmp_create("V3DFill", 16u * 1024u * 1024u, 4096u, &g_pmp_fill);
+    if (err)
+        return err;
+
+    g_pmp_fill_created = 1;
+    return NULL;
+}
 
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
@@ -313,6 +343,13 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
     if (g_pmp_created)
         pmp_err = pmp_release(&g_pmp, 0, g_pmp.max_pages);
 
+    if (g_pmp_fill_created)
+    {
+        _kernel_oserror *fill_err = pmp_release(&g_pmp_fill, 0, g_pmp_fill.max_pages);
+        if (!pmp_err)
+            pmp_err = fill_err;
+    }
+
     return irq_err ? irq_err : pmp_err;
 }
 
@@ -330,6 +367,8 @@ enum
     SWI_V3D_MemSplit = 5,
     SWI_V3D_ClockInfo = 6,
     SWI_V3D_IRQTest = 7,
+    SWI_V3D_ScreenInfo = 8,
+    SWI_V3D_FillTest = 9,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -532,6 +571,74 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
             r->r[0] = live_claimed;
             r->r[1] = live_spurious;
+            return NULL;
+        }
+
+        case SWI_V3D_ScreenInfo:
+        {
+            /* Read-only groundwork for the planned GraphicsV Render
+             * accelerator (see README.md) - fetches the OS's own live
+             * screen-mode state, nothing V3D-specific, no hardware
+             * touched. Packed two values per register since there are
+             * seven fields and only R0-R5 conventionally used for
+             * output here; R4/R5 used to avoid clashing with the
+             * driver's own dispatch (this SWI never touches r->r[6+]). */
+            v3d_screen_info_t info;
+            _kernel_oserror *err = v3d_read_screen_info(&info);
+            if (err)
+                return err;
+
+            r->r[0] = info.mode_flags;
+            r->r[1] = info.log2_bpp;
+            r->r[2] = info.line_length;
+            r->r[3] = info.xwind_limit;
+            r->r[4] = info.ywind_limit;
+            r->r[5] = info.screen_start;
+            r->r[6] = info.display_start;
+            return NULL;
+        }
+
+        case SWI_V3D_FillTest:
+        {
+            /* Step 2 of the planned GraphicsV Render accelerator - see
+             * README.md and cl_fill.c. R0=width, R1=height, R2=colour
+             * in; fills a multi-tile rectangle into a fresh test buffer
+             * (not the real screen - that's step 3), returns physical
+             * address (R0), row stride in bytes (R1), tiles_x (R2),
+             * tiles_y (R3), and the *logical* address (R4) so a BASIC
+             * test script can sample pixels directly with `!(addr)`. */
+            unsigned int target_phys, stride, tiles_x, tiles_y;
+            void *target_log;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    13, "V3DDriver: V3D_FillTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_fill_test(&g_pmp_fill, 0, (unsigned int) r->r[0],
+                                  (unsigned int) r->r[1], (unsigned int) r->r[2],
+                                  &target_phys, &target_log, &stride,
+                                  &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = target_phys;
+            r->r[1] = stride;
+            r->r[2] = tiles_x;
+            r->r[3] = tiles_y;
+            r->r[4] = (unsigned int) target_log;
             return NULL;
         }
 

@@ -13,7 +13,7 @@ CMUNGEFLAGS := -tgcc -32bit -p
 
 CFLAGS   := -mmodule -O2 -Wall -Wextra -Ic -Icmhg
 
-OBJS     := c/module.o c/phys_buffer.o c/cl_clear.o c/sprite.o c/bcmsupport.o c/memsplit.o c/v3d_clock.o c/v3d_irq.o cmhg/V3DDriver.o
+OBJS     := c/module.o c/phys_buffer.o c/cl_clear.o c/cl_fill.o c/sprite.o c/bcmsupport.o c/memsplit.o c/v3d_clock.o c/v3d_irq.o c/screen_info.o cmhg/V3DDriver.o
 
 all: V3DDriver,ffa
 
@@ -26,14 +26,20 @@ cmhg/V3DDriver.o: cmhg/V3DDriver.cmhg
 	$(CMUNGE) $(CMUNGEFLAGS) -o $@ $<
 
 # All .c files include the generated header, so it must exist first.
-c/module.o: c/module.c c/v3d_regs.h c/io_map.h c/phys_buffer.h c/cl_clear.h c/memsplit.h c/v3d_clock.h c/v3d_irq.h cmhg/V3DDriver.h
+c/module.o: c/module.c c/v3d_regs.h c/io_map.h c/phys_buffer.h c/cl_clear.h c/cl_fill.h c/memsplit.h c/v3d_clock.h c/v3d_irq.h c/screen_info.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/module.c -o c/module.o
+
+c/screen_info.o: c/screen_info.c c/screen_info.h
+	$(CC) $(CFLAGS) -c c/screen_info.c -o c/screen_info.o
 
 c/phys_buffer.o: c/phys_buffer.c c/phys_buffer.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/phys_buffer.c -o c/phys_buffer.o
 
-c/cl_clear.o: c/cl_clear.c c/cl_clear.h c/cl_builder.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/sprite.h c/v3d_irq.h
+c/cl_clear.o: c/cl_clear.c c/cl_clear.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/sprite.h c/v3d_irq.h
 	$(CC) $(CFLAGS) -c c/cl_clear.c -o c/cl_clear.o
+
+c/cl_fill.o: c/cl_fill.c c/cl_fill.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/v3d_irq.h
+	$(CC) $(CFLAGS) -c c/cl_fill.c -o c/cl_fill.o
 
 c/sprite.o: c/sprite.c c/sprite.h
 	$(CC) $(CFLAGS) -c c/sprite.c -o c/sprite.o
@@ -54,6 +60,6 @@ V3DDriver,ffa: $(OBJS)
 	$(CC) -mmodule -o $@ $(OBJS)
 
 clean:
-	rm -f c/module.o c/phys_buffer.o c/cl_clear.o c/sprite.o c/bcmsupport.o c/memsplit.o c/v3d_clock.o c/v3d_irq.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
+	rm -f c/module.o c/phys_buffer.o c/cl_clear.o c/cl_fill.o c/sprite.o c/bcmsupport.o c/memsplit.o c/v3d_clock.o c/v3d_irq.o c/screen_info.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
 
 .PHONY: all clean

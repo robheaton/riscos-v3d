@@ -1,0 +1,375 @@
+/*
+ * cl_fill.c - see cl_fill.h.
+ *
+ * Generalises cl_clear.c's fixed-single-64x64-tile clear+store to an
+ * arbitrary tiles_x x tiles_y grid, using the same emitters (cl_packets.h)
+ * and the same explicit-per-tile TileCoordinates approach cl_clear.c
+ * already uses for its one tile - NOT the reference's SupertileCoordinates/
+ * generic-indirect-tile-list mechanism (BranchToImplicitTileList,
+ * PrimListFormat, OP_TILE_COORDINATES_IMPLICIT, OP_RETURN_FROM_SUB_LIST -
+ * see gl_rainbow_triangle.cpp's RCL). That mechanism exists to keep the
+ * RCL compact when walking thousands of tiles for real primitive
+ * rendering; a fill has no primitives and needs no shader/indirect-list
+ * machinery at all, so explicitly unrolling one clear+store pair per
+ * tile is simpler, avoids implementing packets this project has never
+ * used before, and costs only ~40 bytes/tile (about 20KB of RCL for a
+ * full 1920x1080 screen - trivial next to the pages already involved).
+ *
+ * MulticoreTileListSetBase/MulticoreSupertileCfg are still emitted with
+ * real (non-1x1) values, even though SupertileCoordinates is never
+ * used to walk them - they establish the tile_alloc addressing scheme
+ * the binner used, which each explicit TileCoordinates call still
+ * relies on to find its own tile's bin data. Confirmed this is a
+ * genuinely separate concern from SupertileCoordinates by reading
+ * TileBinningModeCfg's own packet (cl_packets.h) - it carries no
+ * supertile parameters at all, only frame width/height, so supertile
+ * grouping is purely an RCL/render-side addressing detail.
+ */
+
+#include <stddef.h>
+#include "cl_fill.h"
+#include "cl_builder.h"
+#include "cl_packets.h"
+#include "v3d_regs.h"
+#include "io_map.h"
+#include "v3d_irq.h"
+
+#define TILE_SIZE 64u
+
+static unsigned int div_round_up(unsigned int a, unsigned int b)
+{
+    return (a + b - 1u) / b;
+}
+
+static unsigned int bytes_to_pages(unsigned int bytes)
+{
+    return div_round_up(bytes, PAGE_SIZE);
+}
+
+/*
+ * Picks the smallest supertile_w/supertile_h (starting at 1x1, growing
+ * whichever dimension is currently smaller) that keeps the resulting
+ * supertile-grid cell count under 256 - transcribed from the reference's
+ * getSuperTiles(), gl_rainbow_triangle.cpp lines ~49-69, not derived
+ * independently (the "grow whichever is smaller" tie-break and the
+ * exact <256 threshold are both real choices from that source, not
+ * obvious ones - e.g. a >= vs > off-by-one here would silently under-
+ * or over-allocate the supertile grid).
+ */
+static void get_super_tiles(unsigned int tiles_x, unsigned int tiles_y,
+                             unsigned int *supertile_w, unsigned int *supertile_h,
+                             unsigned int *frame_w_supertile,
+                             unsigned int *frame_h_supertile)
+{
+    unsigned int sw = 1u, sh = 1u, fw, fh;
+
+    for (;;)
+    {
+        fw = div_round_up(tiles_x, sw);
+        fh = div_round_up(tiles_y, sh);
+        if (fw * fh < 256u)
+            break;
+        if (sw < sh)
+            sw++;
+        else
+            sh++;
+    }
+
+    *supertile_w = sw;
+    *supertile_h = sh;
+    *frame_w_supertile = fw;
+    *frame_h_supertile = fh;
+}
+
+/*
+ * Waits for a CLE IRQ-driven completion counter to advance, exactly
+ * like cl_clear.c's v3d_poll_counter, but without its rich
+ * diagnose_timeout() diagnostics - deliberately NOT sharing that code
+ * (duplicating this one small loop instead) to avoid touching the
+ * hardware-proven M2/M3 path while this multi-tile generalisation is
+ * still unproven. If a real hardware timeout ever shows up here, port
+ * the diagnostics over then, with real failure data to shape them
+ * around instead of guessing what's worth logging in advance.
+ */
+static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
+                                      unsigned int initial,
+                                      _kernel_oserror *timeout_err)
+{
+    unsigned int spin;
+    for (spin = 0; spin < 5000000u; spin++)
+    {
+        if (*counter != initial)
+            return NULL;
+    }
+    return timeout_err;
+}
+
+_kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
+                                 unsigned int width, unsigned int height,
+                                 unsigned int clear_color_rgba,
+                                 unsigned int *target_phys_out,
+                                 void **target_log_out,
+                                 unsigned int *target_stride_bytes_out,
+                                 unsigned int *tiles_x_out,
+                                 unsigned int *tiles_y_out)
+{
+    unsigned int tiles_x, tiles_y, n_tiles;
+    unsigned int tile_alloc_bytes, tile_state_bytes, rcl_bytes;
+    unsigned int tile_alloc_pages, tile_state_pages, rcl_pages;
+    unsigned int padded_w, padded_h, stride, render_bytes, render_pages;
+    unsigned int supertile_w, supertile_h, frame_w_supertile, frame_h_supertile;
+    unsigned int cl_phys, render_phys, tile_alloc_phys, tile_state_phys, rcl_phys;
+    void *cl_log, *render_log, *tile_alloc_log, *tile_state_log, *rcl_log_ptr;
+    _kernel_oserror *err;
+    cl_buf_t bcl, rcl;
+    unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
+    io_mapping_t v3d;
+    unsigned int last_bin_irq, last_render_irq;
+    unsigned int page = base_page;
+    unsigned int col, row;
+
+    if (width == 0u || height == 0u)
+    {
+        static _kernel_oserror err_bad_size = {
+            10, "V3DDriver: V3D_FillTest width/height must be non-zero"
+        };
+        return &err_bad_size;
+    }
+
+    tiles_x = div_round_up(width, TILE_SIZE);
+    tiles_y = div_round_up(height, TILE_SIZE);
+    n_tiles = tiles_x * tiles_y;
+
+    /* Padded to a whole tile grid, not just width x height - see
+     * cl_fill.h's own comment for why (a partial edge tile's full-tile
+     * store writing past the declared frame is an open question this
+     * test buffer sidesteps rather than assumes an answer to). */
+    padded_w = tiles_x * TILE_SIZE;
+    padded_h = tiles_y * TILE_SIZE;
+    stride = padded_w * 4u;
+    render_bytes = stride * padded_h;
+    render_pages = bytes_to_pages(render_bytes);
+
+    /* tile_alloc: align(N*64,4096) + 64*64*2 - transcribed verbatim
+     * from gl_rainbow_triangle.cpp (see cl_fill.h's top comment); the
+     * "+ 64*64*2" term is a literal constant (8192 bytes), not scaled
+     * by tile count - confirmed by reading that source directly, not
+     * inferred from cl_clear.c's single-tile case where the two would
+     * have been indistinguishable (N=1 there too). */
+    tile_alloc_bytes = n_tiles * TILE_SIZE;
+    tile_alloc_bytes = (tile_alloc_bytes + 4095u) & ~4095u;
+    tile_alloc_bytes += TILE_SIZE * TILE_SIZE * 2u;
+    tile_alloc_pages = bytes_to_pages(tile_alloc_bytes);
+
+    /* tile_state: 256 bytes/tile (V3D>=40 - this hardware is 4.2),
+     * matching cl_clear.c's existing single-tile constant scaled up. */
+    tile_state_bytes = n_tiles * 256u;
+    tile_state_pages = bytes_to_pages(tile_state_bytes);
+
+    /* RCL: fixed ~52-byte header + ~40 bytes/tile (two TileCoordinates
+     * blocks per tile - clear, then store, matching cl_clear.c's
+     * existing per-tile pattern) + 1 byte EndOfRendering, plus a page
+     * of slack. BCL is unaffected by tile count (no primitives are
+     * ever emitted regardless of how many tiles there are - see this
+     * file's top comment) so it keeps cl_clear.c's fixed small size. */
+    rcl_bytes = 64u + n_tiles * 40u + 64u;
+    rcl_pages = bytes_to_pages(rcl_bytes);
+
+    /* pmp_alloc caps a single call at 64 pages (MAX_PAGES_PER_CALL in
+     * phys_buffer.c - a fixed-size stack array, not a real hardware
+     * limit). That only bounds how big a rectangle THIS TEST HARNESS
+     * can exercise via a synthetic PMP render-target buffer - it does
+     * not bound the real GraphicsV feature (step 3 writes directly
+     * into the already-existing screen framestore, no PMP allocation
+     * for the render target at all; tile_alloc/tile_state/rcl stay
+     * comfortably under 64 pages even at full 1920x1080 - 32/3/5 pages
+     * respectively). Caught here with a clear, specific error rather
+     * than letting pmp_alloc's generic "invalid page count" surface
+     * for what's actually just "pick a smaller test rectangle". */
+    if (render_pages > 64u || tile_alloc_pages > 64u ||
+        tile_state_pages > 64u || rcl_pages > 64u)
+    {
+        static _kernel_oserror err_too_big = {
+            14, "V3DDriver: V3D_FillTest rectangle too large for this test "
+                "harness (pmp_alloc's 64-page/call cap) - try a smaller "
+                "width/height. Not a limit of the fill algorithm itself."
+        };
+        return &err_too_big;
+    }
+
+    err = pmp_alloc(pmp, page, 1u, &cl_phys, &cl_log);
+    if (err) return err;
+    page += 1u;
+
+    err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
+    if (err) return err;
+    page += rcl_pages;
+
+    err = pmp_alloc(pmp, page, render_pages, &render_phys, &render_log);
+    if (err) return err;
+    page += render_pages;
+
+    err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
+    if (err) return err;
+    page += tile_alloc_pages;
+
+    err = pmp_alloc(pmp, page, tile_state_pages, &tile_state_phys, &tile_state_log);
+    if (err) return err;
+
+    /* Zero tile-alloc/tile-state scratch - see cl_clear.c's own comment
+     * on why (recycled RISC OS pages, not guaranteed-zero fresh memory). */
+    {
+        unsigned int i;
+        volatile unsigned int *p;
+
+        p = (volatile unsigned int *) tile_alloc_log;
+        for (i = 0; i < (tile_alloc_pages * PAGE_SIZE) / 4u; i++)
+            p[i] = 0;
+
+        p = (volatile unsigned int *) tile_state_log;
+        for (i = 0; i < (tile_state_pages * PAGE_SIZE) / 4u; i++)
+            p[i] = 0;
+    }
+
+    get_super_tiles(tiles_x, tiles_y, &supertile_w, &supertile_h,
+                     &frame_w_supertile, &frame_h_supertile);
+
+    /* --- BCL: identical shape to cl_clear.c's, just parameterised on
+     * real width/height instead of the fixed 64x64 test constants. No
+     * primitives, so nothing here scales with tile count. --- */
+    cl_init(&bcl, cl_log, cl_phys, PAGE_SIZE);
+    bcl_start = cl_paddr(&bcl);
+    emit_tile_binning_mode_cfg(&bcl, width, height);
+    emit_flush_vcd_cache(&bcl);
+    emit_occlusion_query_counter(&bcl, 0);
+    emit_start_tile_binning(&bcl);
+
+    emit_clip_window(&bcl, 0, 0, width, height);
+    emit_cfg_bits(&bcl, 1, 1, 1, 0, 0, 0, 0, 7, 0, 0, 1, 0, 0, 0, 0);
+    emit_point_size(&bcl, 1.0f);
+    emit_line_width(&bcl, 1.0f);
+    emit_clipper_xy_scaling(&bcl, (width / 2.0f) * 256.0f, (height / 2.0f) * -256.0f);
+    emit_clipper_z_scale_and_offset(&bcl, 0.5f, 0.5f);
+    emit_clipper_z_min_max(&bcl, 0.0f, 1.0f);
+    emit_viewport_offset(&bcl, width / 2, height / 2, 0, 0);
+    emit_color_write_masks(&bcl, 0);
+    emit_blend_constant_color(&bcl, 0, 0, 0, 0);
+    emit_zero_all_flat_shade_flags(&bcl);
+    emit_zero_all_non_perspective_flags(&bcl);
+    emit_zero_all_centroid_flags(&bcl);
+    emit_transform_feedback_specs(&bcl, 0, 0);
+    emit_occlusion_query_counter(&bcl, 0);
+    emit_sample_state(&bcl, 0xF, 1.0f);
+    emit_vcm_cache_size(&bcl, 4, 4);
+    emit_flush(&bcl);
+    bcl_end = cl_paddr(&bcl);
+
+    /* --- RCL: real multi-tile grid, one clear+store pair per tile --- */
+    cl_init(&rcl, rcl_log_ptr, rcl_phys, rcl_pages * PAGE_SIZE);
+    rcl_start = cl_paddr(&rcl);
+    emit_tile_rendering_mode_cfg_common(&rcl, width, height, 2);
+    emit_tile_rendering_mode_cfg_clear_colors(&rcl, 0, clear_color_rgba, 0);
+    emit_tile_rendering_mode_cfg_color_rt0(&rcl, 0, 2, 0);
+    emit_tile_rendering_mode_cfg_zs_clear(&rcl, 0, 1.0f);
+    emit_tile_list_initial_block_size(&rcl, 0, 1);
+    emit_multicore_tile_list_set_base(&rcl, tile_alloc_phys);
+    emit_multicore_supertile_cfg(&rcl, supertile_w, supertile_h,
+                                   frame_w_supertile, frame_h_supertile,
+                                   tiles_x, tiles_y, 1, 0, 0);
+
+    for (row = 0; row < tiles_y; row++)
+    {
+        for (col = 0; col < tiles_x; col++)
+        {
+            /*
+             * FIX (2026-09-26, hardware-diagnosed): this used to be
+             * render_phys + row*TILE_SIZE*stride + col*TILE_SIZE*4 -
+             * manually computing each tile's destination address. Real
+             * hardware testing (a 4x3-tile fill) showed only tiles at
+             * even multiples of 512 bytes came out correct (0, 512,
+             * 65536, ...) while odd multiples (256, 768) read back
+             * untouched leftover memory - a pattern that only makes
+             * sense if the CLE ALSO derives the column offset from the
+             * current TileCoordinates internally and adds it to
+             * whatever "addr" is given, so a manually-added column
+             * offset was compounding with the hardware's own. This
+             * matches the reference's own actual usage in
+             * gl_rainbow_triangle.cpp - its single, shared store command
+             * (inside the generic/indirect tile list, run once per tile
+             * via implicit tile-coordinate iteration) always passes the
+             * plain, un-offset render_target.paddr(), every time,
+             * regardless of which tile is currently selected. Passing
+             * the same base address here for every tile - trusting the
+             * CLE to add the per-tile offset itself from the preceding
+             * TileCoordinates command - is the same fix, just with
+             * TileCoordinates set explicitly instead of implicitly.
+             */
+            emit_tile_coordinates(&rcl, col, row);
+            emit_end_of_loads(&rcl);
+            emit_store_tile_buffer_none(&rcl);
+            emit_clear_tile_buffers(&rcl);
+            emit_end_of_tile_marker(&rcl);
+
+            /* dummy store: workaround a race condition, per cl_clear.c's
+             * own comment (same reference source) at the equivalent point */
+            emit_tile_coordinates(&rcl, col, row);
+            emit_end_of_loads(&rcl);
+            emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, stride, render_phys);
+            emit_end_of_tile_marker(&rcl);
+        }
+    }
+
+    emit_end_of_rendering(&rcl);
+    rcl_end = cl_paddr(&rcl);
+
+    /* --- kick off binning --- */
+    err = io_map(V3D_MB_BASE, &v3d);
+    if (err) return err;
+
+    IO_WORD(v3d, V3D_PTB_BPOS) = 0;
+    v3d_flush_caches(&v3d);
+    last_bin_irq = g_v3d_irq_bin_done_count;
+
+    IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
+    IO_WORD(v3d, V3D_CLE_CT0QMS) = tile_alloc_pages * PAGE_SIZE;
+    IO_WORD(v3d, V3D_CLE_CT0QTS) = tile_state_phys | V3D_CLE_CT0QTS_ENABLE;
+    IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
+    IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end;
+
+    io_unmap(&v3d);
+
+    {
+        static _kernel_oserror err_bin_timeout = {
+            11, "V3DDriver: V3D_FillTest timed out waiting for binning"
+        };
+        err = wait_for_irq(&g_v3d_irq_bin_done_count, last_bin_irq, &err_bin_timeout);
+        if (err) return err;
+    }
+
+    /* --- kick off rendering --- */
+    err = io_map(V3D_MB_BASE, &v3d);
+    if (err) return err;
+
+    v3d_flush_caches(&v3d);
+    last_render_irq = g_v3d_irq_render_done_count;
+
+    IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
+    IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end;
+
+    io_unmap(&v3d);
+
+    {
+        static _kernel_oserror err_render_timeout = {
+            12, "V3DDriver: V3D_FillTest timed out waiting for rendering"
+        };
+        err = wait_for_irq(&g_v3d_irq_render_done_count, last_render_irq, &err_render_timeout);
+        if (err) return err;
+    }
+
+    *target_phys_out = render_phys;
+    *target_log_out = render_log;
+    *target_stride_bytes_out = stride;
+    *tiles_x_out = tiles_x;
+    *tiles_y_out = tiles_y;
+    return NULL;
+}
