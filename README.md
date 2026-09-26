@@ -1078,6 +1078,45 @@ this thread ever run before" is still knowable; the kick itself moved
 to `v3d_kick_thread()`, called only for non-virgin threads, after
 `QBA`/`QEA`. Not yet tested on hardware.
 
+**Hardware result, attempt 18 (2026-09-26) - the reorder fix also made
+zero difference, byte-for-byte identical failure again.** Four attempts
+at this mechanism (fixed-delay, CS-gated, CA-gated, reordered) had now
+all failed identically. Noticed something in the diagnostic that hadn't
+been weighed properly: `QBA`'s own *readback* didn't match what was
+just written, even in the very first failing test, well before any
+reordering existed - a sign the problem wasn't really about ordering or
+gating logic at all, but about the whole mechanism.
+
+Went back to the primary source properly this time instead of reasoning
+from this project's own prior comments about it. Fetched Broadcom's
+"VideoCore IV 3D Architecture Reference Guide" PDF directly
+(docs.broadcom.com/doc/12358545) and read the actual `V3D_CTnCS`/
+`CTnEA`/`CTnCA` register tables: that document has **no `QBA`/`QEA`/
+`QMA`/`QMS` registers at all** - it's for an older V3D generation that
+submits jobs by directly writing `CTnCA`/`CTnEA`, where `CTSUBS`
+genuinely means what this project's comments assumed. The Pi 4/CM4
+(V3D 4.2) is a later generation with a different, queue-based
+submission model - `CTnCA`/`CTnEA` are plain progress-monitoring
+registers there, and `QBA`/`QEA`/`QMA`/`QMS` (a completely different
+set of registers, different offsets) are what you actually write to
+submit. Every version of the restart/kick logic had been applying an
+older architecture's documented semantics to registers that don't work
+that way on this hardware - explaining why no version of it, however
+carefully reasoned, ever changed the outcome.
+
+Confirmed the correct model by reading the actual, shipping Linux
+kernel `v3d` driver for this exact hardware generation
+(`drivers/gpu/drm/v3d/v3d_sched.c`, `v3d_bin_job_run`/
+`v3d_render_job_run`, fetched from
+raw.githubusercontent.com/torvalds/linux 2026-09-26): it submits every
+job - first, second, thousandth, no exceptions - with nothing but
+`QMA`/`QMS`/`QTS` (if present) then `QBA` then `QEA`. No `CS` read, no
+`CTSUBS`, no state check, no restart logic of any kind. Its own
+comment: *"Writing the end register is what starts the job."* Removed
+the entire kick mechanism (`v3d_kick_thread` and everything before it)
+and the virgin-thread `CA` check - `v3d_clear_run` now does exactly
+what the real driver does, nothing more. Not yet tested on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
