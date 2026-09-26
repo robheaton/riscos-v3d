@@ -97,9 +97,16 @@ enum { MAX_PAGES_PER_CALL = 64 };
  * an intervening *RMKill failed with "memory cannot be moved" - the
  * claim step refusing to swap a still-mapped page's physical backing,
  * exactly as the PRM says it will.)
+ *
+ * Also called from module_final (see phys_buffer.h) - a Dynamic Area
+ * is a system-wide OS resource that outlives the module that created
+ * it, unless the physical pages locked into it are explicitly
+ * released first. Without this, a reloaded module's OS_Memory 12
+ * calls could be recommended pages a still-existing, still-locked
+ * zombie area from the previous instance already owns.
  */
-static _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
-                                     unsigned int num_pages)
+_kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
+                              unsigned int num_pages)
 {
     unsigned int list[MAX_PAGES_PER_CALL][3];
     _kernel_swi_regs regs;

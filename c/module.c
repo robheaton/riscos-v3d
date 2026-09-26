@@ -291,6 +291,8 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
 
 _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
 {
+    _kernel_oserror *irq_err, *pmp_err = NULL;
+
     (void) fatal;
     (void) podule_base;
     (void) pw;
@@ -299,7 +301,19 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
      * this session - see v3d_irq_shutdown's own comment for why a
      * reloaded module leaving its interrupt vector claimed is a real
      * hazard, not just untidy. */
-    return v3d_irq_shutdown();
+    irq_err = v3d_irq_shutdown();
+
+    /* Same reasoning, different resource: the PMP Dynamic Area is
+     * system-wide OS state that outlives this module unless its
+     * claimed physical pages are explicitly released first - see
+     * pmp_release's own comment in phys_buffer.c. Release the whole
+     * area's page range unconditionally (safe even for pages never
+     * actually used - see pmp_release's own comment), not just
+     * whichever sub-ranges this particular session happened to touch. */
+    if (g_pmp_created)
+        pmp_err = pmp_release(&g_pmp, 0, g_pmp.max_pages);
+
+    return irq_err ? irq_err : pmp_err;
 }
 
 /* ---------------------------------------------------------------- */

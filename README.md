@@ -1487,12 +1487,46 @@ shared-GIC-line freeze), with the module's own private word correctly
 threaded through to the handler (the null-pointer-chain freeze). Reload
 without a reboot has now caused two further freezes on top of that
 (dangling vector claim, then reset-pulsing an already-warm core) -
-both fixed, neither yet reconfirmed on hardware. Five separate bugs
-across twenty-plus hardware round-trips to get here, four of them
-genuine machine freezes, not just wrong answers - worth the reader
-treating "reload without reboot" as this project's own highest-risk
-test scenario going forward, not an afterthought. Next milestones
-below.
+both fixed, neither yet reconfirmed on hardware.
+
+**Hardware result (2026-09-26) - the reset-skip fix alone was also not
+enough. A third freeze at the exact same test step**, confirmed via a
+control experiment first: running `StressTest.bas` twice in the *same*
+session with no reload at all works perfectly cleanly, ruling out
+"running the 50-iteration battery more than once" as inherently
+unsafe and confirming this is genuinely specific to reloading. The
+freeze happened before any output at all - with the old every-5th-
+iteration print, that only narrows it to "somewhere in iterations
+1-4", not precise enough to diagnose further, so `StressTest.bas` now
+prints a marker before every single risky call (not just every 5th
+iteration) - if this happens again, the last line on screen will
+pinpoint the exact call in flight.
+
+Found a third system-wide OS resource this module was leaking across
+reloads, this time by direct analogy to the two already found (the
+interrupt vector, the reset-pulse tracking): the PMP Dynamic Area
+itself. Like a claimed device vector, a Dynamic Area is system-wide OS
+state that outlives the module that created it unless its physical
+pages are explicitly released first - `module_final` never did this
+either. A reloaded module's `OS_Memory 12` calls could be recommended
+physical pages a still-existing, still-locked zombie area from the
+previous instance already owns - a double-claim hazard matching the
+timing exactly (the very first real GPU memory use after reload, which
+is the first `pmp_alloc()` call).
+
+**Fix**: exposed `pmp_release()` (previously file-local to
+`phys_buffer.c`) and call it unconditionally from `module_final` for
+the whole PMP area's page range, safe even for pages a given session
+never actually used. Not yet tested on hardware. Given two previous
+fixes for this same symptom didn't fully resolve it, this is not
+presented as confirmed - only as the next well-grounded candidate,
+with better diagnostics now in place either way.
+
+Five separate bugs across twenty-plus hardware round-trips to get
+here, four of them genuine machine freezes, not just wrong answers -
+worth the reader treating "reload without reboot" as this project's
+own highest-risk test scenario going forward, not an afterthought.
+Next milestones below.
 
 ## Next milestones
 

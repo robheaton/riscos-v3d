@@ -17,6 +17,13 @@ REM alongside it in v3d_poll_counter) holds up under sustained
 REM repetition, not just a one-off call. Prints a summary of how many
 REM iterations were genuinely IRQ-driven at the end.
 REM
+REM Prints a marker before every single risky step (not just every 5th
+REM iteration) - added after a real hardware freeze that left no clue
+REM which of PowerOn/ClearTest/ClearToSprite was in flight when it hit,
+REM since the old every-5th-iteration summary print meant "froze before
+REM printing anything" could mean anywhere in iterations 1-4. If it
+REM freezes again, the last line on screen now pinpoints the exact call.
+REM
 REM Stops immediately on the first failure (wrong readback, or any
 REM SWI error/timeout) with full detail. A clean run to completion is
 REM the pass condition; if it ever fails partway through, the printed
@@ -33,6 +40,7 @@ irq_clear_count% = 0
 irq_sprite_count% = 0
 
 FOR i% = 1 TO N%
+  PRINT "iter "; i%; ": PowerOn..."
   SYS "V3D_PowerOn" TO ok%, rate%
   IF ok% <> 1 THEN PRINT "FAIL at iteration "; i%; ": V3D_PowerOn returned ok="; ok% : END
 
@@ -40,15 +48,17 @@ FOR i% = 1 TO N%
   REM no cross-byte carry), force alpha=FF so type-6 TBGR stays opaque
   colour% = (i% * &01010101) OR &FF000000
 
+  PRINT "iter "; i%; ": ClearTest..."
   SYS "V3D_ClearTest", colour% TO phys%, readback%, bin_irq%, render_irq%
   IF readback% <> colour% THEN PRINT "FAIL at iteration "; i%; " (ClearTest): wanted "; ~colour%; " got "; ~readback% : END
   IF bin_irq% = 1 AND render_irq% = 1 THEN irq_clear_count% = irq_clear_count% + 1
 
+  PRINT "iter "; i%; ": ClearToSprite..."
   SYS "V3D_ClearToSprite", colour% TO sprite%, readback2%, physaddr%, sprite_irq%
   IF readback2% <> colour% THEN PRINT "FAIL at iteration "; i%; " (ClearToSprite): wanted "; ~colour%; " got "; ~readback2% : END
   IF sprite_irq% = 1 THEN irq_sprite_count% = irq_sprite_count% + 1
 
-  IF (i% MOD 5) = 0 THEN PRINT "iteration "; i%; " OK (clock rate="; rate%; " Hz, ClearTest IRQ="; bin_irq%; "/"; render_irq%; " ClearToSprite IRQ="; sprite_irq%; ")"
+  PRINT "iter "; i%; " OK (clock rate="; rate%; " Hz, ClearTest IRQ="; bin_irq%; "/"; render_irq%; " ClearToSprite IRQ="; sprite_irq%; ")"
 NEXT i%
 
 PRINT

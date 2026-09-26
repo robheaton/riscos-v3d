@@ -55,6 +55,18 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
                             void **logical_ptr_out);
 
 /*
+ * Releases (unmaps, then unclaims) any pages currently held at
+ * [page_index, page_index+num_pages) in `area`. Safe to call on a
+ * range that was never allocated (see phys_buffer.c's own comment) -
+ * module_final calls this for the whole area's page range unconditionally,
+ * regardless of which specific sub-ranges any particular session
+ * actually used, so a module reload never leaves physical pages
+ * locked into a now-orphaned zombie Dynamic Area.
+ */
+_kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
+                              unsigned int num_pages);
+
+/*
  * Dynamic Area ResizePMP handler (reason 6), wired up via the .cmhg
  * generic-veneers mechanism. Unconditionally refuses any resize
  * requested via OS_ChangeDynamicArea - this PMP's size is only ever
