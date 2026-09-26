@@ -54,17 +54,26 @@ PRINT
 
 IF errors% > 0 THEN PROCfailinfo
 
+SYS "V3D_AccelCopyStats" TO copy_ops%, copy_overlap%, copy_claimed%, copy_errors%, copy_errnum%
+
+PRINT "GraphicsV op 1 (copy) calls seen:  "; copy_ops%
+PRINT "  rejected (overlapping):          "; copy_overlap%
+PRINT "  actually accelerated by the GPU: "; copy_claimed%
+PRINT "  attempted but failed:            "; copy_errors%
+IF copy_errors% > 0 THEN PRINT "  last copy failure error number:  "; copy_errnum%
+PRINT
+
 SYS "V3D_AccelStop"
 PRINT "Released (V3D_AccelStop) - back to normal software rendering."
 PRINT
 IF calls% = 0 THEN PRINT "No GraphicsV traffic seen at all - try more" : PRINT "desktop interaction, or this may indicate something" : PRINT "isn't reaching this vector." : END
 
-IF claimed% > 0 THEN PRINT "At least one real accelerated fill happened - check the desktop looked correct throughout." : END
+IF claimed% > 0 OR copy_claimed% > 0 THEN PRINT "At least one real accelerated fill or copy happened - check the desktop looked correct throughout." : END
 
-PRINT "GraphicsV traffic was seen, but nothing matched (reason 13 +"
-PRINT "op 2 + solid ECF). Could be genuinely correct (no plain solid"
-PRINT "fills happened to occur), or could mean the ECF/coordinate"
-PRINT "decoding needs a closer look."
+PRINT "GraphicsV traffic was seen, but nothing was accelerated."
+PRINT "Could be genuinely correct (no plain solid fills or"
+PRINT "non-overlapping copies happened to occur), or could mean"
+PRINT "the decoding needs a closer look."
 END
 
 DEF PROCfailinfo

@@ -378,6 +378,55 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
                              &tiles_x, &tiles_y);
 }
 
+/*
+ * Step 5's equivalent of v3d_accel_render_fill, for op 1 (copy) - see
+ * gfxv_accel.c's handle_render_copy. Same self-initialisation, same
+ * GraphicsV-bottom-up-to-internal-top-down coordinate conversion,
+ * applied independently to both rectangles (each has its own bottom
+ * edge, so each needs its own flip - they are NOT assumed to share a
+ * common y-origin beyond both being on the same screen). Non-
+ * overlapping only - the caller (gfxv_accel.c's handle_render_copy)
+ * must have already checked that itself; this function does not
+ * re-check, same division of responsibility as v3d_accel_render_fill
+ * not re-validating its own caller's ECF decoding.
+ */
+_kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_bottom,
+                                         unsigned int dest_left, unsigned int dest_bottom,
+                                         unsigned int width, unsigned int height)
+{
+    unsigned int clock_rate;
+    unsigned int src_y_top_down, dest_y_top_down;
+    unsigned int tiles_x, tiles_y;
+    _kernel_oserror *err;
+
+    err = v3d_power_on(&clock_rate);
+    if (err)
+        return err;
+
+    err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    err = ensure_pmp_fill();
+    if (err)
+        return err;
+
+    err = v3d_irq_ensure_ready();
+    if (err)
+        return err;
+
+    /* Each rectangle's own top edge, flipped independently - see this
+     * function's own top comment. */
+    src_y_top_down = g_screen_info.ywind_limit - (src_bottom + height - 1u);
+    dest_y_top_down = g_screen_info.ywind_limit - (dest_bottom + height - 1u);
+
+    return v3d_copy_screen(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+                             src_left, src_y_top_down, dest_left, dest_y_top_down,
+                             width, height,
+                             g_screen_phys_base, g_screen_info.line_length,
+                             &tiles_x, &tiles_y);
+}
+
 static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
 {
     io_mapping_t v3d;
@@ -500,6 +549,7 @@ enum
     SWI_V3D_AccelFailInfo = 14,
     SWI_V3D_CopyTest = 15,
     SWI_V3D_ScreenCopyTest = 16,
+    SWI_V3D_AccelCopyStats = 17,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1000,6 +1050,20 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = tiles_y;
             return NULL;
         }
+
+        case SWI_V3D_AccelCopyStats:
+            /* Op 1 (copy) instrumentation, added from the start this
+             * time - see gfxv_accel.c's own comment. Total op-1 calls
+             * seen (R0), how many were rejected for overlapping (R1),
+             * how many were actually accelerated (R2), how many were
+             * attempted but failed (R3), and the last failure's error
+             * number (R4). */
+            r->r[0] = g_gfxv_copy_op_count;
+            r->r[1] = g_gfxv_copy_overlap_count;
+            r->r[2] = g_gfxv_copy_claimed_count;
+            r->r[3] = g_gfxv_copy_error_count;
+            r->r[4] = g_gfxv_copy_last_fail_errnum;
+            return NULL;
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see

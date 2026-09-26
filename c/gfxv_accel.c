@@ -17,6 +17,7 @@
 #define GRAPHICSV_REASON_MASK 0xFFFFu
 #define GRAPHICSV_REASON_RENDER 13u
 
+#define RENDER_OP_COPY 1u
 #define RENDER_OP_FILL 2u
 
 /* exposed by module.c - the one function that knows how to actually
@@ -32,6 +33,15 @@
 extern _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
                                                 unsigned int right, unsigned int top,
                                                 unsigned int colour_rgba);
+
+/* Same idea, for op 1 (copy) - see module.c's own comment on
+ * v3d_accel_render_copy. Non-overlapping only (see cl_copy.h) -
+ * v3d_gfxv_handler checks for overlap itself before ever calling this,
+ * since that check needs no module.c-private state and belongs at the
+ * protocol-decoding layer. */
+extern _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_bottom,
+                                                unsigned int dest_left, unsigned int dest_bottom,
+                                                unsigned int width, unsigned int height);
 
 static void *g_gfxv_private_word = NULL;
 static int g_gfxv_claimed = 0;
@@ -77,6 +87,19 @@ volatile unsigned int g_gfxv_fail_min_area = 0xFFFFFFFFu;
 volatile unsigned int g_gfxv_fail_max_area = 0;
 volatile unsigned int g_gfxv_success_min_area = 0xFFFFFFFFu;
 volatile unsigned int g_gfxv_success_max_area = 0;
+
+/*
+ * Op 1 (copy) instrumentation - added from the start this time, having
+ * learned from op 2's own live-test experience (a real bug and a real
+ * throughput/reliability question both only became visible once actual
+ * invocation counts were captured, not from visual effects alone).
+ * Exposed via V3D_AccelCopyStats.
+ */
+volatile unsigned int g_gfxv_copy_op_count = 0;
+volatile unsigned int g_gfxv_copy_overlap_count = 0;
+volatile unsigned int g_gfxv_copy_claimed_count = 0;
+volatile unsigned int g_gfxv_copy_error_count = 0;
+volatile unsigned int g_gfxv_copy_last_fail_errnum = 0;
 
 void v3d_gfxv_set_private_word(void *pw)
 {
@@ -149,29 +172,13 @@ static int ecf_decode_solid(const unsigned int *ecf, unsigned int *colour_out)
     return 1;
 }
 
-int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
+static void handle_render_fill(_kernel_swi_regs *r)
 {
-    unsigned int reason;
-    unsigned int op;
     const unsigned int *params;
     unsigned int left, bottom, right, top;
     const unsigned int *ecf;
     unsigned int colour;
     _kernel_oserror *err;
-
-    (void) pw;
-
-    g_gfxv_call_count++;
-
-    reason = ((unsigned int) r->r[4]) & GRAPHICSV_REASON_MASK;
-    if (reason != GRAPHICSV_REASON_RENDER)
-        return 1; /* not ours - VECTOR_PASSON, R4 untouched */
-
-    g_gfxv_render_count++;
-
-    op = (unsigned int) r->r[1];
-    if (op != RENDER_OP_FILL)
-        return 1; /* op 0 (no-op) and op 1 (copy) not handled yet */
 
     g_gfxv_fill_op_count++;
 
@@ -195,7 +202,7 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
     ecf = (const unsigned int *) params[4];
 
     if (!ecf_decode_solid(ecf, &colour))
-        return 1; /* a real pattern/dither fill - not ours to accelerate */
+        return; /* a real pattern/dither fill - not ours to accelerate */
 
     g_gfxv_solid_count++;
 
@@ -213,11 +220,11 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
             g_gfxv_last_fail_top = top;
             if (area < g_gfxv_fail_min_area) g_gfxv_fail_min_area = area;
             if (area > g_gfxv_fail_max_area) g_gfxv_fail_max_area = area;
-            return 1; /* GPU fill failed (e.g. timeout) - leave unclaimed
-                        * so the OS's own CPU fallback still draws
-                        * correctly; see gfxv_accel.h's top comment on
-                        * why silently wrong output is worse than
-                        * falling back here. */
+            return; /* GPU fill failed (e.g. timeout) - leave unclaimed
+                      * so the OS's own CPU fallback still draws
+                      * correctly; see gfxv_accel.h's top comment on
+                      * why silently wrong output is worse than
+                      * falling back here. */
         }
 
         if (area < g_gfxv_success_min_area) g_gfxv_success_min_area = area;
@@ -226,5 +233,79 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
 
     g_gfxv_claimed_count++;
     r->r[4] = 0; /* claimed - see GraphicsV's own R4=0 convention */
+}
+
+static void handle_render_copy(_kernel_swi_regs *r)
+{
+    const unsigned int *params;
+    unsigned int src_left, src_bottom, dest_left, dest_bottom, width, height;
+    _kernel_oserror *err;
+
+    g_gfxv_copy_op_count++;
+
+    /* GraphicsV 13 1 parameter block: word0=Source left, word1=Source
+     * bottom, word2=Dest left, word3=Dest bottom, word4=Width-1,
+     * word5=Height-1 - confirmed against the real PRM (see README).
+     * Both rectangles share the same width/height (a copy, not a
+     * scale). */
+    params = (const unsigned int *) r->r[2];
+    src_left = params[0];
+    src_bottom = params[1];
+    dest_left = params[2];
+    dest_bottom = params[3];
+    width = params[4] + 1u;
+    height = params[5] + 1u;
+
+    /* Non-overlapping only for now (see cl_copy.h). AABB overlap test:
+     * NOT (one rect is entirely to one side of the other on either
+     * axis). Checked here, at the protocol layer, before ever calling
+     * into module.c - the same check V3D_ScreenCopyTest's SWI handler
+     * makes for itself, duplicated rather than shared since the two
+     * call sites take differently-shaped inputs (this one decodes
+     * straight from GraphicsV's own bottom-up rectangle-plus-size
+     * form; the test SWI takes an already-parsed width/height pair). */
+    if (src_left < dest_left + width && dest_left < src_left + width &&
+        src_bottom < dest_bottom + height && dest_bottom < src_bottom + height)
+    {
+        g_gfxv_copy_overlap_count++;
+        return; /* overlapping - not ours to accelerate yet */
+    }
+
+    err = v3d_accel_render_copy(src_left, src_bottom, dest_left, dest_bottom,
+                                  width, height);
+    if (err)
+    {
+        g_gfxv_copy_error_count++;
+        g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
+        return; /* GPU copy failed - leave unclaimed, same fail-safe
+                  * reasoning as handle_render_fill. */
+    }
+
+    g_gfxv_copy_claimed_count++;
+    r->r[4] = 0; /* claimed */
+}
+
+int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
+{
+    unsigned int reason;
+    unsigned int op;
+
+    (void) pw;
+
+    g_gfxv_call_count++;
+
+    reason = ((unsigned int) r->r[4]) & GRAPHICSV_REASON_MASK;
+    if (reason != GRAPHICSV_REASON_RENDER)
+        return 1; /* not ours - VECTOR_PASSON, R4 untouched */
+
+    g_gfxv_render_count++;
+
+    op = (unsigned int) r->r[1];
+    if (op == RENDER_OP_FILL)
+        handle_render_fill(r);
+    else if (op == RENDER_OP_COPY)
+        handle_render_copy(r);
+    /* op 0 (no-op) and any other value: not ours, R4 left untouched */
+
     return 1; /* VECTOR_PASSON regardless - see gfxv_accel.h */
 }

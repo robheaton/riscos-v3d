@@ -1,12 +1,13 @@
 /*
- * gfxv_accel.h - step 4 of the planned GraphicsV Render accelerator
+ * gfxv_accel.h - steps 4-5 of the planned GraphicsV Render accelerator
  * (see README.md's "GraphicsV Render accelerator" section): claim
- * GraphicsV (vector 42) and intercept reason code 13 (Render), op 2
- * (rectangle fill) only, for a genuine solid-colour ECF pattern only -
- * everything else is left unclaimed (R4 untouched) so it falls through
- * to whatever else is on the chain (the kernel's own HAL-bridge
- * claimant, confirmed to exist by the earlier GraphicsV/HAL Video API
- * research - see README).
+ * GraphicsV (vector 42) and intercept reason code 13 (Render) - op 2
+ * (rectangle fill) for a genuine solid-colour ECF pattern only, and op
+ * 1 (rectangle copy) for non-overlapping rectangles only (see
+ * cl_copy.h for why overlap isn't handled yet) - everything else is
+ * left unclaimed (R4 untouched) so it falls through to whatever else
+ * is on the chain (the kernel's own HAL-bridge claimant, confirmed to
+ * exist by the earlier GraphicsV/HAL Video API research - see README).
  *
  * Deliberately NOT auto-claimed on module load - see V3D_AccelStart/
  * V3D_AccelStop below. A silently wrong accelerated fill corrupts
@@ -56,6 +57,14 @@ extern volatile unsigned int g_gfxv_fail_min_area;
 extern volatile unsigned int g_gfxv_fail_max_area;
 extern volatile unsigned int g_gfxv_success_min_area;
 extern volatile unsigned int g_gfxv_success_max_area;
+
+/* Op 1 (copy) instrumentation - see gfxv_accel.c's own comment.
+ * Exposed for V3D_AccelCopyStats. */
+extern volatile unsigned int g_gfxv_copy_op_count;
+extern volatile unsigned int g_gfxv_copy_overlap_count;
+extern volatile unsigned int g_gfxv_copy_claimed_count;
+extern volatile unsigned int g_gfxv_copy_error_count;
+extern volatile unsigned int g_gfxv_copy_last_fail_errnum;
 
 /*
  * OS_Claim/OS_Release on vector 42 (GraphicsV), using this module's
