@@ -58,4 +58,27 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
                                  unsigned int *tiles_x_out,
                                  unsigned int *tiles_y_out);
 
+/*
+ * Same Load+Store copy, but targeting the real screen framestore
+ * directly - no PMP allocation for source or dest at all (that memory
+ * already exists; only the CL/tile_alloc/tile_state scratch buffers
+ * still come from `pmp`, starting at `base_page`). (src_x, src_y) and
+ * (dest_x, dest_y) are both in this driver's own top-down-from-
+ * ScreenStart convention (see cl_fill.h's own comment on this - the
+ * same applies here), NOT GraphicsV's bottom-left-origin one.
+ *
+ * The CALLER MUST have already confirmed the two `width` x `height`
+ * rectangles at (src_x,src_y) and (dest_x,dest_y) do not overlap -
+ * this function does not check that itself (see this header's top
+ * comment on why overlapping copies are out of scope for now).
+ */
+_kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
+                                   unsigned int src_x, unsigned int src_y,
+                                   unsigned int dest_x, unsigned int dest_y,
+                                   unsigned int width, unsigned int height,
+                                   unsigned int screen_phys_base,
+                                   unsigned int screen_stride,
+                                   unsigned int *tiles_x_out,
+                                   unsigned int *tiles_y_out);
+
 #endif /* CL_COPY_H */

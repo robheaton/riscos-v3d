@@ -345,3 +345,19 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
     *stride_bytes_out = stride;
     return NULL;
 }
+
+_kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
+                                   unsigned int src_x, unsigned int src_y,
+                                   unsigned int dest_x, unsigned int dest_y,
+                                   unsigned int width, unsigned int height,
+                                   unsigned int screen_phys_base,
+                                   unsigned int screen_stride,
+                                   unsigned int *tiles_x_out,
+                                   unsigned int *tiles_y_out)
+{
+    unsigned int src_phys = screen_phys_base + src_y * screen_stride + src_x * 4u;
+    unsigned int dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * 4u;
+
+    return run_copy(pmp, base_page, width, height, src_phys, dest_phys,
+                     screen_stride, tiles_x_out, tiles_y_out);
+}

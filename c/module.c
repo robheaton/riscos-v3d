@@ -139,6 +139,13 @@ static _kernel_oserror *ensure_pmp_fill(void)
  * g_pmp_fill's 4096-page/16MB window for realistic test sizes. */
 #define COPY_TEST_BASE_PAGE 3200u
 
+/* Well clear of COPY_TEST_BASE_PAGE's own worst-case usage (two
+ * padded buffers up to 64 pages each, plus scratch) - V3D_ScreenCopyTest
+ * only needs scratch space (CL/tile_alloc/tile_state), no PMP
+ * allocation for source/dest at all (real screen memory already
+ * exists), same reasoning as SCREEN_FILL_BASE_PAGE. */
+#define SCREEN_COPY_BASE_PAGE 3500u
+
 /*
  * Step 3 of the planned GraphicsV Render accelerator: caches the
  * screen's confirmed physical framestore base (see
@@ -492,6 +499,7 @@ enum
     SWI_V3D_AccelStats = 13,
     SWI_V3D_AccelFailInfo = 14,
     SWI_V3D_CopyTest = 15,
+    SWI_V3D_ScreenCopyTest = 16,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -912,6 +920,84 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[2] = stride;
             r->r[3] = tiles_x;
             r->r[4] = tiles_y;
+            return NULL;
+        }
+
+        case SWI_V3D_ScreenCopyTest:
+        {
+            /* Second step of op 1 (copy) - see README.md and
+             * c/cl_copy.c's v3d_copy_screen. R0=src_x, R1=src_y,
+             * R2=dest_x, R3=dest_y, R4=width, R5=height in. Writes
+             * DIRECTLY into the real, live screen framestore, same
+             * caution as V3D_ScreenFillTest. Non-overlapping only -
+             * refuses with a clear error if the source and dest
+             * rectangles overlap at all, same fail-safe philosophy as
+             * everywhere else in this module (see cl_copy.h's own
+             * comment on why overlap isn't handled yet). Returns
+             * tiles_x (R0), tiles_y (R1). */
+            unsigned int src_x = (unsigned int) r->r[0];
+            unsigned int src_y = (unsigned int) r->r[1];
+            unsigned int dest_x = (unsigned int) r->r[2];
+            unsigned int dest_y = (unsigned int) r->r[3];
+            unsigned int width = (unsigned int) r->r[4];
+            unsigned int height = (unsigned int) r->r[5];
+            unsigned int tiles_x, tiles_y;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    23, "V3DDriver: V3D_ScreenCopyTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_screen_framestore();
+            if (err)
+                return err;
+
+            if (width == 0u || height == 0u ||
+                src_x + width > g_screen_info.xwind_limit + 1u ||
+                src_y + height > g_screen_info.ywind_limit + 1u ||
+                dest_x + width > g_screen_info.xwind_limit + 1u ||
+                dest_y + height > g_screen_info.ywind_limit + 1u)
+            {
+                static _kernel_oserror err_out_of_bounds = {
+                    24, "V3DDriver: V3D_ScreenCopyTest rectangle is outside "
+                        "the current screen mode's bounds"
+                };
+                return &err_out_of_bounds;
+            }
+
+            /* AABB overlap test: NOT (one rect is entirely to one
+             * side of the other on either axis). */
+            if (src_x < dest_x + width && dest_x < src_x + width &&
+                src_y < dest_y + height && dest_y < src_y + height)
+            {
+                static _kernel_oserror err_overlap = {
+                    25, "V3DDriver: V3D_ScreenCopyTest source and "
+                        "destination rectangles overlap - not supported yet"
+                };
+                return &err_overlap;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_copy_screen(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+                                    src_x, src_y, dest_x, dest_y, width, height,
+                                    g_screen_phys_base, g_screen_info.line_length,
+                                    &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = tiles_x;
+            r->r[1] = tiles_y;
             return NULL;
         }
 
