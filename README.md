@@ -1237,6 +1237,16 @@ yet). A nonzero count would mean a device-number collision or some
 other surprise, to be understood before going further. Not yet tested
 on hardware.
 
+**Hardware result (2026-09-26) - CONFIRMED CLEAN.** Fresh reboot,
+`V3D_PowerOn` then `V3D_IRQTest`: no error, `spurious count=0`. Vector
+claimed, `HAL_IRQEnable`/`HAL_IRQDisable` both worked, released again,
+handler never invoked (as expected - nothing unmasks a real interrupt
+in this stage). Device number 10 is confirmed correct and the claim/
+enable/disable/release plumbing is safe. Stage 2 next: the raw-pointer
++ static-base call for `HAL_IRQClear` from inside the handler, plus
+unmasking `V3D_CTL_INT_MSK_CLR` and actually wiring bin/render
+completion to the interrupt instead of the busy-poll.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
