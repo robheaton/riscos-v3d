@@ -14,7 +14,7 @@
 ; request a real allocation via !Allocate to allocate@riscosopen.org.
 
 title-string:            V3DDriver
-help-string:              V3DDriver 0.01 (M0-M3 complete, GPU sprite in Wimp window verified, not for release)
+help-string:              V3DDriver 0.02 (GraphicsV Render accelerator active - see NoAutoStart)
 initialisation-code:      module_init
 finalisation-code:        module_final
 swi-chunk-base-number:    0xC0040

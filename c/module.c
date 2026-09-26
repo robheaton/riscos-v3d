@@ -545,9 +545,39 @@ static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
 /* Module entry points (names must match the .cmhg file)            */
 /* ---------------------------------------------------------------- */
 
+/*
+ * Case-insensitive substring search for "NOAUTOSTART" in the module's
+ * own *RMLoad command tail - deliberately not using strstr/strcasestr
+ * (avoids depending on anything from string.h this codebase doesn't
+ * already use elsewhere) and deliberately simple: this only needs to
+ * recognise one fixed word, not general command-line parsing.
+ */
+static int cmd_tail_has_noautostart(const char *cmd_tail)
+{
+    static const char target[] = "NOAUTOSTART";
+    unsigned int i;
+
+    if (!cmd_tail)
+        return 0;
+
+    for (; *cmd_tail; cmd_tail++)
+    {
+        for (i = 0; target[i]; i++)
+        {
+            char c = cmd_tail[i];
+            if (c >= 'a' && c <= 'z')
+                c = (char) (c - 'a' + 'A');
+            if (c != target[i])
+                break;
+        }
+        if (!target[i])
+            return 1;
+    }
+    return 0;
+}
+
 _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
 {
-    (void) cmd_tail;
     (void) podule_base;
 
     /* Captured here, not discarded: v3d_irq_claim() needs this exact
@@ -558,8 +588,39 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
     v3d_gfxv_set_private_word(pw);
 
     g_powered_on = 0;
-    /* Deliberately doing nothing else here: no hardware is touched, and
-     * no IO region is mapped, until a SWI actually asks for it. */
+
+    /*
+     * Auto-start: claims GraphicsV immediately on load, same as a
+     * manual V3D_AccelStart, unless the module was loaded with
+     * "NoAutoStart" on its command tail (*RMLoad V3DDriver NoAutoStart)
+     * - a safety valve for testing/isolating this module given its
+     * history of real bugs only surfacing under live desktop traffic
+     * (see README's "GraphicsV Render accelerator" section), and given
+     * this compounds the still-unresolved reload-without-reboot
+     * freeze (a THIRD system vector's claim state to reason about on
+     * unload, on top of the IRQ vector and GraphicsV itself).
+     *
+     * Deliberately does NOT power on the GPU/PMP/IRQ machinery here -
+     * that stays lazy, deferred to the first real accelerated
+     * GraphicsV call (v3d_accel_render_fill/copy already do this) -
+     * module_init runs very early in the boot sequence, before the
+     * system may be fully settled, and this module's own real GPU
+     * initialisation (firmware mailbox calls, clock enable, ASB gates)
+     * has no proven need to happen that early. Claiming the vector
+     * itself is cheap and inert until GraphicsV actually delivers a
+     * Render call.
+     *
+     * A failure to claim (e.g. OS_Claim itself erroring) does NOT fail
+     * module_init - the module still loads and its test SWIs still
+     * work either way; only the automatic acceleration is unavailable,
+     * recoverable later via a manual V3D_AccelStart.
+     */
+    if (!cmd_tail_has_noautostart(cmd_tail))
+        (void) v3d_gfxv_start();
+
+    /* Deliberately doing nothing else here: no other hardware is
+     * touched, and no IO region is mapped, until a SWI or a real
+     * GraphicsV call actually asks for it. */
     return NULL;
 }
 

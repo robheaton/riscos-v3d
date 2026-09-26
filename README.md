@@ -1655,7 +1655,47 @@ remains unresolved. Next milestones below.
   well-grounded theories were tested and fixed, none resolved it.
   **Always reboot before loading a freshly-built module for testing.**
   This does not affect the module's actual operation once loaded - only
-  development-time reloading.
+  development-time reloading. **Now applies on every ordinary load, not
+  just ones where `V3D_AccelStart` was manually run** - see "Auto-start
+  at boot" below, since the module now claims `GraphicsV` automatically
+  on load, adding a second (really third, alongside the IRQ vector)
+  system vector's release path to whatever isn't currently understood
+  about this freeze.
+
+## Auto-start at boot (2026-09-26, build-verified, not yet hardware-tested)
+
+The module now claims `GraphicsV` automatically in `module_init` - the
+moment it's loaded, acceleration is active, no manual `V3D_AccelStart`
+needed. Test scripts (`AccelTest.bas` etc.) still work unchanged:
+`V3D_AccelStart`/`V3D_AccelStop` are idempotent, so calling
+`V3D_AccelStart` when auto-start already claimed the vector is a safe
+no-op.
+
+**Deliberately does NOT power on the GPU/PMP/IRQ machinery at boot** -
+only the `GraphicsV` claim itself happens in `module_init`. The actual
+GPU initialisation (firmware mailbox calls, clock enable, ASB gates)
+stays exactly as lazy as it already was, deferred to the first real
+accelerated call (`v3d_accel_render_fill`/`v3d_accel_render_copy`
+already self-initialise this way). `module_init` runs very early in
+the boot sequence, before the system may be fully settled, and there's
+no proven need for this module's own hardware bring-up to happen that
+early - claiming a software vector is cheap and inert until `GraphicsV`
+actually delivers a Render call.
+
+**Opt-out**: `*RMLoad V3DDriver NoAutoStart` skips the automatic claim,
+leaving the module in the original manual-opt-in mode (`V3D_AccelStart`
+still works normally) - a safety valve for testing/isolating this
+module given its history of real bugs that only surfaced under live
+desktop traffic (see the "GraphicsV Render accelerator" sections
+above), and given every additional claimed system vector is one more
+thing to reason about for the still-unresolved reload freeze above.
+
+A failed auto-claim (e.g. `OS_Claim` itself erroring) does not fail
+`module_init` - the module still loads and its test SWIs still work
+either way; only the automatic acceleration is unavailable, recoverable
+later via a manual `V3D_AccelStart`.
+
+Not yet hardware-tested.
 
 ## Next milestones
 
