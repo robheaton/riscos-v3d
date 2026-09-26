@@ -1141,6 +1141,40 @@ the same unconditional `BPOS=0` write in the same place (before the
 cache flush, before `QMA`/`QMS`/`QTS`/`QBA`/`QEA`). Not yet tested on
 hardware.
 
+**Hardware result, attempt 20 (2026-09-26) - `BPOS` made no difference
+either. Then found the real bug, and it wasn't in the submission path
+at all.** Every test across all nineteen attempts had followed the same
+pattern: `V3D_PowerOn` → submit → `V3D_PowerOn` again → submit - always
+re-calling `PowerOn` before the second submission, out of habit (and
+because it's genuinely required before the *first* one). Tested,
+finally, the one thing that had never actually been isolated:
+`V3D_PowerOn` once, then two submissions with **no** second `PowerOn`
+in between. Both succeeded, byte-exact, on entirely different physical
+addresses. That's the whole answer: calling `V3D_PowerOn` a *second*
+time - re-pulsing a hardware reset on an already-warm, already-clocked,
+already-working V3D core - is itself what was breaking everything.
+Every one of attempts 9 through 20 was a well-grounded fix for a
+symptom of a trigger reintroduced by the test methodology itself, not
+a bug in the code under test.
+
+The irony: the exact assert-then-deassert reset-pulse-on-every-call
+behavior in `v3d_power_on()` was originally added (long before the
+clock-gate investigation) specifically to *fix* a wedged-thread problem
+by forcing a "genuine pulse every call" - reasonable at the time, wrong
+in hindsight now that the real cause of early hangs (the firmware
+clock gate) is understood and fixed independently. Re-pulsing reset on
+an already-good core doesn't recover anything; it's what breaks a
+previously-working one.
+
+**Fix**: `V3D_PowerOn` is now idempotent. The full reset/gate/clock
+sequence runs only on the genuinely first call in a boot; every call
+after that is a no-op that just reports back the already-confirmed
+clock rate. Real callers only need to call it once anyway, but
+defensively calling it again - completely reasonable for real code to
+do - must not silently break the GPU. `BPOS`-clearing is kept (harmless,
+and matches the real driver unconditionally), even though it wasn't
+the actual fix. Not yet tested on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

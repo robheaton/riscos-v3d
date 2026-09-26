@@ -32,6 +32,8 @@
                          * error, not a silent ABI bug. */
 
 static int g_powered_on = 0;
+static unsigned int g_v3d_clock_rate = 0; /* set once, on the first real
+                                            * V3D_PowerOn - see its comment */
 
 /* M2 in progress: physical buffer infrastructure for control lists.
  * Created lazily on first use rather than in module_init, so a module
@@ -96,18 +98,30 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
  * reference (pm.cpp) - direct PM_GRAFX reset deassert + ASB master/slave
  * gate release. No firmware mailbox call required for this step.
  *
- * DIVERGES FROM THE REFERENCE HERE, deliberately: the reference only
- * ever sets PM_V3DRSTN (deassert reset), never clears it, because it
- * runs once on a chip fresh from power-on reset, where the bit is
- * already guaranteed clear - their single "set" call is the real,
- * only reset-deassertion transition that ever happens. We call
- * V3D_PowerOn repeatedly across a whole debugging session without an
- * intervening reboot, so after the first call the bit is already set
- * and every subsequent call was a complete no-op - including, we
- * discovered via CT0CA/CT0RA reading a stale address from several
- * test runs ago, doing nothing to un-wedge a CLE thread that got
- * stuck on an early malformed submission. Explicitly asserting reset
- * first, then deasserting it, forces a genuine pulse every call.
+ * HISTORY: an earlier version of this function explicitly asserted
+ * reset then deasserted it on *every* call (diverging from the
+ * reference, which only ever sets PM_V3DRSTN once, correct for a chip
+ * fresh from silicon reset), reasoning that repeated calls needed a
+ * genuine pulse each time to recover a CLE thread that had gotten
+ * wedged. That reasoning was wrong, and expensively so: hardware
+ * testing (2026-09-26) spent nineteen separate attempts investigating
+ * a "second GPU submission in a session always hangs" bug - address
+ * ranges, clock re-enable idempotency, restart/kick logic (five
+ * variants, then removed entirely to match the real Linux v3d
+ * driver), V3D_PTB_BPOS - before finding the actual cause: calling
+ * V3D_PowerOn a *second* time, re-pulsing a hardware reset on an
+ * already-warm, already-clocked, already-working V3D core, is itself
+ * what breaks it. A minimal test confirmed it directly: PowerOn once,
+ * then two separate ClearTest/ClearToSprite submissions with no
+ * second PowerOn in between - both succeeded, byte-exact, on entirely
+ * different physical addresses.
+ *
+ * So: real callers should only need to call this once per boot
+ * anyway, but defensively calling it again (a completely reasonable
+ * thing for real code to do) must not silently break the GPU. Now
+ * idempotent - the whole reset/gate/clock sequence only runs on the
+ * genuinely first call; every call after that is a no-op that just
+ * reports back the already-confirmed clock rate.
  */
 static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
 {
@@ -118,6 +132,12 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
                                   * below has no other side effect, and
                                   * -O2 is entitled to delete a plain
                                   * empty counting loop entirely */
+
+    if (g_powered_on)
+    {
+        *clock_rate_out = g_v3d_clock_rate;
+        return NULL;
+    }
 
     /* --- firmware clock gate: confirmed root cause of every CLE hang
      * logged so far (2026-09-26 hardware test: V3D_ClockInfo reported
@@ -182,6 +202,7 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
     io_unmap(&v3d);
 
     g_powered_on = 1;
+    g_v3d_clock_rate = clock_rate;
     *clock_rate_out = clock_rate;
     return NULL;
 }
