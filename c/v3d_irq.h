@@ -1,8 +1,39 @@
 /*
- * v3d_irq.h - Stage 1 of real IRQ handling: claim the V3D interrupt
- * vector and prove OS_ClaimDeviceVector/HAL_IRQEnable/HAL_IRQDisable
- * work safely, without yet unmasking any V3D interrupt bit or wiring
- * the handler into real bin/render completion.
+ * v3d_irq.h - real IRQ handling.
+ *
+ * Stage 1 (done, hardware-confirmed 2026-09-26): claim the V3D
+ * interrupt vector via OS_ClaimDeviceVector and exercise
+ * HAL_IRQEnable/HAL_IRQDisable via the safe OS_Hardware 0 SWI path.
+ * See device-number sourcing/citations below - unchanged from stage 1.
+ *
+ * Stage 2a (this version): everything needed for the handler to
+ * actually service a real interrupt, built and testable while V3D's
+ * own interrupt bits remain masked (V3D_CTL_INT_MSK_CLR is never
+ * written anywhere in this stage) - so nothing here can be exercised
+ * by a genuine hardware interrupt yet, only by direct SWI-driven
+ * testing, same safety margin as stage 1:
+ *   - v3d_irq_resolve_clear(): looks up HAL_IRQClear's raw address and
+ *     "static base" (R9) value via OS_Hardware 1, once, outside
+ *     interrupt context - https://www.riscosopen.org/wiki/documentation/show/OS_Hardware%201
+ *     (fetched 2026-09-26): "Calls made to the routine should be in a
+ *     privileged mode, with R9 (sb) set to the static base value
+ *     returned by this SWI."
+ *   - v3d_irq_call_clear(): the actual raw-pointer + R9 call, safe to
+ *     use from inside the interrupt handler (a plain branch, no SWI
+ *     trap, no R14_svc hazard - see the PRM's OS_ClaimDeviceVector
+ *     page, which explicitly warns a handler must "strictly avoid the
+ *     use of non re-entrant SWIs"). Also directly SWI-testable outside
+ *     interrupt context via V3D_IRQTest, to prove the resolved
+ *     address/sb/branch sequence itself doesn't crash before it's
+ *     ever exercised for real.
+ *   - a permanent (not temporary/shared) IO mapping for V3D's own
+ *     registers, established once, so the handler never needs to call
+ *     OS_Memory 14 itself (a SWI call, and the exact shared-window-
+ *     theft hazard v3d_poll_counter's own comment already warns
+ *     about).
+ *   - the handler itself now has real logic: check V3D_CTL_INT_STS,
+ *     if FLDONE/FRDONE is set acknowledge it (V3D_CTL_INT_CLR +
+ *     HAL_IRQClear) and claim; otherwise pass on untouched.
  *
  * Device number 10 = iDev_GPU_VC3D. Not available through any
  * documented enumeration API (RiscOSOpen's own "List of HAL devices"
@@ -16,23 +47,9 @@
  * matches the real upstream Linux device tree's v3d node exactly
  * (arch/arm/boot/dts/broadcom/bcm2711.dtsi: `interrupts = <GIC_SPI 74
  * IRQ_TYPE_LEVEL_HIGH>`, fetched from
- * raw.githubusercontent.com/raspberrypi/linux). Two independent real
- * sources agreeing is why this is trusted despite not being a
- * documented, publicly-enumerable device number.
- *
- * HAL_IRQEnable/HAL_IRQDisable are called here via OS_Hardware 0
- * ("Call HAL routine" - SWI &7A, R8=0, R9=entry number, R0=device
- * number - riscosopen.org/wiki/documentation/show/OS_Hardware 0,
- * fetched 2026-09-26), which is safe from ordinary SWI-handler
- * context. This is deliberately NOT the mechanism used to call
- * HAL_IRQClear from *inside* the interrupt handler in a later stage -
- * the PRM's own OS_ClaimDeviceVector page explicitly warns that a
- * device driver's interrupt routine must "strictly avoid the use of
- * non re-entrant SWIs" (calling a normal SWI from IRQ mode risks
- * corrupting R14_svc if it interrupted other SVC-mode code mid-SWI) -
- * that needs the raw HAL routine address + its "static base" (R9)
- * value, resolved once via OS_Hardware 1 outside interrupt context,
- * called directly with R9 set - a later, separate piece of work.
+ * raw.githubusercontent.com/raspberrypi/linux). Confirmed correct on
+ * real hardware (2026-09-26): V3D_IRQTest claims/enables/disables/
+ * releases cleanly with zero spurious handler invocations.
  */
 #ifndef V3D_IRQ_H
 #define V3D_IRQ_H
@@ -41,17 +58,35 @@
 
 #define V3D_IRQ_DEVICE_NUMBER 10u /* iDev_GPU_VC3D - see comment above */
 
-/* Incremented by v3d_irq_handler every time it's actually invoked.
- * Stage 1 never unmasks any V3D interrupt bit (see v3d_regs.h's
- * V3D_CTL_INT_MSK_CLR), so V3D cannot physically raise this device's
- * IRQ line yet - this should read 0 after V3D_IRQTest. A nonzero value
- * means something unexpected happened (device number collision, a
- * HAL/GIC surprise) and must be understood before going further. */
+/* Incremented by v3d_irq_handler every time it actually claims the
+ * interrupt (i.e. found a real FLDONE/FRDONE bit set) - distinct from
+ * g_v3d_irq_spurious_count, which counts invocations where it found
+ * nothing recognisable and passed on. Both should read 0 until stage
+ * 2b actually unmasks a V3D interrupt bit. */
+extern volatile unsigned int g_v3d_irq_claimed_count;
 extern volatile unsigned int g_v3d_irq_spurious_count;
 
 _kernel_oserror *v3d_irq_claim(void);
 _kernel_oserror *v3d_irq_release(void);
 _kernel_oserror *v3d_irq_hal_enable(void);
 _kernel_oserror *v3d_irq_hal_disable(void);
+
+/*
+ * Resolves HAL_IRQClear's raw address + static-base value (OS_Hardware
+ * 1) and establishes the permanent IO mapping the handler will read/
+ * write V3D registers through. Must be called once, outside interrupt
+ * context (e.g. as part of claiming the vector), before the handler
+ * can safely do anything beyond count-and-pass-on.
+ */
+_kernel_oserror *v3d_irq_resolve_clear(void);
+
+/*
+ * Directly exercises the raw-pointer HAL_IRQClear call (v3d_irq_call_
+ * clear, defined in v3d_irq.c) from ordinary SWI-handler context, for
+ * V3D_IRQTest to prove the resolved address/sb/branch sequence itself
+ * doesn't crash before it's ever exercised for real inside a genuine
+ * interrupt. v3d_irq_resolve_clear() must have been called first.
+ */
+_kernel_oserror *v3d_irq_test_call_clear(void);
 
 #endif

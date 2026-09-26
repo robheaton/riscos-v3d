@@ -415,26 +415,33 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
         case SWI_V3D_IRQTest:
         {
-            /* Stage 1 of real IRQ handling - see v3d_irq.h. Claims the
-             * vector, exercises HAL_IRQEnable/HAL_IRQDisable, releases
-             * the vector again (this is a one-shot test, not permanent
+            /* Real IRQ handling test - see v3d_irq.h. Claims the
+             * vector, resolves+exercises the raw HAL_IRQClear call
+             * (stage 2a - proves the address/static-base/branch
+             * sequence doesn't crash, from safe non-interrupt context),
+             * exercises HAL_IRQEnable/HAL_IRQDisable, releases the
+             * vector again (this is a one-shot test, not permanent
              * wiring yet), and reports how many times the handler was
-             * actually invoked - should be 0, since no V3D interrupt
-             * bit is unmasked anywhere in this stage. */
+             * actually invoked, claimed and spurious - both should be
+             * 0, since no V3D interrupt bit is unmasked anywhere in
+             * this stage. */
             _kernel_oserror *err, *cleanup_err;
 
+            g_v3d_irq_claimed_count = 0;
             g_v3d_irq_spurious_count = 0;
 
             err = v3d_irq_claim();
             if (err)
                 return err; /* never claimed - nothing to release */
 
+            if (!err) err = v3d_irq_resolve_clear();
+            if (!err) err = v3d_irq_test_call_clear();
             if (!err) err = v3d_irq_hal_enable();
             if (!err) err = v3d_irq_hal_disable();
 
-            /* Always release, even if enable/disable failed above -
-             * we did successfully claim, so we must clean that up
-             * regardless of what went wrong after. */
+            /* Always release, even if something above failed - we did
+             * successfully claim, so we must clean that up regardless
+             * of what went wrong after. */
             cleanup_err = v3d_irq_release();
             if (!err)
                 err = cleanup_err;
@@ -442,7 +449,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            r->r[0] = g_v3d_irq_spurious_count;
+            r->r[0] = g_v3d_irq_claimed_count;
+            r->r[1] = g_v3d_irq_spurious_count;
             return NULL;
         }
 

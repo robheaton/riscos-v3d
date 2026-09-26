@@ -26,6 +26,7 @@
 #define SWI_OS_Memory 0x68
 #define OS_Memory_MapIO   14
 #define OS_Memory_UnmapIO 15
+#define OS_Memory_MapIOPermanent 13
 
 typedef struct io_mapping
 {
@@ -64,6 +65,43 @@ static inline void io_unmap(const io_mapping_t *m)
     regs.r[1] = m->key;
     /* best-effort: nothing sensible to do if release itself fails */
     (void) _kernel_swi(SWI_OS_Memory, &regs, &regs);
+}
+
+/*
+ * Maps in `size` bytes at `phys` PERMANENTLY - unlike io_map/io_unmap
+ * above, this mapping is never released and there is no corresponding
+ * unmap call (OS_Memory 15 only releases *temporary* IO mappings -
+ * see https://www.riscosopen.org/wiki/documentation/show/OS_Memory%2013,
+ * fetched 2026-09-26). Deliberately not megabyte-aligned-only like
+ * io_map: takes an arbitrary physical address and size. Only meant to
+ * be called once, for state that must survive for the module's whole
+ * lifetime (e.g. the V3D interrupt handler's own register access - it
+ * cannot safely call OS_Memory 14 itself, both because that's a SWI
+ * call from IRQ mode and because OS_Memory 14 is explicitly documented
+ * as one single, shared, system-wide mapping that any other code could
+ * steal from under it - see v3d_poll_counter's own comment on that
+ * exact hazard). No cache-policy flags are set (R0's flag bits 8/9
+ * both clear = "normal, non-bufferable"/"normal, non-cacheable" per
+ * OS_Memory 13 Flags), matching the Strongly-Ordered mapping io_map
+ * already relies on for every other register access in this driver.
+ */
+static inline _kernel_oserror *io_map_permanent(unsigned int phys,
+                                                  unsigned int size,
+                                                  volatile unsigned int **out_base)
+{
+    _kernel_swi_regs regs;
+    _kernel_oserror *err;
+
+    regs.r[0] = OS_Memory_MapIOPermanent;
+    regs.r[1] = (int) phys;
+    regs.r[2] = (int) size;
+
+    err = _kernel_swi(SWI_OS_Memory, &regs, &regs);
+    if (err)
+        return err;
+
+    *out_base = (volatile unsigned int *) regs.r[3];
+    return NULL;
 }
 
 /* word offset within a mapped megabyte, from a full register address */

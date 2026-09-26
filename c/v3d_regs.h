@@ -101,15 +101,30 @@
 #define V3D_CTL_L2TFLSTA  (V3D_CORE0 + 0x34u)
 #define V3D_CTL_L2TFLEND  (V3D_CORE0 + 0x38u)
 
-/* Interrupt status - diagnostic only, we don't use actual IRQs yet.
- * Source: real Linux kernel drivers/gpu/drm/v3d/v3d_regs.h. Notably,
- * V3D_INT_OUTOMEM: the Linux driver's own comment says the binner
- * stalls waiting for this interrupt to be serviced (more tile-alloc
- * memory fed to it via V3D_PTB_BPOA/BPOS) before it can make further
- * progress - if BFC never advances, this bit is the first thing worth
- * checking, since a bin stalled on OOM looks identical from BFC's
- * perspective to one that never started at all. */
-#define V3D_CTL_INT_STS   (V3D_CORE0 + 0x50u)
+/* Interrupt status/control. Source: real Linux kernel
+ * drivers/gpu/drm/v3d/v3d_regs.h, fetched and independently
+ * re-verified 2026-09-26 (not trusted from a summarizing tool alone -
+ * these exact offsets were re-checked byte-for-byte against the raw
+ * header text). Notably, V3D_INT_OUTOMEM: the Linux driver's own
+ * comment says the binner stalls waiting for this interrupt to be
+ * serviced (more tile-alloc memory fed to it via V3D_PTB_BPOA/BPOS)
+ * before it can make further progress - if BFC never advances, this
+ * bit is the first thing worth checking, since a bin stalled on OOM
+ * looks identical from BFC's perspective to one that never started at
+ * all.
+ *
+ * MSK_SET/MSK_CLR are how the actual interrupt line gets un/masked -
+ * write 1 bits to MSK_SET to mask (disable) those interrupts, 1 bits
+ * to MSK_CLR to unmask (enable) them; MSK_STS reads which are
+ * currently masked. STS/SET/CLR are the status/raise/acknowledge
+ * register: write 1 bits to CLR to acknowledge (standard write-1-to-
+ * clear) once a bit's been serviced. */
+#define V3D_CTL_INT_STS     (V3D_CORE0 + 0x50u)
+#define V3D_CTL_INT_SET     (V3D_CORE0 + 0x54u)
+#define V3D_CTL_INT_CLR     (V3D_CORE0 + 0x58u)
+#define V3D_CTL_INT_MSK_STS (V3D_CORE0 + 0x5Cu)
+#define V3D_CTL_INT_MSK_SET (V3D_CORE0 + 0x60u)
+#define V3D_CTL_INT_MSK_CLR (V3D_CORE0 + 0x64u)
 #define V3D_INT_FRDONE    (1u << 0)  /* render done */
 #define V3D_INT_FLDONE    (1u << 1)  /* bin (flush/load) done */
 #define V3D_INT_OUTOMEM   (1u << 2)  /* binner stalled, needs more tile-alloc memory */

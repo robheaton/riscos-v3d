@@ -1247,6 +1247,31 @@ enable/disable/release plumbing is safe. Stage 2 next: the raw-pointer
 unmasking `V3D_CTL_INT_MSK_CLR` and actually wiring bin/render
 completion to the interrupt instead of the busy-poll.
 
+**Stage 2a (this commit)**: everything needed for the handler to
+service a real interrupt, built and testable while `V3D_CTL_INT_MSK_CLR`
+is still never written anywhere - so nothing here can be exercised by a
+genuine hardware interrupt yet, same safety margin as stage 1.
+`v3d_irq_resolve_clear()` looks up `HAL_IRQClear`'s raw address and
+static-base (`R9`) value via `OS_Hardware 1`, and establishes a
+*permanent* IO mapping (`OS_Memory 13`, not the shared/temporary
+`OS_Memory 14` window `v3d_poll_counter` already warns is unsafe to
+hold across anything, and definitely unsafe to call as a SWI from IRQ
+mode at all) for the handler's own register access. The raw call
+itself (`call_hal_routine`, GCC inline assembly: `R9`=static base,
+`blx` to the resolved address, `R0`=device number) was disassembled
+and checked by hand against the documented convention before shipping,
+not just built and hoped - the generated code is a textbook-exact
+match (`mov r0,#10` / `ldr r9,[...]` / `blx r4`, with `r4/r8/r9/lr`
+correctly saved and restored around it). The handler itself now has
+real logic (check `V3D_CTL_INT_STS`, acknowledge + claim if
+`FLDONE`/`FRDONE` is set, otherwise pass on) but still cannot run for
+a genuine reason yet. `V3D_IRQTest` extended to also resolve and
+directly exercise the raw `HAL_IRQClear` call from safe, non-interrupt
+context, proving the address/static-base/branch sequence itself
+doesn't crash before it's ever used for real - reports both the
+claimed and spurious handler-invocation counts (`R0`/`R1`), both
+expected to read 0. Not yet tested on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
