@@ -325,3 +325,45 @@ _kernel_oserror *v3d_irq_ensure_ready(void)
     g_v3d_irq_ready = 1;
     return NULL;
 }
+
+/*
+ * Must be called from module_final, unconditionally - a no-op if
+ * v3d_irq_ensure_ready() was never called (module unloaded without
+ * any GPU submission ever happening). Otherwise mask everything back
+ * off, HAL_IRQDisable, and release the vector.
+ *
+ * This matters more than ordinary cleanup hygiene: OS_ClaimDeviceVector
+ * only recognises a later claim as replacing an earlier one when the
+ * device number, handler address and R12 all match exactly - a
+ * *reloaded* module gets a different handler address every time (a
+ * fresh RMA allocation), so it is never recognised as "the same
+ * driver" replacing the old claim. Without this, every reload leaves
+ * the previous instance's claim permanently in the vector's chain of
+ * claimants, pointing at code and data that no longer exist once that
+ * instance is unloaded - a dangling entry a later real interrupt could
+ * still reach (e.g. if some future version of this handler ever
+ * legitimately passes on an unrecognised interrupt) with unpredictable
+ * results. BCMSupport's own real module does the equivalent in its
+ * mailbox_shutdown().
+ */
+_kernel_oserror *v3d_irq_shutdown(void)
+{
+    _kernel_oserror *err = NULL;
+
+    if (!g_v3d_irq_ready)
+        return NULL;
+
+    if (g_v3d_permanent_mapped)
+        IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
+
+    err = v3d_irq_hal_disable();
+
+    {
+        _kernel_oserror *release_err = v3d_irq_release();
+        if (!err)
+            err = release_err;
+    }
+
+    g_v3d_irq_ready = 0;
+    return err;
+}

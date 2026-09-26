@@ -269,8 +269,12 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
     (void) fatal;
     (void) podule_base;
     (void) pw;
-    /* No persistent IO mapping is held, so nothing to release. */
-    return NULL;
+
+    /* Must run unconditionally, even if IRQ handling was never used
+     * this session - see v3d_irq_shutdown's own comment for why a
+     * reloaded module leaving its interrupt vector claimed is a real
+     * hazard, not just untidy. */
+    return v3d_irq_shutdown();
 }
 
 /* ---------------------------------------------------------------- */

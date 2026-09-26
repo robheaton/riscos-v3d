@@ -1437,16 +1437,40 @@ repetition, not just a one-off. Dropped the register-polling half of
 `v3d_poll_counter()` - the interrupt path is what this driver actually
 relies on now.
 
+**Hardware result (2026-09-26) - a third freeze, this time on
+`StressTest.bas` after a plain `*RMKill`/`*RMLoad` reload rather than a
+fresh reboot; a full reboot fixed it.** Root cause: `module_final` did
+nothing at all - never released the interrupt vector or disabled the
+interrupt. `OS_ClaimDeviceVector` only recognises a later claim as
+*replacing* an earlier one when the device number, handler address and
+`R12` all match exactly - a reloaded module gets a fresh RMA address
+for its handler every time, so it's never recognised as "the same
+driver." Without releasing on unload, every reload left the previous
+instance's claim permanently in the vector's chain of claimants,
+pointing at code and data that no longer existed once that instance
+was unloaded - a dangling entry a real interrupt could still reach
+later (e.g. if the handler ever passed on an unrecognised interrupt),
+with unpredictable results. Matches BCMSupport's own real module, which
+does the equivalent release in its `mailbox_shutdown()`.
+
+**Fix**: added `v3d_irq_shutdown()` (mask everything off, `HAL_IRQDisable`,
+release the vector - a safe no-op if IRQ handling was never used this
+session) and call it unconditionally from `module_final`. Not yet
+re-tested on hardware specifically for this fix (i.e. reload without a
+reboot in between), though the underlying mechanism is straightforward
+compared to the earlier two incidents.
+
 **Real IRQ handling: complete.** Summary of the full path, since it
-took nineteen "attempt N" hardware round-trips across three separate
-bugs to get here (two of them genuine machine-freezing incidents, not
+took nineteen "attempt N" hardware round-trips across four separate
+bugs to get here (three of them genuine machine-freezing incidents, not
 just wrong answers): the bin/render wait no longer touches any V3D
 hardware register directly - it purely watches a memory counter the
 interrupt handler maintains, woken by a real `OS_ClaimDeviceVector`-
 claimed GIC interrupt, acknowledged correctly at both the hub and core
 level (the shared-GIC-line freeze), with the module's own private word
 correctly threaded through to the handler (the null-pointer-chain
-freeze). Next milestones below.
+freeze), and properly released again on module unload (the dangling-
+claimant freeze). Next milestones below.
 
 ## Next milestones
 

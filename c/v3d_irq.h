@@ -158,4 +158,15 @@ _kernel_oserror *v3d_irq_test_live_cycle(unsigned int *out_claimed,
  */
 _kernel_oserror *v3d_irq_ensure_ready(void);
 
+/*
+ * Must be called from module_final, unconditionally - see v3d_irq.c's
+ * own comment for why this matters more than ordinary cleanup hygiene
+ * (a reloaded module's OS_ClaimDeviceVector claim is never recognised
+ * as replacing the previous instance's, since the handler address
+ * changes on every reload - without this, every reload leaves a
+ * dangling claimant pointing at freed code/data). A safe no-op if
+ * v3d_irq_ensure_ready() was never called.
+ */
+_kernel_oserror *v3d_irq_shutdown(void);
+
 #endif
