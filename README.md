@@ -8,6 +8,11 @@ tile to a requested colour, stores it to memory, and the CPU reads
 back exactly that colour through a physical buffer the GPU wrote to.
 Confirmed on real hardware, not just build-verified.
 
+> **Known limitation**: do not `*RMKill`/`*RMLoad` this module without
+> a full reboot in between - it reliably freezes the machine. Always
+> reboot before loading a freshly-built module. See "Known
+> limitations" further down for the full story.
+
 - **M0/M1** — power on the V3D block, read its identity registers back
   correctly (confirms it reports itself as V3D 4.2, matching the known
   Pi 4/CM4 spec).
@@ -1512,21 +1517,54 @@ either. A reloaded module's `OS_Memory 12` calls could be recommended
 physical pages a still-existing, still-locked zombie area from the
 previous instance already owns - a double-claim hazard matching the
 timing exactly (the very first real GPU memory use after reload, which
-is the first `pmp_alloc()` call).
+is the first `pmp_alloc()` call). Exposed `pmp_release()` (previously
+file-local to `phys_buffer.c`) and called it unconditionally from
+`module_final` for the whole PMP area's page range.
 
-**Fix**: exposed `pmp_release()` (previously file-local to
-`phys_buffer.c`) and call it unconditionally from `module_final` for
-the whole PMP area's page range, safe even for pages a given session
-never actually used. Not yet tested on hardware. Given two previous
-fixes for this same symptom didn't fully resolve it, this is not
-presented as confirmed - only as the next well-grounded candidate,
-with better diagnostics now in place either way.
+**Hardware result (2026-09-26) - CONCLUSIVE NEGATIVE, investigation
+paused.** Built and tested a diagnostic variant with *only* the
+`pmp_release()` addition reverted (vector-release and reset-skip fixes
+both still present): froze at the exact same step regardless. That
+isolates `pmp_release()` as not the cause - but since *every* variant
+tried (with any combination of the three fixes present or absent) has
+frozen identically, none of the three theories investigated (dangling
+vector claim, reset-pulsing a warm core, leaked PMP pages) has been
+confirmed as the actual root cause, despite each being individually
+well-grounded and directly analogous to real bugs already found and
+fixed elsewhere in this project. Four hardware round-trips (each
+costing a full physical reboot) spent on this one scenario without a
+resolution.
+
+**Decision: documented as a known limitation rather than continuing to
+guess.** This does not affect the module's actual functionality -
+confirmed reliable within a single boot/instance (50/50 real
+interrupt-driven completions under sustained repetition, real GPU
+rendering, all working correctly). It only affects *reloading* the
+module without an intervening reboot, which is a development-time
+convenience, not something real usage depends on (a real driver loads
+once at boot and stays loaded). See "Known limitations" below.
+Revisiting this is possible but would need a fundamentally different
+diagnostic approach, not another targeted guess in the same vein as
+the last four.
 
 Five separate bugs across twenty-plus hardware round-trips to get
 here, four of them genuine machine freezes, not just wrong answers -
-worth the reader treating "reload without reboot" as this project's
-own highest-risk test scenario going forward, not an afterthought.
-Next milestones below.
+three of those four (vector claim leak, reset-pulse tracking, PMP
+Dynamic Area leak) were investigated but the actual reload freeze
+remains unresolved. Next milestones below.
+
+## Known limitations
+
+- **Do not `*RMKill`/`*RMLoad` this module without a full reboot in
+  between.** Doing so reliably freezes the machine outright (a hard,
+  unrecoverable freeze requiring a physical reset) the moment any real
+  GPU work is exercised afterward - confirmed reproducible across many
+  hardware tests. Root cause not found despite dedicated investigation
+  (see "Real IRQ handling" above for the full history) - several
+  well-grounded theories were tested and fixed, none resolved it.
+  **Always reboot before loading a freshly-built module for testing.**
+  This does not affect the module's actual operation once loaded - only
+  development-time reloading.
 
 ## Next milestones
 
