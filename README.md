@@ -2093,7 +2093,7 @@ indistinguishably from normal CPU rendering, entirely through the
 documented, sanctioned `GraphicsV` mechanism - no Wimp/WindowManager
 patching, no undocumented hooks.
 
-## Op 1: rectangle copy (2026-09-26, build-verified, not yet hardware-tested)
+## Op 1: rectangle copy (2026-09-26, hardware-verified)
 
 The last piece of the original 5-step plan: `GraphicsV` op 1 (rectangle
 copy), needed for window-scroll acceleration - arguably more visible in
@@ -2147,4 +2147,17 @@ per-pixel test pattern (not a flat colour - can't distinguish
 "genuinely copied" from "coincidentally already there"), sampling 7
 points including partial edge tiles.
 
-Not yet hardware-tested.
+**Confirmed on real hardware 2026-09-26, first attempt**: all 7 sample
+points matched (source vs. dest, byte-for-byte) across the 4x3
+non-tile-aligned grid, including both partial edge tiles. This confirms
+the inference held: the CLE derives each tile's addressing from
+`TileCoordinates` automatically for `Load` exactly as it already does
+for `Store` (see step 2's own hard-won lesson above), and `height=0`
+("derive from `TileRenderingModeCfgCommon`") works for `Load` the same
+way it does for `Store`. `LoadTileBufferGeneral` - untested even in the
+reference project's own code - is now proven, real, working
+infrastructure for this driver.
+
+Next: point this at the real framestore (non-overlapping only, same
+progression as fill's step 2 -> step 3), then wire into `gfxv_accel.c`
+as op 1 with an overlap check.
