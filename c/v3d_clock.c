@@ -72,7 +72,7 @@ _kernel_oserror *v3d_query_clock(unsigned int *state_out,
     return tag_call(TAG_GET_MAX_CLOCK_RATE, CLOCK_ID_V3D, 0, 0, &echo, max_rate_out);
 }
 
-_kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out)
+_kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out, int *already_on_out)
 {
     unsigned int echo, state, rate, max_rate;
     _kernel_oserror *err;
@@ -93,6 +93,8 @@ _kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out)
     err = tag_call(TAG_GET_CLOCK_STATE, CLOCK_ID_V3D, 0, 0, &echo, &state);
     if (err)
         return err;
+
+    if (already_on_out) *already_on_out = (state & 1u) ? 1 : 0;
 
     if (!(state & 1u))
     {

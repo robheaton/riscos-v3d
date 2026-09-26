@@ -119,16 +119,29 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
  *
  * So: real callers should only need to call this once per boot
  * anyway, but defensively calling it again (a completely reasonable
- * thing for real code to do) must not silently break the GPU. Now
- * idempotent - the whole reset/gate/clock sequence only runs on the
- * genuinely first call; every call after that is a no-op that just
- * reports back the already-confirmed clock rate.
+ * thing for real code to do) must not silently break the GPU. Made
+ * idempotent via g_powered_on - but that guard is per-*module-
+ * instance* C state, and a real hardware test (2026-09-26) found it
+ * doesn't survive a plain module reload (*RMKill then *RMLoad): a
+ * freshly-loaded instance's g_powered_on is 0 again even though the
+ * underlying V3D
+ * core is still warm from the previous instance's use, so its first
+ * V3D_PowerOn call reset-pulses an already-working core all over
+ * again - the machine froze running real GPU work right after such a
+ * reload, without an intervening full reboot. g_powered_on can only
+ * ever answer "did *this instance* power on", not "does the hardware
+ * actually need it" - the fix is to ask the hardware directly instead:
+ * v3d_ensure_clock_on() now reports whether the firmware clock was
+ * *already* on before this call touched anything, which is real,
+ * instance-independent hardware truth. If so, skip the reset/gate
+ * sequence entirely, regardless of this instance's own history.
  */
 static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
 {
     io_mapping_t pm, v3d;
     _kernel_oserror *err;
     unsigned int val, clock_rate;
+    int clock_already_on;
     volatile unsigned int spin; /* volatile: the reset-pulse delay loop
                                   * below has no other side effect, and
                                   * -O2 is entitled to delete a plain
@@ -147,9 +160,21 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
      * CLE is used: a gated block can still be read/written (explaining
      * why ReadIdent/TestBuffer always worked regardless), so this was
      * never going to show up as a register-access failure. */
-    err = v3d_ensure_clock_on(&clock_rate);
+    err = v3d_ensure_clock_on(&clock_rate, &clock_already_on);
     if (err)
         return err;
+
+    if (clock_already_on)
+    {
+        /* Real hardware evidence this core was already through a
+         * complete, correct power-on before - whether by this
+         * instance or an earlier one. Re-pulsing reset now would be
+         * exactly the confirmed hang/freeze cause described above. */
+        g_powered_on = 1;
+        g_v3d_clock_rate = clock_rate;
+        *clock_rate_out = clock_rate;
+        return NULL;
+    }
 
     /* --- PM_GRAFX: assert then deassert V3D reset (real pulse) --- */
     err = io_map(PM_MB_BASE, &pm);

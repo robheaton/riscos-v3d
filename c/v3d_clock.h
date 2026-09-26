@@ -41,7 +41,17 @@ _kernel_oserror *v3d_query_clock(unsigned int *state_out,
  * (SetClockState) and, if the firmware has no rate remembered at all,
  * requests one (SetClockRate, using GetMaxClockRate's answer) - a
  * one-way "make sure it's on" call, not a toggle.
+ *
+ * `already_on_out` (optional, may be NULL) reports whether the clock
+ * was *already* on before this call touched anything - real hardware
+ * truth, unlike module.c's own g_powered_on, which is per-module-
+ * instance C state that a module reload wipes clean even though the
+ * underlying GPU core is still warm. v3d_power_on() uses this to
+ * decide whether the PM_GRAFX reset pulse is safe to skip - reset-
+ * pulsing an already-warm core is a confirmed real hang/freeze cause
+ * (see v3d_power_on's own comment), and "was g_powered_on set in *this*
+ * instance" is the wrong question to ask after a reload.
  */
-_kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out);
+_kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out, int *already_on_out);
 
 #endif

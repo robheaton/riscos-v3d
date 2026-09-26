@@ -1455,22 +1455,44 @@ does the equivalent release in its `mailbox_shutdown()`.
 
 **Fix**: added `v3d_irq_shutdown()` (mask everything off, `HAL_IRQDisable`,
 release the vector - a safe no-op if IRQ handling was never used this
-session) and call it unconditionally from `module_final`. Not yet
-re-tested on hardware specifically for this fix (i.e. reload without a
-reboot in between), though the underlying mechanism is straightforward
-compared to the earlier two incidents.
+session) and call it unconditionally from `module_final`.
 
-**Real IRQ handling: complete.** Summary of the full path, since it
-took nineteen "attempt N" hardware round-trips across four separate
-bugs to get here (three of them genuine machine-freezing incidents, not
-just wrong answers): the bin/render wait no longer touches any V3D
-hardware register directly - it purely watches a memory counter the
-interrupt handler maintains, woken by a real `OS_ClaimDeviceVector`-
-claimed GIC interrupt, acknowledged correctly at both the hub and core
-level (the shared-GIC-line freeze), with the module's own private word
-correctly threaded through to the handler (the null-pointer-chain
-freeze), and properly released again on module unload (the dangling-
-claimant freeze). Next milestones below.
+**Hardware result (2026-09-26) - the vector-release fix alone was not
+enough. The machine froze again at the exact same test step, reload
+then `StressTest.bas`.** That ruled the dangling-vector theory out (or
+at least out as the *whole* explanation) and pointed at something more
+familiar: `g_powered_on` is per-module-instance C state, and a reload
+resets it to 0 even though the underlying V3D core is still warm from
+the previous instance's use - meaning the freshly-loaded instance's
+first `V3D_PowerOn` call reset-pulses an already-working core all over
+again. That is the *exact* confirmed cause of the original "second call
+always hangs" saga (attempts 9-21) - just triggered by module reload
+this time instead of a second call within one instance, so the earlier
+idempotency fix (scoped to `g_powered_on`, which can't survive a
+reload) never saw it coming.
+
+**Real fix**: `v3d_ensure_clock_on()` now reports whether the firmware
+clock was *already* on before it touched anything - real, instance-
+independent hardware truth, unlike `g_powered_on`. `v3d_power_on()` now
+skips the entire reset/gate sequence whenever the clock was already on,
+regardless of this instance's own history, not just when its own
+`g_powered_on` happens to be set. Not yet tested on hardware.
+
+**Real IRQ handling: mechanically complete, reload-safety not yet
+reconfirmed.** The bin/render wait no longer touches any V3D hardware
+register directly - it purely watches a memory counter the interrupt
+handler maintains, woken by a real `OS_ClaimDeviceVector`-claimed GIC
+interrupt, acknowledged correctly at both the hub and core level (the
+shared-GIC-line freeze), with the module's own private word correctly
+threaded through to the handler (the null-pointer-chain freeze). Reload
+without a reboot has now caused two further freezes on top of that
+(dangling vector claim, then reset-pulsing an already-warm core) -
+both fixed, neither yet reconfirmed on hardware. Five separate bugs
+across twenty-plus hardware round-trips to get here, four of them
+genuine machine freezes, not just wrong answers - worth the reader
+treating "reload without reboot" as this project's own highest-risk
+test scenario going forward, not an afterthought. Next milestones
+below.
 
 ## Next milestones
 
