@@ -54,13 +54,22 @@ PRINT
 
 IF errors% > 0 THEN PROCfailinfo
 
-SYS "V3D_AccelCopyStats" TO copy_ops%, copy_overlap%, copy_claimed%, copy_errors%, copy_errnum%
+REM V3D_AccelCopyStats: R0=total op-1 calls, R1=overlapping calls seen
+REM (now ATTEMPTED via the scratch-buffer path, not just rejected),
+REM R2=non-overlapping accelerated, R3=non-overlapping failed,
+REM R4=overlapping accelerated (scratch-buffer path), R5=overlapping
+REM failed/too-large, R6=last failure's error number (either path).
+SYS "V3D_AccelCopyStats" TO copy_ops%, copy_overlap%, copy_claimed%, copy_errors%, copy_overlap_claimed%, copy_overlap_errors%, copy_errnum%
 
-PRINT "GraphicsV op 1 (copy) calls seen:  "; copy_ops%
-PRINT "  rejected (overlapping):          "; copy_overlap%
-PRINT "  actually accelerated by the GPU: "; copy_claimed%
-PRINT "  attempted but failed:            "; copy_errors%
-IF copy_errors% > 0 THEN PRINT "  last copy failure error number:  "; copy_errnum%
+PRINT "GraphicsV op 1 (copy) calls seen:      "; copy_ops%
+PRINT "Direct (non-overlapping) path:"
+PRINT "  actually accelerated by the GPU:    "; copy_claimed%
+PRINT "  attempted but failed:               "; copy_errors%
+PRINT "Overlap (scratch-buffer) path:"
+PRINT "  overlapping calls seen:             "; copy_overlap%
+PRINT "  actually accelerated by the GPU:    "; copy_overlap_claimed%
+PRINT "  attempted but failed/too large:     "; copy_overlap_errors%
+IF copy_errors% > 0 OR copy_overlap_errors% > 0 THEN PRINT "  last copy failure error number:   "; copy_errnum%
 PRINT
 
 SYS "V3D_AccelStop"
@@ -68,7 +77,7 @@ PRINT "Released (V3D_AccelStop) - back to normal software rendering."
 PRINT
 IF calls% = 0 THEN PRINT "No GraphicsV traffic seen at all - try more" : PRINT "desktop interaction, or this may indicate something" : PRINT "isn't reaching this vector." : END
 
-IF claimed% > 0 OR copy_claimed% > 0 THEN PRINT "At least one real accelerated fill or copy happened - check the desktop looked correct throughout." : END
+IF claimed% > 0 OR copy_claimed% > 0 OR copy_overlap_claimed% > 0 THEN PRINT "At least one real accelerated fill or copy happened - check the desktop looked correct throughout." : END
 
 PRINT "GraphicsV traffic was seen, but nothing was accelerated."
 PRINT "Could be genuinely correct (no plain solid fills or"
