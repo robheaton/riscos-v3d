@@ -1,10 +1,13 @@
 REM > StressTest
 REM Repeatedly exercises V3D_PowerOn + V3D_ClearTest + V3D_ClearToSprite
 REM in one session, without reloading the module or rebooting between
-REM iterations, to check whether the firmware clock-gate fix (
-REM V3D_PowerOn now enables the clock before every PM_GRAFX reset
-REM pulse) makes a real hardware reset - and so full recovery - happen
-REM on every call, not just the first one after a reboot.
+REM iterations. V3D_PowerOn is now idempotent (the real bug behind a
+REM long "second call always hangs" investigation turned out to be
+REM V3D_PowerOn itself: calling it more than once per boot used to
+REM re-pulse a hardware reset on an already-working V3D core, which is
+REM what broke things - not anything about the submissions between
+REM calls). This deliberately calls it every iteration anyway, since
+REM real code doing that defensively must not break the GPU either.
 REM
 REM Stops immediately on the first failure (wrong readback, or any
 REM SWI error/timeout) with full detail. A clean run to completion is
@@ -38,6 +41,6 @@ NEXT i%
 
 PRINT
 PRINT N%; " iterations completed with no failures."
-PRINT "Confirms V3D_PowerOn's reset+clock-enable recovers cleanly call"
-PRINT "after call in one session, with no reboot needed between tests."
+PRINT "Confirms V3D_PowerOn is safe to call every iteration - no reboot"
+PRINT "needed between tests, and no need to avoid calling it again."
 END
