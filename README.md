@@ -2033,4 +2033,32 @@ store, not necessarily via the same path a real Wimp redraw uses, so a
 self-generated test call here could prove nothing either way), then
 reports the stats and releases.
 
-Not yet hardware-tested.
+**First hardware round (2026-09-26): fail-safe design confirmed
+working, but a real bug found underneath it.** `AccelTest.bas` while
+interacting with the real desktop: 13620 handler invocations, 4863
+genuine solid-ECF fills attempted, only 58 (1.2%) actually accelerated.
+Critically, **nothing on screen looked wrong** - confirming the
+fail-safe design's core property (a failed GPU attempt correctly falls
+through to normal CPU rendering) held up under real, heavy, unplanned
+load, not just the isolated test cases that exercised it before.
+
+`V3D_AccelFailInfo`'s new diagnostics found the actual cause
+immediately: the last failure's rectangle printed as `top=22
+bottom=45` - i.e. `top < bottom`, impossible for a genuine rectangle
+in `GraphicsV`'s bottom-left-origin convention (a real top edge must be
+`>= ` the bottom edge). That's the exact signature of a **word1/word3
+swap in the parameter block decode** - `gfxv_accel.c` had read word1 as
+`bottom` and word3 as `top`, backwards from the real PRM layout
+(`GraphicsV 13 2`: word1=Top, word3=Bottom - re-fetched and double-
+checked after finding this, not just trusted from memory a second
+time). With the swap, `top - bottom + 1` computed as unsigned
+arithmetic wraps around into a huge, nonsensical height for almost
+every real rectangle, cascading into garbage tile counts - explaining
+both the near-100% failure rate and why it varied by rectangle (any
+call where the real top and bottom coordinates happened to differ by
+only 1, i.e. a single-pixel-tall row, would coincidentally read the
+same swapped value either way and slip through - consistent with the
+successes skewing toward very small areas, 2 to 960 sq px).
+
+**Fixed**: swapped the decode to `top = params[1]`, `bottom =
+params[3]`. Not yet re-tested on hardware.

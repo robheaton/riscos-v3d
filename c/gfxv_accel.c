@@ -175,14 +175,23 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
 
     g_gfxv_fill_op_count++;
 
-    /* GraphicsV 13 2 parameter block: word0=left, word1=bottom,
-     * word2=right, word3=top (all inclusive), word4=ECF block pointer -
-     * confirmed against the real PRM, see README. */
+    /* GraphicsV 13 2 parameter block: word0=left, word1=TOP, word2=right,
+     * word3=BOTTOM (all inclusive), word4=ECF block pointer - confirmed
+     * against the real PRM (fetched twice, once before this bug and
+     * once again to double-check after finding it - see README). A
+     * first version of this code had word1/word3 swapped (bottom/top
+     * reversed) - real hardware testing found it: with top<bottom (the
+     * exact symptom of this swap on a real rectangle, where the true
+     * top edge is numerically >= the true bottom edge), `top - bottom
+     * + 1` wraps around as unsigned arithmetic, producing a huge,
+     * nonsensical height that cascaded into garbage tile counts and a
+     * ~98% real-desktop failure rate (see git history / README for the
+     * full diagnosis). */
     params = (const unsigned int *) r->r[2];
     left = params[0];
-    bottom = params[1];
+    top = params[1];
     right = params[2];
-    top = params[3];
+    bottom = params[3];
     ecf = (const unsigned int *) params[4];
 
     if (!ecf_decode_solid(ecf, &colour))
