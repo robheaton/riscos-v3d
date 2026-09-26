@@ -2164,7 +2164,7 @@ way it does for `Store`. `LoadTileBufferGeneral` - untested even in the
 reference project's own code - is now proven, real, working
 infrastructure for this driver.
 
-### Copy step 2: real framestore copy (2026-09-26, build-verified, not yet hardware-tested)
+### Copy step 2: real framestore copy (2026-09-26, hardware-verified)
 
 Same Load+Store copy, but targeting the real screen framestore
 directly (`V3D_ScreenCopyTest`, `v3d_copy_screen` in `cl_copy.c`) -
@@ -2178,6 +2178,11 @@ the same (a bug here writes to the live, visible desktop). Test with
 whatever's currently on screen at the source rectangle should appear
 duplicated at the destination.
 
-Not yet hardware-tested. Once confirmed: wire into `gfxv_accel.c` as
-op 1, with the same overlap check, behind the same `V3D_AccelStart`
-opt-in already covering op 2.
+**Confirmed on real hardware 2026-09-26, first attempt**: the source
+rectangle's on-screen content (part of the desktop wallpaper) appeared
+correctly duplicated at the destination rectangle, screenshot-verified.
+Same Load+Store mechanism, now proven against real screen memory as
+well as a synthetic buffer.
+
+Next: wire into `gfxv_accel.c` as op 1, with the same overlap check,
+behind the same `V3D_AccelStart` opt-in already covering op 2.
