@@ -1185,6 +1185,58 @@ one-off pair of calls. `V3D_PowerOn` is now genuinely safe to call
 defensively as many times as real code likes, in addition to being
 required before the first submission.
 
+## Real IRQ handling (started 2026-09-26)
+
+The bin/render waits (`v3d_poll_counter`) are currently bounded busy-
+polls - fine for a test SWI, not for a real driver. Moving to real
+interrupt-driven waiting, staged deliberately: this is a materially
+different risk class from everything before it. Every bug so far has
+been recoverable with `*RMKill` or a reboot; a genuinely broken
+low-level interrupt/register handler risks destabilising the machine
+more seriously. Researched thoroughly before writing any code (see
+`c/v3d_irq.h`'s own comment for full sourcing) rather than guessing at
+IRQ-claiming mechanics the way earlier register-level work sometimes
+started from an educated guess:
+
+- CMHG directive is `vector-handlers` (not `generic-veneers`, which is
+  for a different, simpler C-callable-from-assembly convention) -
+  confirmed against BCMSupport, a real shipped ROOL module using this
+  exact directive for its own mailbox IRQ handler. Handler signature
+  `int v3d_irq_handler(_kernel_swi_regs *r, void *pw)`, return 0 to
+  claim / 1 to pass on (`VECTOR_CLAIM`/`VECTOR_PASSON`, confirmed from
+  cmunge's own codegen source, not the PRM prose alone).
+- Device number **10** (`iDev_GPU_VC3D`) for `OS_ClaimDeviceVector`.
+  Not available through any documented enumeration API - RISC OS
+  Open's own "List of HAL devices" page lists only Video/Audio/
+  SysPeri/Comms/ExpCtl/HID categories, no 3D/GPU one - so this comes
+  from `HAL_BCM2835`'s own private header, and is trusted only because
+  it's cross-checked two independent ways: that header's own comment
+  chain, and `HAL_BCM2835`'s GIC-400 driver mapping device 10 to GIC
+  SPI 74, which matches the real upstream Linux device tree's `v3d`
+  node exactly.
+- The real, important finding: the PRM's own `OS_ClaimDeviceVector`
+  page explicitly warns an interrupt handler must "strictly avoid the
+  use of non re-entrant SWIs", because a normal SWI call from IRQ mode
+  risks corrupting `R14_svc` if it interrupted other SVC-mode code
+  mid-SWI. So `HAL_IRQClear` (needed *inside* the handler once real
+  bin/render completion is wired up) can't be called via a plain SWI
+  from there - it needs the routine's raw address plus a "static base"
+  value (`R9`) resolved once via `OS_Hardware 1` outside interrupt
+  context, called with `R9` set - hand-written register-level code,
+  not yet implemented.
+
+**Stage 1 (this commit)**: prove the claim/enable/disable plumbing is
+safe before touching anything else. `V3D_IRQTest` claims the vector,
+calls `HAL_IRQEnable`/`HAL_IRQDisable` via the safe `OS_Hardware 0`
+SWI path (fine from ordinary SWI-handler context, deliberately *not*
+used from inside the handler itself), releases the vector again, and
+reports how many times the handler was actually invoked (`R0` - should
+read 0, since no `V3D_CTL_INT_MSK_CLR` bit is unmasked anywhere in
+this stage, so V3D cannot physically raise this device's IRQ line
+yet). A nonzero count would mean a device-number collision or some
+other surprise, to be understood before going further. Not yet tested
+on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

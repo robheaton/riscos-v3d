@@ -19,7 +19,7 @@ initialisation-code:      module_init
 finalisation-code:        module_final
 swi-chunk-base-number:    0xC0040
 swi-handler-code:         v3d_swi_handler
-swi-decoding-table:       V3D,PowerOn,ReadIdent,TestBuffer,ClearTest,ClearToSprite,MemSplit,ClockInfo
+swi-decoding-table:       V3D,PowerOn,ReadIdent,TestBuffer,ClearTest,ClearToSprite,MemSplit,ClockInfo,IRQTest
 
 ; Dynamic Area ResizePMP handler (reason 6), required by any Physical
 ; Memory Pool area (see phys_buffer.c). The veneer takes care of the
@@ -28,3 +28,10 @@ swi-decoding-table:       V3D,PowerOn,ReadIdent,TestBuffer,ClearTest,ClearToSpri
 ; our C function only needs to run cmunge -d and match whatever
 ; signature it generates (verified, not guessed - see phys_buffer.c).
 generic-veneers:          v3d_da_resize_veneer/v3d_da_resize_handler(private-word: r12)
+
+; V3D interrupt vector, claimed via OS_ClaimDeviceVector (see v3d_irq.c
+; for the device-number sourcing and why vector-handlers, not
+; generic-veneers, is the correct directive for this - confirmed
+; against BCMSupport, a real shipped module which uses this exact
+; directive (vector-handlers) for its own mailbox IRQ handler.
+vector-handlers:          v3d_irq_entry/v3d_irq_handler

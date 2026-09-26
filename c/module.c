@@ -26,6 +26,7 @@
 #include "cl_clear.h"
 #include "memsplit.h"
 #include "v3d_clock.h"
+#include "v3d_irq.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -280,6 +281,7 @@ enum
     SWI_V3D_ClearToSprite = 4,
     SWI_V3D_MemSplit = 5,
     SWI_V3D_ClockInfo = 6,
+    SWI_V3D_IRQTest = 7,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -408,6 +410,39 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[0] = state;
             r->r[1] = rate;
             r->r[2] = max_rate;
+            return NULL;
+        }
+
+        case SWI_V3D_IRQTest:
+        {
+            /* Stage 1 of real IRQ handling - see v3d_irq.h. Claims the
+             * vector, exercises HAL_IRQEnable/HAL_IRQDisable, releases
+             * the vector again (this is a one-shot test, not permanent
+             * wiring yet), and reports how many times the handler was
+             * actually invoked - should be 0, since no V3D interrupt
+             * bit is unmasked anywhere in this stage. */
+            _kernel_oserror *err, *cleanup_err;
+
+            g_v3d_irq_spurious_count = 0;
+
+            err = v3d_irq_claim();
+            if (err)
+                return err; /* never claimed - nothing to release */
+
+            if (!err) err = v3d_irq_hal_enable();
+            if (!err) err = v3d_irq_hal_disable();
+
+            /* Always release, even if enable/disable failed above -
+             * we did successfully claim, so we must clean that up
+             * regardless of what went wrong after. */
+            cleanup_err = v3d_irq_release();
+            if (!err)
+                err = cleanup_err;
+
+            if (err)
+                return err;
+
+            r->r[0] = g_v3d_irq_spurious_count;
             return NULL;
         }
 
