@@ -1272,6 +1272,16 @@ doesn't crash before it's ever used for real - reports both the
 claimed and spurious handler-invocation counts (`R0`/`R1`), both
 expected to read 0. Not yet tested on hardware.
 
+**Hardware result (2026-09-26) - CONFIRMED CLEAN.** `V3D_PowerOn` then
+`V3D_IRQTest`: `claimed=0 spurious=0`, no error. The raw `HAL_IRQClear`
+call (resolved address + `R9` static-base + `blx`, hand-disassembled
+and verified before shipping) ran for real on hardware for the first
+time, from the safe non-interrupt test path, without incident. This
+was the highest-risk untested piece of this whole feature; it's
+confirmed working. Stage 2b next: unmask `V3D_CTL_INT_MSK_CLR` and wire
+real bin/render completion to it - the step where a genuine hardware
+interrupt fires for the first time.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
