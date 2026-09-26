@@ -763,6 +763,48 @@ offset - confirmed against the Linux kernel's own
 mailbox directly, but left documented in `v3d_regs.h` in case anything
 here ever needs raw mailbox access again.)
 
+**Hardware result, attempt 9 (2026-09-26): `V3D_MemSplit` worked -
+`ARM base=0 size=0x3C000000, VC base=0x3C000000 size=0x4000000`.** Real
+numbers at last: a 1GB board, ARM gets the bottom 960MB, VideoCore
+firmware reserves the top 64MB from `0x3C000000` up. This is the
+answer attempt 7 was chasing - and it disproves attempt 7's own theory.
+Every hang logged so far (attempts 1-6, and the decisive attempt-7
+retest) happened with `CA`/`EA`/`QBA`/`QEA` around `0x03000000`-
+`0x030C0000` - roughly 48-50MB in. That's nowhere near the 960MB
+ARM/VC boundary; a physical-address-climbs-into-GPU-territory theory
+cannot explain a hang at 1/20th of that boundary. The correlation
+attempt 7 found (later calls in a session fail, earlier ones don't) was
+real, but the "why" was wrong.
+
+Re-reading `v3d_restart_thread()` (`c/cl_clear.c`) against the actual
+evidence points at a better explanation: it deliberately does nothing
+when `CS` shows `CTRUN` set, treating that as "already running, leave
+it alone" (added earlier after writing CTSUBS unconditionally
+reproduced the same hang on an already-fine thread). But `CTRUN=1`
+just means "running" - it doesn't distinguish "genuinely busy" from
+"hung mid-job", and a `BFC`/`RFC` poll timeout is exactly the case
+where `CTRUN=1` almost certainly means the latter. Nothing anywhere
+in this codebase ever cleared that condition, so once *any* submission
+timed out with `CTRUN` still set, the CLE thread stayed wedged in that
+state for the rest of the session: every later submission's
+`restart_thread()` call keeps declining to touch it (any SWI, any
+buffer address), which is consistent with everything logged, including
+a previously-100%-reliable `V3D_ClearTest` failing identically once run
+after `V3D_ClearToSprite` had already wedged the thread earlier in the
+same session.
+
+**Fix**: `diagnose_timeout()` now attempts recovery, not just
+diagnosis. If `CS` shows `CTRUN` set at the moment of a timeout, it
+writes `V3D_CT_CS_CTRUN` back (per its own documented R/W meaning:
+writing 1 *stops* the thread, never starts one - see the bit's comment
+in `v3d_regs.h`) and polls briefly for it to actually clear, so the
+*next* submission's `restart_thread()` finds a genuinely stopped thread
+(`CTSUBS`/`CTERR` set) instead of a permanently wedged `CTRUN=1` it
+will never act on. The outcome (`REC=stopped` / `REC=timeout`) is
+folded into the existing diagnostic message. Not yet tested on
+hardware - if this is right, a `V3D_ClearTest` run immediately after a
+timeout should now succeed instead of failing identically.
+
 ## Testing on hardware
 
 1. Build with a working GCCSDK RISC OS cross-toolchain.

@@ -476,6 +476,36 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
  * reports anything (in particular V3D_INT_OUTOMEM - see the register's
  * comment in v3d_regs.h for why a stalled-on-OOM binner would look
  * identical to a never-started one from BFC's perspective alone).
+ *
+ * Also attempts recovery, not just diagnosis: v3d_restart_thread()
+ * deliberately leaves a thread alone whenever CS shows CTRUN set,
+ * treating that as "already running, nothing to do" (see its own
+ * comment - writing the CTSUBS restart to a thread that was never
+ * halted reproduced the very race it exists to fix). But CTRUN just
+ * means "running" per the PRM - it doesn't distinguish "genuinely
+ * making progress" from "hung mid-job", and a timed-out poll is
+ * exactly the case where a thread reporting CTRUN=1 is almost
+ * certainly the latter. Left alone, that thread stays wedged in this
+ * state for the rest of the session: restart_thread() keeps declining
+ * to touch it on every later submission (any SWI, any buffer address),
+ * since CTRUN never clears on its own. That fits everything logged in
+ * "attempt 7"/"attempt 8" far better than an address-range theory
+ * does: BCMSupport's real ARM/VC split (queried in attempt 8) sits at
+ * 0x3C000000 (960MB) but every failing CA/EA/QBA/QEA on record has
+ * been ~0x03000000-0x030C0000 (~48-50MB) - nowhere near it. What those
+ * attempts actually had in common is that ClearToSprite had already
+ * been run (and presumably wedged the thread) earlier in the same
+ * session, and every attempt after that point failed identically
+ * regardless of address, including a previously-100%-reliable
+ * ClearTest. So: if CTRUN is set here, request a stop the documented
+ * way (V3D_CT_CS_CTRUN is R/W; per its own comment in v3d_regs.h,
+ * writing 1 stops the thread rather than starting one) and poll
+ * briefly for it to actually leave the running state, so the *next*
+ * submission's restart_thread() finds a genuinely stopped thread
+ * (CTSUBS/CTERR set) instead of a permanently wedged CTRUN=1 it will
+ * never touch. Bounded and best-effort: if the stop request itself
+ * doesn't take, the caller still gets the timeout error, just with
+ * that outcome recorded in the message instead of silently retried.
  */
 /*
  * `bufs` lets us check CA/EA against every physical buffer this job
@@ -499,6 +529,7 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     unsigned int rb_qba = 0, rb_qea = 0;
     unsigned int mmu_ctl = 0, hub_sts = 0, vio_id = 0, vio_addr = 0;
     unsigned int pos = 0;
+    int recover_attempted = 0, recover_ok = 0;
 
     if (!io_map(V3D_MB_BASE, &v3d))
     {
@@ -526,6 +557,24 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
             rb_qba = IO_WORD(v3d, V3D_CLE_CT1QBA);
             rb_qea = IO_WORD(v3d, V3D_CLE_CT1QEA);
         }
+
+        if (cs & V3D_CT_CS_CTRUN)
+        {
+            unsigned int cs_reg = is_bin ? V3D_CLE_CT0CS : V3D_CLE_CT1CS;
+            unsigned int spin;
+
+            recover_attempted = 1;
+            IO_WORD(v3d, cs_reg) = V3D_CT_CS_CTRUN; /* request stop - see comment above */
+            for (spin = 0; spin < 100000u; spin++)
+            {
+                if (!(IO_WORD(v3d, cs_reg) & V3D_CT_CS_CTRUN))
+                {
+                    recover_ok = 1;
+                    break;
+                }
+            }
+        }
+
         io_unmap(&v3d);
     }
 
@@ -535,7 +584,10 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     append_hex32(out_err->errmess, &pos, cs);
     append_str(out_err->errmess, &pos, (cs & V3D_CT_CS_CTRUN) ? "(RUN" : "(STOP");
     if (cs & V3D_CT_CS_CTERR) append_str(out_err->errmess, &pos, " ERR");
-    append_str(out_err->errmess, &pos, ") MMU=");
+    append_str(out_err->errmess, &pos, ")");
+    if (recover_attempted)
+        append_str(out_err->errmess, &pos, recover_ok ? " REC=stopped" : " REC=timeout");
+    append_str(out_err->errmess, &pos, " MMU=");
     append_hex32(out_err->errmess, &pos, mmu_ctl & 1u);
     if (mmu_ctl & V3D_MMU_CTL_ENABLE)
     {
