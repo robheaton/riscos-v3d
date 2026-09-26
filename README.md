@@ -1,4 +1,4 @@
-# V3DDriver — real desktop window fills now GPU-accelerated via GraphicsV, hardware-verified
+# V3DDriver — real desktop fills and copies now GPU-accelerated via GraphicsV, hardware-verified
 
 An independent RISC OS module driving the Raspberry Pi 4/CM4's
 VideoCore VI (V3D) GPU directly at the register level. As of
@@ -1722,11 +1722,10 @@ wrong fill corrupts visible desktop state, which is worse than a
 crash) - **done, hardware-verified** (2028/2028 real desktop fills
 accelerated, zero failures, desktop confirmed visually correct
 throughout), see `V3D_AccelStart`/`V3D_AccelStop`/`V3D_AccelStats`
-below; (5) op 1 (copy), non-overlapping only - **in progress**, first
-step (`V3D_CopyTest`, a synthetic-buffer copy via the new
-`LoadTileBufferGeneral`+`StoreTileBufferGeneral` round trip) is
-build-verified, not yet hardware-tested. See "Op 1: rectangle copy"
-below.
+below; (5) op 1 (copy), non-overlapping only - **done, hardware-
+verified** (2641/3533 real desktop copies accelerated, 892 correctly
+rejected as overlapping, zero failures). See "Op 1: rectangle copy"
+below. **All 5 planned steps complete.**
 
 ### Step 1: screen-mode groundwork (2026-09-26, hardware-verified)
 
@@ -2189,7 +2188,7 @@ correctly duplicated at the destination rectangle, screenshot-verified.
 Same Load+Store mechanism, now proven against real screen memory as
 well as a synthetic buffer.
 
-### Copy step 3: wired into the live handler (2026-09-26, build-verified, not yet hardware-tested)
+### Copy step 3: wired into the live handler (2026-09-26, hardware-verified)
 
 `gfxv_accel.c`'s `v3d_gfxv_handler` now dispatches on op (1=copy,
 2=fill) via two new static helpers (`handle_render_fill`,
@@ -2211,4 +2210,19 @@ rejected for overlapping, how many were actually accelerated, how many
 failed, and the last failure's error number. `AccelTest.bas` now
 reports both fill and copy stats from the same live-desktop session.
 
-Not yet hardware-tested.
+**Confirmed on real hardware 2026-09-26**: `AccelTest.bas` during real
+drag/resize/scroll/directory-browse interaction - **996/996 (100%) of
+genuine solid-ECF fills accelerated, 2641/3533 op-1 calls accelerated
+(the remaining 892 correctly rejected as overlapping - a real,
+frequent case in ordinary use, e.g. scrolling), zero failures on
+either op**, desktop confirmed visually correct throughout, including
+during scrolling (exactly where overlapping copies get skipped and
+fall back to normal rendering).
+
+**This completes the original 5-step GraphicsV Render accelerator
+plan, hardware-verified end to end.** Real V3D GPU hardware now
+transparently accelerates real Wimp desktop rendering - both window
+fills and non-overlapping copies - entirely through the documented
+`GraphicsV` mechanism, with a proven fail-safe design that has now
+been exercised under real, heavy, unplanned desktop load without a
+single visible glitch across two separate live test sessions.
