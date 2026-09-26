@@ -146,6 +146,13 @@ static _kernel_oserror *ensure_pmp_fill(void)
  * exists), same reasoning as SCREEN_FILL_BASE_PAGE. */
 #define SCREEN_COPY_BASE_PAGE 3500u
 
+/* Well clear of SCREEN_COPY_BASE_PAGE's own worst-case usage (scratch
+ * buffer up to 64 pages, plus run_copy's own scratch ~41 pages more -
+ * up to ~105 pages from 3500). V3D_OverlapCopyTest needs a bounding
+ * buffer (up to 64 pages) plus everything v3d_copy_screen_overlapping
+ * itself needs, so it gets its own well-separated range too. */
+#define OVERLAP_COPY_TEST_BASE_PAGE 3700u
+
 /*
  * Step 3 of the planned GraphicsV Render accelerator: caches the
  * screen's confirmed physical framestore base (see
@@ -427,6 +434,52 @@ _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_b
                              &tiles_x, &tiles_y);
 }
 
+/*
+ * Overlap-safe twin of v3d_accel_render_copy - same self-
+ * initialisation and coordinate-flip reasoning, but routes through
+ * v3d_copy_screen_overlapping's scratch-buffer pass instead of a
+ * direct single-pass copy (see cl_copy.h/.c for why a direct pass
+ * isn't safe once source and destination overlap). Reuses
+ * SCREEN_COPY_BASE_PAGE - safe since this and v3d_accel_render_copy/
+ * V3D_ScreenCopyTest are never invoked concurrently (RISC OS foreground
+ * calls are single-threaded and this driver always blocks until its
+ * own submission completes before returning).
+ */
+_kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsigned int src_bottom,
+                                                     unsigned int dest_left, unsigned int dest_bottom,
+                                                     unsigned int width, unsigned int height)
+{
+    unsigned int clock_rate;
+    unsigned int src_y_top_down, dest_y_top_down;
+    unsigned int tiles_x, tiles_y;
+    _kernel_oserror *err;
+
+    err = v3d_power_on(&clock_rate);
+    if (err)
+        return err;
+
+    err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    err = ensure_pmp_fill();
+    if (err)
+        return err;
+
+    err = v3d_irq_ensure_ready();
+    if (err)
+        return err;
+
+    src_y_top_down = g_screen_info.ywind_limit - (src_bottom + height - 1u);
+    dest_y_top_down = g_screen_info.ywind_limit - (dest_bottom + height - 1u);
+
+    return v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+                             src_left, src_y_top_down, dest_left, dest_y_top_down,
+                             width, height,
+                             g_screen_phys_base, g_screen_info.line_length,
+                             &tiles_x, &tiles_y);
+}
+
 static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
 {
     io_mapping_t v3d;
@@ -550,6 +603,7 @@ enum
     SWI_V3D_CopyTest = 15,
     SWI_V3D_ScreenCopyTest = 16,
     SWI_V3D_AccelCopyStats = 17,
+    SWI_V3D_OverlapCopyTest = 18,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1052,18 +1106,69 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
         }
 
         case SWI_V3D_AccelCopyStats:
-            /* Op 1 (copy) instrumentation, added from the start this
-             * time - see gfxv_accel.c's own comment. Total op-1 calls
-             * seen (R0), how many were rejected for overlapping (R1),
-             * how many were actually accelerated (R2), how many were
-             * attempted but failed (R3), and the last failure's error
-             * number (R4). */
+            /* Op 1 (copy) instrumentation - see gfxv_accel.c's own
+             * comment. Total op-1 calls seen (R0), how many were
+             * overlapping (R1, now accelerated via the scratch-buffer
+             * path rather than always skipped), how many
+             * non-overlapping copies were accelerated directly (R2),
+             * how many of those failed (R3), how many overlapping
+             * copies were accelerated via the scratch-buffer path (R4),
+             * how many of those failed or were too large (R5), and the
+             * last failure's error number from either path (R6). */
             r->r[0] = g_gfxv_copy_op_count;
             r->r[1] = g_gfxv_copy_overlap_count;
             r->r[2] = g_gfxv_copy_claimed_count;
             r->r[3] = g_gfxv_copy_error_count;
-            r->r[4] = g_gfxv_copy_last_fail_errnum;
+            r->r[4] = g_gfxv_copy_overlap_claimed_count;
+            r->r[5] = g_gfxv_copy_overlap_error_count;
+            r->r[6] = g_gfxv_copy_last_fail_errnum;
             return NULL;
+
+        case SWI_V3D_OverlapCopyTest:
+        {
+            /* Isolated test for the new overlap-safe copy path (see
+             * README.md and c/cl_copy.c's v3d_copy_overlap_test) -
+             * genuinely new territory (scratch-buffer two-pass copy),
+             * tested against a synthetic buffer before ever trusting
+             * it live. R0=width, R1=height, R2=shift_x, R3=shift_y in
+             * - deliberately NOT required to be tile-aligned, since a
+             * sub-tile shift is exactly the case a direct copy gets
+             * wrong. Returns the buffer's logical address (R0), row
+             * stride (R1), tiles_x (R2), tiles_y (R3) for a test
+             * script to sample and verify pixel-for-pixel. */
+            void *buf_log;
+            unsigned int stride, tiles_x, tiles_y;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    26, "V3DDriver: V3D_OverlapCopyTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_copy_overlap_test(&g_pmp_fill, OVERLAP_COPY_TEST_BASE_PAGE,
+                                          (unsigned int) r->r[0], (unsigned int) r->r[1],
+                                          (unsigned int) r->r[2], (unsigned int) r->r[3],
+                                          &buf_log, &stride, &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = (unsigned int) buf_log;
+            r->r[1] = stride;
+            r->r[2] = tiles_x;
+            r->r[3] = tiles_y;
+            return NULL;
+        }
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see

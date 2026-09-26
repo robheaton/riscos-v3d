@@ -3,11 +3,13 @@
  * (see README.md's "GraphicsV Render accelerator" section): claim
  * GraphicsV (vector 42) and intercept reason code 13 (Render) - op 2
  * (rectangle fill) for a genuine solid-colour ECF pattern only, and op
- * 1 (rectangle copy) for non-overlapping rectangles only (see
- * cl_copy.h for why overlap isn't handled yet) - everything else is
- * left unclaimed (R4 untouched) so it falls through to whatever else
- * is on the chain (the kernel's own HAL-bridge claimant, confirmed to
- * exist by the earlier GraphicsV/HAL Video API research - see README).
+ * 1 (rectangle copy) for ANY rectangle (non-overlapping copies go
+ * through a direct single-pass Load+Store; overlapping ones - the
+ * common scroll case - go through a scratch-buffer two-pass copy
+ * instead, see cl_copy.h/.c) - everything else is left unclaimed (R4
+ * untouched) so it falls through to whatever else is on the chain (the
+ * kernel's own HAL-bridge claimant, confirmed to exist by the earlier
+ * GraphicsV/HAL Video API research - see README).
  *
  * Deliberately NOT auto-claimed on module load - see V3D_AccelStart/
  * V3D_AccelStop below. A silently wrong accelerated fill corrupts
@@ -65,6 +67,8 @@ extern volatile unsigned int g_gfxv_copy_overlap_count;
 extern volatile unsigned int g_gfxv_copy_claimed_count;
 extern volatile unsigned int g_gfxv_copy_error_count;
 extern volatile unsigned int g_gfxv_copy_last_fail_errnum;
+extern volatile unsigned int g_gfxv_copy_overlap_claimed_count;
+extern volatile unsigned int g_gfxv_copy_overlap_error_count;
 
 /*
  * OS_Claim/OS_Release on vector 42 (GraphicsV), using this module's

@@ -72,16 +72,18 @@ static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
 
 /*
  * Shared core: builds and submits a multi-tile Load+Store control list
- * copying from `src_phys` to `dest_phys` (both using `stride` - real
- * GraphicsV op 1 copies within the same framestore, so source and
- * dest always share a stride; the synthetic test below does too, for
- * simplicity). No ClearTileBuffers at all - every tile is populated
- * from `src_phys` via LoadTileBufferGeneral, not cleared.
+ * copying from `src_phys` (row stride `src_stride`) to `dest_phys` (row
+ * stride `dest_stride`) - separate strides so this can also copy
+ * between two buffers of different widths (needed for the overlap-safe
+ * scratch-buffer path below; real GraphicsV op 1 copies within the
+ * same framestore, so its two calls always pass the same stride
+ * twice). No ClearTileBuffers at all - every tile is populated from
+ * `src_phys` via LoadTileBufferGeneral, not cleared.
  */
 static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int width, unsigned int height,
                                    unsigned int src_phys, unsigned int dest_phys,
-                                   unsigned int stride,
+                                   unsigned int src_stride, unsigned int dest_stride,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out)
 {
@@ -221,9 +223,9 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
              * hardware-confirmed for Load specifically - that's
              * exactly what this file's own test exists to check). */
             emit_tile_coordinates(&rcl, col, row);
-            emit_load_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, stride, src_phys);
+            emit_load_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, src_stride, src_phys);
             emit_end_of_loads(&rcl);
-            emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, stride, dest_phys);
+            emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, dest_stride, dest_phys);
             emit_end_of_tile_marker(&rcl);
         }
     }
@@ -337,7 +339,7 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
     }
 
     err = run_copy(pmp, base_page + 2u * buf_pages, width, height,
-                    src_phys, dest_phys, stride, tiles_x_out, tiles_y_out);
+                    src_phys, dest_phys, stride, stride, tiles_x_out, tiles_y_out);
     if (err) return err;
 
     *src_log_out = src_log;
@@ -359,5 +361,169 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
     unsigned int dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * 4u;
 
     return run_copy(pmp, base_page, width, height, src_phys, dest_phys,
-                     screen_stride, tiles_x_out, tiles_y_out);
+                     screen_stride, screen_stride, tiles_x_out, tiles_y_out);
+}
+
+/*
+ * Overlap-safe copy: routes through a freshly-allocated scratch buffer
+ * instead of a single direct Load(source)+Store(dest) pass, so it's
+ * safe for ANY overlap, not just shifts of at least a full tile.
+ *
+ * WHY a direct pass isn't safe for overlapping rectangles even with
+ * careful per-tile ordering: a tile's Load and Store both read/write a
+ * fixed 64x64-pixel block, but source and destination are usually
+ * shifted by something OTHER than a whole number of tiles (a scroll by
+ * 20 pixels, say). A single tile's Store can then overwrite pixels
+ * that belong to a DIFFERENT, not-yet-processed tile's Load region -
+ * no ordering of the SAME tile grid avoids this once the shift is
+ * smaller than one tile in either dimension. Routing through scratch
+ * sidesteps the question entirely: source->scratch and scratch->dest
+ * are each individually a fresh-buffer copy, which is always non-
+ * overlapping by construction (scratch is memory nothing else is
+ * using), so both passes reuse run_copy's already-proven, unmodified
+ * core with zero new tile-ordering logic to get wrong.
+ *
+ * Bounded to pmp_alloc's 64-page/call cap for the scratch buffer
+ * itself (same cap already governing every synthetic-buffer test in
+ * this project) - large overlapping copies (e.g. a full-screen
+ * scroll) are refused with a clear error rather than silently
+ * chunked, so the caller's own fallback (leaving the GraphicsV call
+ * unclaimed) takes over instead of this driver attempting something
+ * only partially tested.
+ */
+_kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_page,
+                                               unsigned int src_x, unsigned int src_y,
+                                               unsigned int dest_x, unsigned int dest_y,
+                                               unsigned int width, unsigned int height,
+                                               unsigned int screen_phys_base,
+                                               unsigned int screen_stride,
+                                               unsigned int *tiles_x_out,
+                                               unsigned int *tiles_y_out)
+{
+    unsigned int tiles_x, tiles_y, padded_w, padded_h, scratch_stride;
+    unsigned int scratch_bytes, scratch_pages;
+    unsigned int scratch_phys, src_phys, dest_phys;
+    void *scratch_log;
+    _kernel_oserror *err;
+
+    if (width == 0u || height == 0u)
+    {
+        static _kernel_oserror err_bad_size = {
+            10, "V3DDriver: overlapping copy width/height must be non-zero"
+        };
+        return &err_bad_size;
+    }
+
+    tiles_x = div_round_up(width, TILE_SIZE);
+    tiles_y = div_round_up(height, TILE_SIZE);
+    padded_w = tiles_x * TILE_SIZE;
+    padded_h = tiles_y * TILE_SIZE;
+    scratch_stride = padded_w * 4u;
+    scratch_bytes = scratch_stride * padded_h;
+    scratch_pages = bytes_to_pages(scratch_bytes);
+
+    if (scratch_pages > 64u)
+    {
+        static _kernel_oserror err_too_big = {
+            14, "V3DDriver: overlapping copy too large for a scratch-"
+                "buffer pass (pmp_alloc's 64-page/call cap)"
+        };
+        return &err_too_big;
+    }
+
+    err = pmp_alloc(pmp, base_page, scratch_pages, &scratch_phys, &scratch_log);
+    if (err) return err;
+
+    src_phys = screen_phys_base + src_y * screen_stride + src_x * 4u;
+    dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * 4u;
+
+    /* Pass 1: real source -> scratch (always non-overlapping - scratch
+     * is fresh driver memory nothing else touches). */
+    err = run_copy(pmp, base_page + scratch_pages, width, height,
+                    src_phys, scratch_phys, screen_stride, scratch_stride,
+                    &tiles_x, &tiles_y);
+    if (err) return err;
+
+    /* Pass 2: scratch -> real destination (same reasoning). */
+    err = run_copy(pmp, base_page + scratch_pages, width, height,
+                    scratch_phys, dest_phys, scratch_stride, screen_stride,
+                    &tiles_x, &tiles_y);
+    if (err) return err;
+
+    *tiles_x_out = tiles_x;
+    *tiles_y_out = tiles_y;
+    return NULL;
+}
+
+_kernel_oserror *v3d_copy_overlap_test(pmp_area_t *pmp, unsigned int base_page,
+                                         unsigned int width, unsigned int height,
+                                         unsigned int shift_x, unsigned int shift_y,
+                                         void **buf_log_out,
+                                         unsigned int *stride_bytes_out,
+                                         unsigned int *tiles_x_out,
+                                         unsigned int *tiles_y_out)
+{
+    unsigned int bound_w, bound_h, bound_tiles_x, bound_tiles_y;
+    unsigned int padded_w, padded_h, stride, buf_bytes, buf_pages;
+    unsigned int buf_phys;
+    void *buf_log;
+    _kernel_oserror *err;
+    unsigned int x, y;
+
+    if (width == 0u || height == 0u)
+    {
+        static _kernel_oserror err_bad_size = {
+            10, "V3DDriver: V3D_OverlapCopyTest width/height must be non-zero"
+        };
+        return &err_bad_size;
+    }
+
+    /* Bounding box covering both the source rect at (0,0) and the
+     * dest rect at (shift_x, shift_y), padded to a whole tile grid -
+     * same safety-margin reasoning as v3d_fill_test's own padding
+     * (this is a test buffer we control the size of; the real screen
+     * target has no such margin, which is exactly why the 64-page cap
+     * matters more there). */
+    bound_w = width + shift_x;
+    bound_h = height + shift_y;
+    bound_tiles_x = div_round_up(bound_w, TILE_SIZE);
+    bound_tiles_y = div_round_up(bound_h, TILE_SIZE);
+    padded_w = bound_tiles_x * TILE_SIZE;
+    padded_h = bound_tiles_y * TILE_SIZE;
+    stride = padded_w * 4u;
+    buf_bytes = stride * padded_h;
+    buf_pages = bytes_to_pages(buf_bytes);
+
+    if (buf_pages > 64u)
+    {
+        static _kernel_oserror err_too_big = {
+            14, "V3DDriver: V3D_OverlapCopyTest rectangle+shift too "
+                "large for this test harness (pmp_alloc's 64-page/call cap)"
+        };
+        return &err_too_big;
+    }
+
+    err = pmp_alloc(pmp, base_page, buf_pages, &buf_phys, &buf_log);
+    if (err) return err;
+
+    /* Per-pixel test pattern across the WHOLE bounding buffer, source
+     * and dest regions alike - see this function's own header comment
+     * for why the expected post-copy value is computed analytically
+     * from this formula rather than saved beforehand. */
+    for (y = 0; y < padded_h; y++)
+    {
+        volatile unsigned int *row_ptr =
+            (volatile unsigned int *) ((unsigned char *) buf_log + y * stride);
+        for (x = 0; x < padded_w; x++)
+            row_ptr[x] = 0xFF000000u | (x << 12) | y;
+    }
+
+    err = v3d_copy_screen_overlapping(pmp, base_page + buf_pages,
+                                        0, 0, shift_x, shift_y, width, height,
+                                        buf_phys, stride, tiles_x_out, tiles_y_out);
+    if (err) return err;
+
+    *buf_log_out = buf_log;
+    *stride_bytes_out = stride;
+    return NULL;
 }

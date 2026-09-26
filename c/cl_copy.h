@@ -16,19 +16,22 @@
  * code) - keeping them apart means a bug here can't regress the fill
  * path, and the two can be diffed directly if something doesn't work.
  *
- * NON-OVERLAPPING ONLY for now, matching the original scoping's own
- * plan ("op 1 (copy), non-overlapping only, as a later pass"). The
- * PRM's own GraphicsV 13 1 doc explicitly allows overlapping source/
- * dest rectangles ("they may be overlapping" - exactly what a window
- * scroll is), but this driver controls the exact per-tile processing
- * order itself (it emits the RCL), which in principle allows a
- * memmove-style direction choice to make overlapping copies safe too -
- * genuinely more subtle than it sounds once sub-tile-granularity
- * pixel shifts are considered (a tile's load window can straddle the
- * boundary between already-overwritten and not-yet-touched memory even
- * with correct macro-level tile ordering), so it's deliberately
- * deferred rather than half-solved. Callers must reject overlapping
- * rectangles themselves before calling anything here.
+ * `v3d_copy_screen` (direct, single-pass) is NON-OVERLAPPING ONLY,
+ * matching the original scoping's own plan ("op 1 (copy), non-
+ * overlapping only, as a later pass"). The PRM's own GraphicsV 13 1
+ * doc explicitly allows overlapping source/dest rectangles ("they may
+ * be overlapping" - exactly what a window scroll is) - a direct
+ * single-pass copy is NOT safe for this in general: a tile's Load and
+ * Store both cover a fixed 64x64-pixel block, but source and
+ * destination are usually shifted by something other than a whole
+ * number of tiles (a scroll by 20 pixels, say), so one tile's Store
+ * can overwrite pixels a DIFFERENT, not-yet-processed tile's Load
+ * still needs - no ordering of the same tile grid avoids this once the
+ * shift is smaller than one tile in either dimension. `v3d_copy_screen_
+ * overlapping` below handles this instead, by routing through a
+ * scratch buffer (see its own comment) - callers should use that one
+ * whenever the two rectangles might overlap, and reserve the direct
+ * `v3d_copy_screen` for cases already known not to.
  */
 #ifndef CL_COPY_H
 #define CL_COPY_H
@@ -80,5 +83,62 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int screen_stride,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out);
+
+/*
+ * Overlap-safe version of v3d_copy_screen: routes through a freshly-
+ * allocated scratch buffer (source -> scratch, then scratch -> dest),
+ * so it's correct for ANY overlap, not just shifts of at least a full
+ * tile - see this header's top comment and cl_copy.c's own comment on
+ * v3d_copy_screen_overlapping for the full reasoning.
+ *
+ * Bounded to pmp_alloc's 64-page/call cap for the scratch buffer -
+ * large overlapping copies (e.g. a full-screen scroll) are refused
+ * with a clear error rather than silently chunked, so the caller's own
+ * fallback (leaving the GraphicsV call unclaimed, same as everywhere
+ * else in this driver) takes over instead.
+ */
+_kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_page,
+                                               unsigned int src_x, unsigned int src_y,
+                                               unsigned int dest_x, unsigned int dest_y,
+                                               unsigned int width, unsigned int height,
+                                               unsigned int screen_phys_base,
+                                               unsigned int screen_stride,
+                                               unsigned int *tiles_x_out,
+                                               unsigned int *tiles_y_out);
+
+/*
+ * Isolated test for v3d_copy_screen_overlapping, against a synthetic
+ * PMP buffer instead of the real screen - exactly mirrors a real
+ * scroll (same buffer, two overlapping sub-rectangles) rather than the
+ * two-separate-buffers shape v3d_copy_test uses, since that's the
+ * actual hazard this function exists to handle safely.
+ *
+ * Allocates one buffer big enough to hold both a `width` x `height`
+ * source rectangle at (0,0) and a destination rectangle at
+ * (shift_x, shift_y) - deliberately NOT required to be a multiple of
+ * the 64px tile size, since a sub-tile shift is exactly the case a
+ * naive direct copy gets wrong (see cl_copy.h's top comment). Fills
+ * the whole buffer with a per-pixel test pattern (pixel at `(x,y)` =
+ * `0xFF000000|(x<<12)|y`) before the copy runs, so the destination
+ * rectangle's EXPECTED post-copy
+ * value at any pixel is computable analytically (from the
+ * corresponding source-side coordinate), without needing to have
+ * saved anything - important here specifically because the source
+ * region's own pixels may themselves get overwritten by the
+ * destination write when they overlap, so "does dest match src now"
+ * would be circular; "does dest match what src originally had" is the
+ * real question.
+ *
+ * On success, *buf_log_out points at the buffer's start (CPU-readable
+ * directly) and *stride_bytes_out is its row stride, for a caller to
+ * compute expected values and sample points itself.
+ */
+_kernel_oserror *v3d_copy_overlap_test(pmp_area_t *pmp, unsigned int base_page,
+                                         unsigned int width, unsigned int height,
+                                         unsigned int shift_x, unsigned int shift_y,
+                                         void **buf_log_out,
+                                         unsigned int *stride_bytes_out,
+                                         unsigned int *tiles_x_out,
+                                         unsigned int *tiles_y_out);
 
 #endif /* CL_COPY_H */

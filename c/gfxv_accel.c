@@ -35,13 +35,25 @@ extern _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bo
                                                 unsigned int colour_rgba);
 
 /* Same idea, for op 1 (copy) - see module.c's own comment on
- * v3d_accel_render_copy. Non-overlapping only (see cl_copy.h) -
- * v3d_gfxv_handler checks for overlap itself before ever calling this,
- * since that check needs no module.c-private state and belongs at the
- * protocol-decoding layer. */
+ * v3d_accel_render_copy. Direct, single-pass, non-overlapping only
+ * (see cl_copy.h) - v3d_gfxv_handler checks for overlap itself before
+ * ever calling this, since that check needs no module.c-private state
+ * and belongs at the protocol-decoding layer. */
 extern _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_bottom,
                                                 unsigned int dest_left, unsigned int dest_bottom,
                                                 unsigned int width, unsigned int height);
+
+/* Overlap-safe twin, used instead when handle_render_copy's own
+ * overlap check finds the rectangles intersect - routes through a
+ * scratch buffer (see cl_copy.c's v3d_copy_screen_overlapping), so
+ * it's correct for any overlap, not just shifts of at least a full
+ * tile. Slower than the direct path (two full copy passes instead of
+ * one) and bounded to a maximum size (see its own comment) - genuinely
+ * large overlapping copies still fall back to this handler leaving the
+ * call unclaimed, same as any other failure. */
+extern _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsigned int src_bottom,
+                                                             unsigned int dest_left, unsigned int dest_bottom,
+                                                             unsigned int width, unsigned int height);
 
 static void *g_gfxv_private_word = NULL;
 static int g_gfxv_claimed = 0;
@@ -100,6 +112,14 @@ volatile unsigned int g_gfxv_copy_overlap_count = 0;
 volatile unsigned int g_gfxv_copy_claimed_count = 0;
 volatile unsigned int g_gfxv_copy_error_count = 0;
 volatile unsigned int g_gfxv_copy_last_fail_errnum = 0;
+
+/* Overlap-safe (scratch-buffer) path specifically - see
+ * v3d_accel_render_copy_overlapping. g_gfxv_copy_overlap_count above
+ * still counts every overlapping call seen; these track what happened
+ * to them now that they're actually attempted instead of always
+ * skipped. */
+volatile unsigned int g_gfxv_copy_overlap_claimed_count = 0;
+volatile unsigned int g_gfxv_copy_overlap_error_count = 0;
 
 void v3d_gfxv_set_private_word(void *pw)
 {
@@ -256,19 +276,38 @@ static void handle_render_copy(_kernel_swi_regs *r)
     width = params[4] + 1u;
     height = params[5] + 1u;
 
-    /* Non-overlapping only for now (see cl_copy.h). AABB overlap test:
-     * NOT (one rect is entirely to one side of the other on either
-     * axis). Checked here, at the protocol layer, before ever calling
-     * into module.c - the same check V3D_ScreenCopyTest's SWI handler
-     * makes for itself, duplicated rather than shared since the two
-     * call sites take differently-shaped inputs (this one decodes
-     * straight from GraphicsV's own bottom-up rectangle-plus-size
-     * form; the test SWI takes an already-parsed width/height pair). */
+    /* AABB overlap test: NOT (one rect is entirely to one side of the
+     * other on either axis). Checked here, at the protocol layer,
+     * before ever calling into module.c - the same check
+     * V3D_ScreenCopyTest's SWI handler makes for itself, duplicated
+     * rather than shared since the two call sites take differently-
+     * shaped inputs (this one decodes straight from GraphicsV's own
+     * bottom-up rectangle-plus-size form; the test SWI takes an
+     * already-parsed width/height pair). Overlapping rectangles route
+     * through v3d_accel_render_copy_overlapping's scratch-buffer pass
+     * instead of the direct single-pass copy - see cl_copy.h/.c for
+     * why a direct pass isn't safe once source and destination
+     * overlap. */
     if (src_left < dest_left + width && dest_left < src_left + width &&
         src_bottom < dest_bottom + height && dest_bottom < src_bottom + height)
     {
         g_gfxv_copy_overlap_count++;
-        return; /* overlapping - not ours to accelerate yet */
+
+        err = v3d_accel_render_copy_overlapping(src_left, src_bottom,
+                                                  dest_left, dest_bottom,
+                                                  width, height);
+        if (err)
+        {
+            g_gfxv_copy_overlap_error_count++;
+            g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
+            return; /* too large for the scratch-buffer path, or a GPU
+                      * failure - leave unclaimed, same fail-safe
+                      * reasoning as everywhere else in this driver. */
+        }
+
+        g_gfxv_copy_overlap_claimed_count++;
+        r->r[4] = 0; /* claimed */
+        return;
     }
 
     err = v3d_accel_render_copy(src_left, src_bottom, dest_left, dest_bottom,
