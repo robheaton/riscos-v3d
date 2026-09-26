@@ -1354,6 +1354,14 @@ invocation during the wait is exactly the class of problem this exists
 to catch safely, before real submission code ever unmasks for real.
 Not yet tested on hardware.
 
+**Hardware result (2026-09-26) - CONFIRMED SAFE.** `V3D_PowerOn` then
+`V3D_IRQTest`: `claimed=0 spurious=0`, no freeze, no error. A genuine
+~10 million-iteration wait with the interrupt actually enabled and
+nothing at all fired spuriously - the hub-masking fix holds up
+directly in isolation, with no GPU job involved. Next: the real test -
+`V3D_ClearTest` with the interrupt live, actually submitting a job so
+`FLDONE`/`FRDONE` should legitimately fire this time.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
