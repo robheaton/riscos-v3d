@@ -2244,7 +2244,7 @@ fills and non-overlapping copies - entirely through the documented
 been exercised under real, heavy, unplanned desktop load without a
 single visible glitch across two separate live test sessions.
 
-## Overlapping copy (2026-09-26, synthetic buffer hardware-verified; real framestore not yet tested)
+## Overlapping copy (2026-09-26, hardware-verified)
 
 Extends op 1 to handle overlapping rectangles - the common real-world
 case this driver couldn't accelerate yet (window scrolling is almost
@@ -2315,4 +2315,13 @@ which got its own dedicated real-framestore step before going live.
 Added `V3D_ScreenCopyOverlapTest`/`test/ScreenCopyOverlapTest.bas` to
 close that gap: a genuinely overlapping, sub-tile-shifted copy (mimics
 a real scroll - same rectangle shifted by `(30,20)` pixels) directly
-against the real screen. Not yet hardware-tested.
+against the real screen.
+
+**Confirmed on real hardware 2026-09-26**: the source area's content
+appeared correctly shifted at the destination, with no visible
+corruption in the overlap region - visually confirmed. Overlapping
+copy is now hardware-verified end to end: synthetic buffer, real
+framestore, and (from the moment it was wired in) the live desktop
+handler. This closes the last gap in the original 5-step plan - window
+scrolling, the most common real-world copy case, is now genuinely
+GPU-accelerable, not just non-overlapping copies.
