@@ -25,6 +25,7 @@
 #include "phys_buffer.h"
 #include "cl_clear.h"
 #include "memsplit.h"
+#include "v3d_clock.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -245,6 +246,7 @@ enum
     SWI_V3D_ClearTest = 3,
     SWI_V3D_ClearToSprite = 4,
     SWI_V3D_MemSplit = 5,
+    SWI_V3D_ClockInfo = 6,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -358,6 +360,19 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = arm_size;
             r->r[2] = vc_base;
             r->r[3] = vc_size;
+            return NULL;
+        }
+
+        case SWI_V3D_ClockInfo:
+        {
+            unsigned int state, rate, max_rate;
+            _kernel_oserror *err = v3d_query_clock(&state, &rate, &max_rate);
+            if (err)
+                return err;
+
+            r->r[0] = state;
+            r->r[1] = rate;
+            r->r[2] = max_rate;
             return NULL;
         }
 

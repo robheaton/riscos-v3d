@@ -13,7 +13,7 @@ CMUNGEFLAGS := -tgcc -32bit -p
 
 CFLAGS   := -mmodule -O2 -Wall -Wextra -Ic -Icmhg
 
-OBJS     := c/module.o c/phys_buffer.o c/cl_clear.o c/sprite.o c/memsplit.o cmhg/V3DDriver.o
+OBJS     := c/module.o c/phys_buffer.o c/cl_clear.o c/sprite.o c/bcmsupport.o c/memsplit.o c/v3d_clock.o cmhg/V3DDriver.o
 
 all: V3DDriver,ffa
 
@@ -26,7 +26,7 @@ cmhg/V3DDriver.o: cmhg/V3DDriver.cmhg
 	$(CMUNGE) $(CMUNGEFLAGS) -o $@ $<
 
 # All .c files include the generated header, so it must exist first.
-c/module.o: c/module.c c/v3d_regs.h c/io_map.h c/phys_buffer.h c/cl_clear.h c/memsplit.h cmhg/V3DDriver.h
+c/module.o: c/module.c c/v3d_regs.h c/io_map.h c/phys_buffer.h c/cl_clear.h c/memsplit.h c/v3d_clock.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/module.c -o c/module.o
 
 c/phys_buffer.o: c/phys_buffer.c c/phys_buffer.h cmhg/V3DDriver.h
@@ -38,13 +38,19 @@ c/cl_clear.o: c/cl_clear.c c/cl_clear.h c/cl_builder.h c/v3d_regs.h c/io_map.h c
 c/sprite.o: c/sprite.c c/sprite.h
 	$(CC) $(CFLAGS) -c c/sprite.c -o c/sprite.o
 
-c/memsplit.o: c/memsplit.c c/memsplit.h
+c/bcmsupport.o: c/bcmsupport.c c/bcmsupport.h
+	$(CC) $(CFLAGS) -c c/bcmsupport.c -o c/bcmsupport.o
+
+c/memsplit.o: c/memsplit.c c/memsplit.h c/bcmsupport.h
 	$(CC) $(CFLAGS) -c c/memsplit.c -o c/memsplit.o
+
+c/v3d_clock.o: c/v3d_clock.c c/v3d_clock.h c/bcmsupport.h
+	$(CC) $(CFLAGS) -c c/v3d_clock.c -o c/v3d_clock.o
 
 V3DDriver,ffa: $(OBJS)
 	$(CC) -mmodule -o $@ $(OBJS)
 
 clean:
-	rm -f c/module.o c/phys_buffer.o c/cl_clear.o c/sprite.o c/memsplit.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
+	rm -f c/module.o c/phys_buffer.o c/cl_clear.o c/sprite.o c/bcmsupport.o c/memsplit.o c/v3d_clock.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
 
 .PHONY: all clean

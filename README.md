@@ -841,6 +841,49 @@ there, not a new guess. Fixed `diagnose_timeout()` to actually print
 yet tested on hardware - next timeout's message will say whether the
 binner is out of tile-allocation memory or something else entirely.
 
+**Hardware result, attempt 11 (2026-09-26) - bisection against the
+exact M2-verified commit.** Attempt 10's `V3D_ClearTest` hang (not just
+`ClearToSprite`) meant this was no longer sprite-specific - a real
+regression somewhere, or something environmental. Rather than keep
+reading code, built and shipped the *exact* binary from commit
+`200aa5d` ("M2 confirmed working on hardware... verified correct") -
+before any of the later `v3d_restart_thread`/`diagnose_timeout`
+iterations existed - and ran it fresh on the same hardware. **It hung
+too**, with its own (older, simpler) diagnostic:
+`STS=0x00000000 CS=0x00000050 (STOP) CA=0x00000000 EA=0x00000000
+QBA=w0x03066000/r0x00003000 QEA=w0x0306606B/r0x03065002
+tAlloc=0x0306B000 rTgt=0x03067000 tState=0x0306E000`. This rules out
+every code change made since M2 as the cause - the identical bytes
+that were "byte-exact, 100% reliable" on this project's own earlier
+hardware session no longer work today, on the same board. Whatever
+this is, it isn't in `cl_clear.c`'s restart/recovery logic.
+
+That reframes the question: what differs about *this session's
+hardware/firmware state* versus whatever M2's success depended on?
+One real candidate, not yet checked at all: nothing in this driver has
+ever asked the firmware to turn the V3D core's clock on.
+`v3d_power_on()` only pulses `PM_GRAFX`'s reset and releases the ASB
+gates - a different, lower-level thing than the Raspberry Pi
+firmware's own independent clock-gating per hardware block. A V3D
+block with no clock running would still answer plain register
+reads/writes correctly (explaining why `V3D_ReadIdent` and
+`V3D_TestBuffer` have always worked) while never advancing a state
+machine that depends on that clock ticking - which looks exactly like
+what's been observed: `CTRUN` sets, `STS` never reports an error,
+nothing ever completes. M2 may simply have run at a moment when the
+firmware happened to already have the V3D clock on for unrelated
+reasons; nothing here has ever controlled it directly.
+
+Added `V3D_ClockInfo` (0xC0046) to check this - queries
+`GetClockState`/`GetClockRate`/`GetMaxClockRate` for `ClockID::V3D`
+(=5) via `BCMSupport_SendTempPropertyBuffer` (tag numbers and clock ID
+cross-checked against both the bare-metal reference project and
+BCMSupport's own real header, in agreement). Diagnostic only - it does
+not yet force the clock on, deliberately, so the first hardware result
+is real data rather than a fix layered on a guess. Refactored the
+mailbox-call helper out of `memsplit.c` into `bcmsupport.c` so both
+SWIs share it. Not yet tested on hardware.
+
 ## Testing on hardware
 
 1. Build with a working GCCSDK RISC OS cross-toolchain.
