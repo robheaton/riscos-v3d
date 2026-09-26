@@ -29,6 +29,7 @@
 #include "v3d_irq.h"
 #include "screen_info.h"
 #include "cl_fill.h"
+#include "gfxv_accel.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -310,6 +311,59 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
     return NULL;
 }
 
+/*
+ * Step 4 of the planned GraphicsV Render accelerator (see README.md
+ * and gfxv_accel.c): the one function that knows how to actually
+ * perform an accelerated fill using this driver's existing PMP/IRQ/
+ * screen-framestore infrastructure, exposed for gfxv_accel.c's vector
+ * handler to call. Takes GraphicsV's OWN inclusive (left, bottom,
+ * right, top) rectangle - 0,0 is bottom-left, positive Y is up, per
+ * GraphicsV 13 2's own parameter block doc - and converts to this
+ * driver's internal top-down-from-ScreenStart convention (confirmed by
+ * step 3's hardware test: increasing y moves away from the top) before
+ * calling v3d_fill_screen. This is the one place that conversion
+ * happens - gfxv_accel.c deliberately knows nothing about it.
+ *
+ * Unlike V3D_ScreenFillTest (which requires the caller to have already
+ * called V3D_PowerOn), this self-initialises everything it needs -
+ * a real desktop redraw calling into GraphicsV won't have called any
+ * of this module's own test SWIs first.
+ */
+_kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
+                                         unsigned int right, unsigned int top,
+                                         unsigned int colour_rgba)
+{
+    unsigned int clock_rate;
+    unsigned int width, height, y_top_down;
+    unsigned int tiles_x, tiles_y;
+    _kernel_oserror *err;
+
+    err = v3d_power_on(&clock_rate);
+    if (err)
+        return err;
+
+    err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    err = ensure_pmp_fill();
+    if (err)
+        return err;
+
+    err = v3d_irq_ensure_ready();
+    if (err)
+        return err;
+
+    width = right - left + 1u;
+    height = top - bottom + 1u;
+    y_top_down = g_screen_info.ywind_limit - top;
+
+    return v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                             left, y_top_down, width, height, colour_rgba,
+                             g_screen_phys_base, g_screen_info.line_length,
+                             &tiles_x, &tiles_y);
+}
+
 static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
 {
     io_mapping_t v3d;
@@ -359,6 +413,7 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
      * v3d_irq.h for why a raw hardware vector needs it passed
      * explicitly, unlike every other entry point into this module. */
     v3d_irq_set_private_word(pw);
+    v3d_gfxv_set_private_word(pw);
 
     g_powered_on = 0;
     /* Deliberately doing nothing else here: no hardware is touched, and
@@ -368,7 +423,7 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
 
 _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
 {
-    _kernel_oserror *irq_err, *pmp_err = NULL;
+    _kernel_oserror *irq_err, *gfxv_err, *pmp_err = NULL;
 
     (void) fatal;
     (void) podule_base;
@@ -379,6 +434,12 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
      * reloaded module leaving its interrupt vector claimed is a real
      * hazard, not just untidy. */
     irq_err = v3d_irq_shutdown();
+
+    /* Same reasoning, a second system vector: see the README's
+     * "GraphicsV Render accelerator" section for why this compounds
+     * the existing, unresolved reload-without-reboot freeze risk - a
+     * safe no-op if V3D_AccelStart was never called this session. */
+    gfxv_err = v3d_gfxv_shutdown();
 
     /* Same reasoning, different resource: the PMP Dynamic Area is
      * system-wide OS state that outlives this module unless its
@@ -397,7 +458,9 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
             pmp_err = fill_err;
     }
 
-    return irq_err ? irq_err : pmp_err;
+    if (irq_err) return irq_err;
+    if (gfxv_err) return gfxv_err;
+    return pmp_err;
 }
 
 /* ---------------------------------------------------------------- */
@@ -417,6 +480,9 @@ enum
     SWI_V3D_ScreenInfo = 8,
     SWI_V3D_FillTest = 9,
     SWI_V3D_ScreenFillTest = 10,
+    SWI_V3D_AccelStart = 11,
+    SWI_V3D_AccelStop = 12,
+    SWI_V3D_AccelStats = 13,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -751,6 +817,31 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = tiles_y;
             return NULL;
         }
+
+        case SWI_V3D_AccelStart:
+            /* Step 4 of the planned GraphicsV Render accelerator - see
+             * README.md and gfxv_accel.c. Deliberately explicit opt-in,
+             * not auto-claimed on module load - see gfxv_accel.h's top
+             * comment for why. No arguments, no return values. */
+            return v3d_gfxv_start();
+
+        case SWI_V3D_AccelStop:
+            return v3d_gfxv_stop();
+
+        case SWI_V3D_AccelStats:
+            /* Real instrumentation for the accelerator now sitting in
+             * the live Wimp/VDU graphics pipeline - see gfxv_accel.c.
+             * Returns total handler invocations (R0), how many were
+             * reason 13/Render (R1), how many were op 2/fill (R2), how
+             * many had a genuine solid ECF (R3), how many were actually
+             * accelerated (R4), and how many attempted-but-failed (R5). */
+            r->r[0] = g_gfxv_call_count;
+            r->r[1] = g_gfxv_render_count;
+            r->r[2] = g_gfxv_fill_op_count;
+            r->r[3] = g_gfxv_solid_count;
+            r->r[4] = g_gfxv_claimed_count;
+            r->r[5] = g_gfxv_error_count;
+            return NULL;
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see
