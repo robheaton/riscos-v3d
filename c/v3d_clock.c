@@ -77,9 +77,29 @@ _kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out)
     unsigned int echo, state, rate, max_rate;
     _kernel_oserror *err;
 
-    err = tag_call(TAG_SET_CLOCK_STATE, CLOCK_ID_V3D, 1, 0, &echo, &state);
+    /* Check before setting: a real hardware test (2026-09-26) found the
+     * first V3D_PowerOn in a session works reliably, but a second one
+     * - clock already confirmed on from the first call - reliably
+     * hangs the CLE on a fresh, correctly-addressed submission (CS
+     * shows CTRUN, BFC never advances, no error flags - not a stale-
+     * state or address problem, both ruled out separately). The one
+     * concrete difference between call 1 and call 2 is that call 2
+     * re-issues SetClockState(on) to a clock that's already running.
+     * If the firmware treats a redundant enable as a brief re-init of
+     * an already-stable clock rather than a true no-op, a hardware
+     * reset pulse landing moments later on a momentarily-disturbed
+     * clock would produce exactly this symptom. Only ask the firmware
+     * to change anything when the clock is actually confirmed off. */
+    err = tag_call(TAG_GET_CLOCK_STATE, CLOCK_ID_V3D, 0, 0, &echo, &state);
     if (err)
         return err;
+
+    if (!(state & 1u))
+    {
+        err = tag_call(TAG_SET_CLOCK_STATE, CLOCK_ID_V3D, 1, 0, &echo, &state);
+        if (err)
+            return err;
+    }
 
     err = tag_call(TAG_GET_CLOCK_RATE, CLOCK_ID_V3D, 0, 0, &echo, &rate);
     if (err)

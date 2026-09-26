@@ -991,6 +991,39 @@ the Filer, as done here, or `Wimp_StartTask`), not inside a Task
 Window. Noted here so this doesn't get re-investigated as a code bug
 in a future session.
 
+**Hardware result, attempt 15 (2026-09-26) - reboot-free reliability:
+regressed, then re-diagnosed.** `StressTest.bas` failed on its very
+first iteration - immediately after the just-successful `ShowSprite`
+run, in the same session, no reboot in between. Narrowed with a
+minimal, isolated repro (fresh reboot, just two plain `PowerOn`+
+`ClearTest` pairs back to back): the first call always works; the
+second, immediately after, reliably hangs - `CS=(RUN)`, `BFC` frozen,
+`STS=0` (no OOM/GMPV), `REC=timeout` (the stop-request recovery
+doesn't take), and this time `CA`/`EA` correctly matched *this*
+submission's own freshly-written addresses (not a stale leftover job -
+ruled out separately), so the CLE is picking up a fresh, correctly-
+addressed job and simply never starting it.
+
+Checked whether the reset itself was the problem first, since that's
+the cheaper thing to rule out: `V3D_ReadIdent` right after a "second"
+`V3D_PowerOn` (before touching `ClearTest` at all) reported
+`CT0CS=0 CT1CS=0` - a genuinely clean reset. So the reset pulse itself
+is fine on repeat calls; something about the *submission* after a
+repeat power-on is different.
+
+The one concrete difference between call 1 and call 2: on call 1 the
+firmware clock was confirmed off, so `v3d_ensure_clock_on()`'s
+`SetClockState(V3D, 1)` was a real, meaningful transition; on call 2
+the clock is already on, and the code re-issued that same "turn on"
+request unconditionally anyway. If the firmware treats a redundant
+enable as a brief re-init of an already-stable clock rather than a
+true no-op, a hardware reset pulse landing moments later on a
+momentarily-disturbed clock would produce exactly this symptom, while
+leaving every other register (including the reset check above) looking
+completely normal. Fixed `v3d_ensure_clock_on()` to check
+`GetClockState` first and only call `SetClockState` when the clock is
+actually confirmed off. Not yet tested on hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
