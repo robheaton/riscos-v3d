@@ -1362,6 +1362,49 @@ directly in isolation, with no GPU job involved. Next: the real test -
 `V3D_ClearTest` with the interrupt live, actually submitting a job so
 `FLDONE`/`FRDONE` should legitimately fire this time.
 
+**Hardware result (2026-09-26) - SECOND FREEZE, same crash address,
+real root cause found.** `V3D_ClearTest` froze the machine again:
+identical `Internal error: abort on data transfer at &20F09D7C` -
+byte-for-byte the same address as before. That determinism, plus
+`V3D_IRQTest`'s wait having just proven clean with the interrupt
+genuinely live but no job submitted, narrowed this precisely: the
+handler had never actually run for a *real* reason before this moment
+(nothing legitimately fires `FLDONE`/`FRDONE` without a submitted job)
+- this was its first genuine invocation, and it crashed immediately,
+every time, at the same address.
+
+Root cause: `v3d_irq_claim()` was passing `R2=0` to
+`OS_ClaimDeviceVector`. The PRM documents that this value becomes `R12`
+whenever the hardware vector later invokes the handler - and R12 is
+exactly the register RISC OS/GCCSDK module code uses to locate its own
+global/static data. Every *other* entry point into this module (SWI
+handler, `module_init`) receives the correct value automatically from
+the kernel; a raw hardware vector doesn't know to provide it - passing
+the right value is the claiming code's own responsibility, and it
+never did. Confirmed at the disassembly level, not just inferred: the
+`vector-handlers` veneer (`cmhg/V3DDriver.o`, `v3d_irq_entry`) takes
+`R12` and dereferences it as a pointer chain (`ldr ip,[ip]` / `ldmib
+ip,{fp,ip}`) to bootstrap the module's static-data-area pointers
+*before* ever calling our C handler - with `R2=0`, that's a null-
+pointer dereference chain landing on a garbage address, which is
+exactly what a "data transfer abort" at a fixed, deterministic address
+looks like. The same mechanism was independently confirmed for
+`module_init` (its own `pw` parameter comes from `_clib_initialise
+module`'s return value) and for the SWI-handler veneer (`mov r2, ip` -
+its `pw` comes straight from the kernel-provided `R12`), proving both
+that this is the same "private word" concept throughout the module and
+that a genuinely correct value was available the whole time, just
+never captured or passed on.
+
+**Fix**: `module_init` now captures its own `pw` parameter (previously
+discarded) via `v3d_irq_set_private_word()`, and `v3d_irq_claim()`/
+`v3d_irq_release()` pass that real value as `R2` instead of `0`. Not
+yet tested on hardware - the hub-masking fix from the previous freeze
+is unrelated and still correct/needed (it addresses a different,
+real hazard - a shared GIC line with unacknowledged hub-level sources
+- and stays in place), this is a second, independent bug that
+happened to be masked by the first one until it was fixed.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

@@ -33,6 +33,12 @@ static unsigned int g_hal_irqclear_sb = 0;
 static io_mapping_t g_v3d_permanent_mapping;
 static int g_v3d_permanent_mapped = 0;
 static int g_v3d_irq_ready = 0;
+static void *g_module_private_word = NULL;
+
+void v3d_irq_set_private_word(void *pw)
+{
+    g_module_private_word = pw;
+}
 
 /*
  * Raw call to a resolved HAL routine: sets R9 (sb) to the static-base
@@ -137,8 +143,10 @@ _kernel_oserror *v3d_irq_claim(void)
 
     regs.r[0] = (int) V3D_IRQ_DEVICE_NUMBER;
     regs.r[1] = (int) v3d_irq_entry;
-    regs.r[2] = 0; /* R12 value passed to the handler - private word,
-                     * unused by v3d_irq_handler for now */
+    regs.r[2] = (int) g_module_private_word; /* becomes R12 when the
+                     * handler is invoked - see v3d_irq_set_private_word's
+                     * comment in v3d_irq.h for why this must be the
+                     * module's own real private word, not 0 */
     regs.r[3] = 0; /* only meaningful for podule device numbers 8/13 */
     regs.r[4] = 0;
     return _kernel_swi((int) SWI_OS_ClaimDeviceVector, &regs, &regs);
@@ -152,7 +160,7 @@ _kernel_oserror *v3d_irq_release(void)
      * own documentation. */
     regs.r[0] = (int) V3D_IRQ_DEVICE_NUMBER;
     regs.r[1] = (int) v3d_irq_entry;
-    regs.r[2] = 0;
+    regs.r[2] = (int) g_module_private_word;
     return _kernel_swi((int) SWI_OS_ReleaseDeviceVector, &regs, &regs);
 }
 

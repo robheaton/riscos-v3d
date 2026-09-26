@@ -251,7 +251,12 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
 {
     (void) cmd_tail;
     (void) podule_base;
-    (void) pw;
+
+    /* Captured here, not discarded: v3d_irq_claim() needs this exact
+     * value later - see v3d_irq_set_private_word's comment in
+     * v3d_irq.h for why a raw hardware vector needs it passed
+     * explicitly, unlike every other entry point into this module. */
+    v3d_irq_set_private_word(pw);
 
     g_powered_on = 0;
     /* Deliberately doing nothing else here: no hardware is touched, and

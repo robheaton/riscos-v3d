@@ -93,6 +93,20 @@ extern volatile unsigned int g_v3d_irq_spurious_count;
 extern volatile unsigned int g_v3d_irq_bin_done_count;
 extern volatile unsigned int g_v3d_irq_render_done_count;
 
+/*
+ * Must be called once, before v3d_irq_claim(), with this module's own
+ * private word (the third parameter every other entry point - SWI
+ * handler, service calls, module_init - already receives correctly
+ * from the kernel). v3d_irq_claim() passes it on as OS_ClaimDeviceVector's
+ * R2, which the PRM documents becomes R12 whenever the hardware vector
+ * later invokes our handler - the register GCCSDK-compiled module code
+ * uses to locate its own global/static data. Get this wrong (e.g.
+ * leave it 0) and the handler's very first genuine invocation - not
+ * any of the safe, SWI-context-only testing before it - dereferences
+ * garbage the moment it touches any global variable.
+ */
+void v3d_irq_set_private_word(void *pw);
+
 _kernel_oserror *v3d_irq_claim(void);
 _kernel_oserror *v3d_irq_release(void);
 _kernel_oserror *v3d_irq_hal_enable(void);
