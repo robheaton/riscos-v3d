@@ -1674,9 +1674,9 @@ see `V3D_ScreenInfo` below; (2) multi-tile fill into an arbitrary
 physical address, verified via a PMP test buffer before ever touching
 real screen memory - **done**, see `V3D_FillTest` below; (3) same fill
 targeting the real framestore at a real rectangle, verified visually -
-**done** (build-verified, not yet hardware-tested), see
-`V3D_ScreenFillTest` below; (4) claim `GraphicsV`, handle op 2 (fill)
-only, ECF-solid-only, behind an explicit opt-in (not auto-claimed on
+**done, hardware-verified**, see `V3D_ScreenFillTest` below; (4) claim
+`GraphicsV`, handle op 2 (fill) only, ECF-solid-only, behind an
+explicit opt-in (not auto-claimed on
 module load, given a silently wrong fill corrupts visible desktop
 state, which is worse than a crash) - next; (5) op 1 (copy),
 non-overlapping only, as a later pass.
@@ -1799,7 +1799,7 @@ tile's store. Still worth deliberate caution the first time step 3
 targets the real framestore (no padding to fall back on there), but
 this is real supporting evidence, not just an assumption.
 
-### Step 3: fill into the real screen framestore (2026-09-26, build-verified, not yet hardware-tested)
+### Step 3: fill into the real screen framestore (2026-09-26, hardware-verified)
 
 Same multi-tile fill as step 2, but targeting the real, live screen
 framestore instead of a synthetic PMP buffer - `V3D_ScreenFillTest`.
@@ -1921,4 +1921,23 @@ PRM's own text, not yet observed: the call only succeeds if the active
 driver indicates (via `GraphicsV 8`) that it has a *separate*
 framestore - if the Pi's driver doesn't, this fails with a clear,
 specific error (`R4` still nonzero on return) rather than silently
-trusting stale register contents. Not yet re-tested on hardware.
+trusting stale register contents.
+
+**Confirmed working on real hardware 2026-09-26**: `GraphicsV 9`
+answered correctly on the very first real attempt - the Pi's active
+display driver does report a separate framestore this way. Running
+`ScreenFillTest.bas` (150x100 rectangle at (400,300)) produced a
+solid, correctly-sized (3x2 tile grid, as expected for 150x100) purple
+rectangle that appeared near the top-left of the real desktop and
+stayed on screen (an empty background area, so nothing redrew over
+it). This confirms the whole step-3 chain end to end: `GraphicsV 9`'s
+reported physical address is correct, the multi-tile fill machinery
+(unchanged from step 2, just pointed at a different address) works
+identically against real screen memory as it did against a synthetic
+buffer, and V3D output is genuinely visible on the real display - not
+just readable back by the CPU. Useful data point for step 4: this
+driver's own row-0-at-`ScreenStart` convention places increasing `y`
+further from the top of the visible display (i.e. `ScreenStart` is
+the top of the screen in memory, not the bottom) - real evidence to
+reconcile against `GraphicsV`'s own bottom-left-origin convention when
+that work starts.
