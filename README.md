@@ -1175,19 +1175,26 @@ do - must not silently break the GPU. `BPOS`-clearing is kept (harmless,
 and matches the real driver unconditionally), even though it wasn't
 the actual fix. Not yet tested on hardware.
 
+**Hardware result, attempt 21 (2026-09-26) - CONFIRMED FIXED, and
+stress-tested.** `StressTest.bas` (50 iterations of `V3D_PowerOn` +
+`V3D_ClearTest` + `V3D_ClearToSprite`, exact readback checked every
+time, varying colour, no reboot) completed all 50 with no failures.
+This closes out the entire "second call always hangs" investigation
+(attempts 9-21): the fix holds under real repetition, not just a
+one-off pair of calls. `V3D_PowerOn` is now genuinely safe to call
+defensively as many times as real code likes, in addition to being
+required before the first submission.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done
 and hardware-verified. Not yet attempted:
 
-- **Robustness**: `V3D_ClearTest` has been confirmed working on a
-  freshly-loaded module; it hasn't been stress-tested across many
-  repeated calls in the same session the way the earlier bugs (page
-  reuse, restart timing) were found by exactly that kind of repetition.
-  Worth deliberately hammering it a few dozen times before trusting it.
-- Real IRQ handling instead of polling, once repeated-call robustness
-  is confirmed - the current bin/render waits are bounded busy-polls,
-  fine for a test SWI, not for a real driver.
+- ~~**Robustness**~~ - done: `StressTest.bas` confirmed 50 repeated
+  `V3D_PowerOn`/`V3D_ClearTest`/`V3D_ClearToSprite` calls in one session
+  with exact readback checks and no failures (attempt 21).
+- Real IRQ handling instead of polling - the current bin/render waits
+  are bounded busy-polls, fine for a test SWI, not for a real driver.
 - Eventually: actual shaders (the reference's rainbow-triangle QPU
   bytecode is a ready-made, proven starting point) rather than a
   fixed-function clear - this is real primitive rendering, not just a
