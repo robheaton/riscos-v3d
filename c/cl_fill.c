@@ -24,6 +24,13 @@
  * TileBinningModeCfg's own packet (cl_packets.h) - it carries no
  * supertile parameters at all, only frame width/height, so supertile
  * grouping is purely an RCL/render-side addressing detail.
+ *
+ * v3d_fill_test (step 2) and v3d_fill_screen (step 3) share a common
+ * core (run_fill) that builds and submits the control lists against
+ * whatever target physical address/stride it's given - step 2 points
+ * that at a freshly-allocated, padded PMP test buffer; step 3 points
+ * it directly at the real screen framestore (no PMP allocation for the
+ * render target at all - that memory already exists).
  */
 
 #include <stddef.h>
@@ -104,22 +111,28 @@ static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
     return timeout_err;
 }
 
-_kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
-                                 unsigned int width, unsigned int height,
-                                 unsigned int clear_color_rgba,
-                                 unsigned int *target_phys_out,
-                                 void **target_log_out,
-                                 unsigned int *target_stride_bytes_out,
-                                 unsigned int *tiles_x_out,
-                                 unsigned int *tiles_y_out)
+/*
+ * Shared core: builds and submits a multi-tile clear+store control
+ * list targeting `target_phys`/`target_stride` directly (the caller
+ * decides whether that's a PMP test buffer or the real framestore),
+ * using PMP pages starting at `base_page` for the CL/tile_alloc/
+ * tile_state scratch buffers only - never for the render target
+ * itself. Returns *tiles_x_out / *tiles_y_out (diagnostic) on success.
+ */
+static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
+                                   unsigned int width, unsigned int height,
+                                   unsigned int clear_color_rgba,
+                                   unsigned int target_phys,
+                                   unsigned int target_stride,
+                                   unsigned int *tiles_x_out,
+                                   unsigned int *tiles_y_out)
 {
     unsigned int tiles_x, tiles_y, n_tiles;
     unsigned int tile_alloc_bytes, tile_state_bytes, rcl_bytes;
     unsigned int tile_alloc_pages, tile_state_pages, rcl_pages;
-    unsigned int padded_w, padded_h, stride, render_bytes, render_pages;
     unsigned int supertile_w, supertile_h, frame_w_supertile, frame_h_supertile;
-    unsigned int cl_phys, render_phys, tile_alloc_phys, tile_state_phys, rcl_phys;
-    void *cl_log, *render_log, *tile_alloc_log, *tile_state_log, *rcl_log_ptr;
+    unsigned int cl_phys, tile_alloc_phys, tile_state_phys, rcl_phys;
+    void *cl_log, *tile_alloc_log, *tile_state_log, *rcl_log_ptr;
     _kernel_oserror *err;
     cl_buf_t bcl, rcl;
     unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
@@ -131,7 +144,7 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: V3D_FillTest width/height must be non-zero"
+            10, "V3DDriver: fill width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -139,16 +152,6 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
     tiles_x = div_round_up(width, TILE_SIZE);
     tiles_y = div_round_up(height, TILE_SIZE);
     n_tiles = tiles_x * tiles_y;
-
-    /* Padded to a whole tile grid, not just width x height - see
-     * cl_fill.h's own comment for why (a partial edge tile's full-tile
-     * store writing past the declared frame is an open question this
-     * test buffer sidesteps rather than assumes an answer to). */
-    padded_w = tiles_x * TILE_SIZE;
-    padded_h = tiles_y * TILE_SIZE;
-    stride = padded_w * 4u;
-    render_bytes = stride * padded_h;
-    render_pages = bytes_to_pages(render_bytes);
 
     /* tile_alloc: align(N*64,4096) + 64*64*2 - transcribed verbatim
      * from gl_rainbow_triangle.cpp (see cl_fill.h's top comment); the
@@ -177,22 +180,16 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
 
     /* pmp_alloc caps a single call at 64 pages (MAX_PAGES_PER_CALL in
      * phys_buffer.c - a fixed-size stack array, not a real hardware
-     * limit). That only bounds how big a rectangle THIS TEST HARNESS
-     * can exercise via a synthetic PMP render-target buffer - it does
-     * not bound the real GraphicsV feature (step 3 writes directly
-     * into the already-existing screen framestore, no PMP allocation
-     * for the render target at all; tile_alloc/tile_state/rcl stay
-     * comfortably under 64 pages even at full 1920x1080 - 32/3/5 pages
-     * respectively). Caught here with a clear, specific error rather
-     * than letting pmp_alloc's generic "invalid page count" surface
-     * for what's actually just "pick a smaller test rectangle". */
-    if (render_pages > 64u || tile_alloc_pages > 64u ||
-        tile_state_pages > 64u || rcl_pages > 64u)
+     * limit). tile_alloc/tile_state/rcl stay comfortably under that
+     * even at full 1920x1080 (32/3/5 pages respectively) - this only
+     * ever bites the CALLER if it also PMP-allocates a huge render
+     * buffer (v3d_fill_test's synthetic-buffer case), not here. */
+    if (tile_alloc_pages > 64u || tile_state_pages > 64u || rcl_pages > 64u)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_FillTest rectangle too large for this test "
-                "harness (pmp_alloc's 64-page/call cap) - try a smaller "
-                "width/height. Not a limit of the fill algorithm itself."
+            14, "V3DDriver: fill rectangle too large - tile_alloc/"
+                "tile_state/RCL scratch buffers exceed pmp_alloc's "
+                "64-page/call cap"
         };
         return &err_too_big;
     }
@@ -204,10 +201,6 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
     err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
     if (err) return err;
     page += rcl_pages;
-
-    err = pmp_alloc(pmp, page, render_pages, &render_phys, &render_log);
-    if (err) return err;
-    page += render_pages;
 
     err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
     if (err) return err;
@@ -282,27 +275,23 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
         for (col = 0; col < tiles_x; col++)
         {
             /*
-             * FIX (2026-09-26, hardware-diagnosed): this used to be
-             * render_phys + row*TILE_SIZE*stride + col*TILE_SIZE*4 -
-             * manually computing each tile's destination address. Real
-             * hardware testing (a 4x3-tile fill) showed only tiles at
-             * even multiples of 512 bytes came out correct (0, 512,
-             * 65536, ...) while odd multiples (256, 768) read back
-             * untouched leftover memory - a pattern that only makes
-             * sense if the CLE ALSO derives the column offset from the
-             * current TileCoordinates internally and adds it to
-             * whatever "addr" is given, so a manually-added column
-             * offset was compounding with the hardware's own. This
-             * matches the reference's own actual usage in
-             * gl_rainbow_triangle.cpp - its single, shared store command
-             * (inside the generic/indirect tile list, run once per tile
-             * via implicit tile-coordinate iteration) always passes the
-             * plain, un-offset render_target.paddr(), every time,
-             * regardless of which tile is currently selected. Passing
-             * the same base address here for every tile - trusting the
-             * CLE to add the per-tile offset itself from the preceding
-             * TileCoordinates command - is the same fix, just with
-             * TileCoordinates set explicitly instead of implicitly.
+             * FIX (2026-09-26, hardware-diagnosed): this used to add a
+             * manual row*TILE_SIZE*stride + col*TILE_SIZE*4 offset to
+             * target_phys per tile. Real hardware testing (a 4x3-tile
+             * fill) showed only tiles at even multiples of 512 bytes
+             * came out correct while odd multiples read back untouched
+             * leftover memory - a pattern that only makes sense if the
+             * CLE ALSO derives the column offset from the current
+             * TileCoordinates internally and adds it to whatever "addr"
+             * is given, so a manually-added offset was compounding with
+             * the hardware's own. Matches the reference's own actual
+             * usage in gl_rainbow_triangle.cpp - its single, shared
+             * store command always passes the plain, un-offset
+             * render_target.paddr(), every time, regardless of which
+             * tile is selected. Passing the same base address here for
+             * every tile - trusting the CLE to add the per-tile offset
+             * itself - is the same fix, just with TileCoordinates set
+             * explicitly instead of implicitly.
              */
             emit_tile_coordinates(&rcl, col, row);
             emit_end_of_loads(&rcl);
@@ -314,7 +303,7 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
              * own comment (same reference source) at the equivalent point */
             emit_tile_coordinates(&rcl, col, row);
             emit_end_of_loads(&rcl);
-            emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, stride, render_phys);
+            emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, target_stride, target_phys);
             emit_end_of_tile_marker(&rcl);
         }
     }
@@ -340,7 +329,7 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
 
     {
         static _kernel_oserror err_bin_timeout = {
-            11, "V3DDriver: V3D_FillTest timed out waiting for binning"
+            11, "V3DDriver: fill timed out waiting for binning"
         };
         err = wait_for_irq(&g_v3d_irq_bin_done_count, last_bin_irq, &err_bin_timeout);
         if (err) return err;
@@ -360,16 +349,93 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
 
     {
         static _kernel_oserror err_render_timeout = {
-            12, "V3DDriver: V3D_FillTest timed out waiting for rendering"
+            12, "V3DDriver: fill timed out waiting for rendering"
         };
         err = wait_for_irq(&g_v3d_irq_render_done_count, last_render_irq, &err_render_timeout);
         if (err) return err;
     }
 
-    *target_phys_out = render_phys;
-    *target_log_out = render_log;
-    *target_stride_bytes_out = stride;
     *tiles_x_out = tiles_x;
     *tiles_y_out = tiles_y;
     return NULL;
+}
+
+_kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
+                                 unsigned int width, unsigned int height,
+                                 unsigned int clear_color_rgba,
+                                 unsigned int *target_phys_out,
+                                 void **target_log_out,
+                                 unsigned int *target_stride_bytes_out,
+                                 unsigned int *tiles_x_out,
+                                 unsigned int *tiles_y_out)
+{
+    unsigned int tiles_x, tiles_y, padded_w, padded_h, stride, render_bytes, render_pages;
+    unsigned int render_phys;
+    void *render_log;
+    _kernel_oserror *err;
+
+    if (width == 0u || height == 0u)
+    {
+        static _kernel_oserror err_bad_size = {
+            10, "V3DDriver: V3D_FillTest width/height must be non-zero"
+        };
+        return &err_bad_size;
+    }
+
+    tiles_x = div_round_up(width, TILE_SIZE);
+    tiles_y = div_round_up(height, TILE_SIZE);
+
+    /* Padded to a whole tile grid, not just width x height - see
+     * cl_fill.h's own comment for why (a partial edge tile's full-tile
+     * store writing past the declared frame was an open question this
+     * test buffer sidesteps rather than assumed an answer to - now
+     * settled by hardware testing, see README, but the padding is kept
+     * here as a harmless safety margin for this synthetic buffer). */
+    padded_w = tiles_x * TILE_SIZE;
+    padded_h = tiles_y * TILE_SIZE;
+    stride = padded_w * 4u;
+    render_bytes = stride * padded_h;
+    render_pages = bytes_to_pages(render_bytes);
+
+    /* Same 64-page/call cap discussed in run_fill - this one specifically
+     * bounds how big a rectangle THIS TEST HARNESS can exercise via its
+     * synthetic PMP render buffer (a full 1920x1088 padded buffer alone
+     * is ~2040 pages). Does not bound the real feature (v3d_fill_screen
+     * never PMP-allocates a render target at all). */
+    if (render_pages > 64u)
+    {
+        static _kernel_oserror err_too_big = {
+            14, "V3DDriver: V3D_FillTest rectangle too large for this test "
+                "harness (pmp_alloc's 64-page/call cap) - try a smaller "
+                "width/height. Not a limit of the fill algorithm itself."
+        };
+        return &err_too_big;
+    }
+
+    err = pmp_alloc(pmp, base_page, render_pages, &render_phys, &render_log);
+    if (err) return err;
+
+    err = run_fill(pmp, base_page + render_pages, width, height, clear_color_rgba,
+                    render_phys, stride, tiles_x_out, tiles_y_out);
+    if (err) return err;
+
+    *target_phys_out = render_phys;
+    *target_log_out = render_log;
+    *target_stride_bytes_out = stride;
+    return NULL;
+}
+
+_kernel_oserror *v3d_fill_screen(pmp_area_t *pmp, unsigned int base_page,
+                                   unsigned int x, unsigned int y,
+                                   unsigned int width, unsigned int height,
+                                   unsigned int clear_color_rgba,
+                                   unsigned int screen_phys_base,
+                                   unsigned int screen_stride,
+                                   unsigned int *tiles_x_out,
+                                   unsigned int *tiles_y_out)
+{
+    unsigned int target_phys = screen_phys_base + y * screen_stride + x * 4u;
+
+    return run_fill(pmp, base_page, width, height, clear_color_rgba,
+                     target_phys, screen_stride, tiles_x_out, tiles_y_out);
 }

@@ -124,6 +124,53 @@ static _kernel_oserror *ensure_pmp_fill(void)
     return NULL;
 }
 
+/* Well clear of V3D_FillTest's own PMP usage in g_pmp_fill (which can
+ * use up to ~2040 pages for a full-screen-sized synthetic render
+ * buffer) - V3D_ScreenFillTest only ever needs scratch space (CL/
+ * tile_alloc/tile_state), up to ~41 pages even at full 1920x1080, so
+ * this leaves generous headroom either way. */
+#define SCREEN_FILL_BASE_PAGE 3000u
+
+/*
+ * Step 3 of the planned GraphicsV Render accelerator: caches the
+ * screen's confirmed physical framestore base (see
+ * v3d_verify_framestore_contiguous's own comment for why this is
+ * checked for real, not assumed) plus the mode info needed to target
+ * it, computed once and reused - re-verifying contiguity across the
+ * whole screen on every single fill call would be wasteful, and the
+ * mode isn't expected to change without a module reload anyway.
+ */
+static int g_screen_framestore_verified = 0;
+static v3d_screen_info_t g_screen_info;
+static unsigned int g_screen_phys_base = 0;
+
+static _kernel_oserror *ensure_screen_framestore(void)
+{
+    _kernel_oserror *err;
+
+    if (g_screen_framestore_verified)
+        return NULL;
+
+    err = v3d_read_screen_info(&g_screen_info);
+    if (err)
+        return err;
+
+    if (g_screen_info.log2_bpp != 5u)
+    {
+        static _kernel_oserror err_bad_bpp = {
+            16, "V3DDriver: V3D_ScreenFillTest only supports 32bpp modes"
+        };
+        return &err_bad_bpp;
+    }
+
+    err = v3d_verify_framestore_contiguous(&g_screen_info, &g_screen_phys_base);
+    if (err)
+        return err;
+
+    g_screen_framestore_verified = 1;
+    return NULL;
+}
+
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
  * reference (pm.cpp) - direct PM_GRAFX reset deassert + ASB master/slave
@@ -369,6 +416,7 @@ enum
     SWI_V3D_IRQTest = 7,
     SWI_V3D_ScreenInfo = 8,
     SWI_V3D_FillTest = 9,
+    SWI_V3D_ScreenFillTest = 10,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -639,6 +687,67 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[2] = tiles_x;
             r->r[3] = tiles_y;
             r->r[4] = (unsigned int) target_log;
+            return NULL;
+        }
+
+        case SWI_V3D_ScreenFillTest:
+        {
+            /* Step 3 of the planned GraphicsV Render accelerator - see
+             * README.md and cl_fill.c's v3d_fill_screen. R0=x, R1=y,
+             * R2=width, R3=height, R4=colour in. Writes DIRECTLY into
+             * the real, live screen framestore - unlike every other
+             * test SWI in this module, this one has a visible effect
+             * on the real desktop the moment it succeeds (the Wimp may
+             * also immediately redraw over it - that's expected, not a
+             * bug, see README). Returns tiles_x (R0), tiles_y (R1). */
+            unsigned int x = (unsigned int) r->r[0];
+            unsigned int y = (unsigned int) r->r[1];
+            unsigned int width = (unsigned int) r->r[2];
+            unsigned int height = (unsigned int) r->r[3];
+            unsigned int colour = (unsigned int) r->r[4];
+            unsigned int tiles_x, tiles_y;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    17, "V3DDriver: V3D_ScreenFillTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_screen_framestore();
+            if (err)
+                return err;
+
+            if (width == 0u || height == 0u ||
+                x + width > g_screen_info.xwind_limit + 1u ||
+                y + height > g_screen_info.ywind_limit + 1u)
+            {
+                static _kernel_oserror err_out_of_bounds = {
+                    18, "V3DDriver: V3D_ScreenFillTest rectangle is outside "
+                        "the current screen mode's bounds"
+                };
+                return &err_out_of_bounds;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                                    x, y, width, height, colour,
+                                    g_screen_phys_base, g_screen_info.line_length,
+                                    &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = tiles_x;
+            r->r[1] = tiles_y;
             return NULL;
         }
 

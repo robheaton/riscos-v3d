@@ -54,4 +54,37 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
                                  unsigned int *tiles_x_out,
                                  unsigned int *tiles_y_out);
 
+/*
+ * Step 3: same multi-tile fill, but targeting the real screen
+ * framestore directly - no PMP allocation for the render target at
+ * all (that memory already exists; only the CL/tile_alloc/tile_state
+ * scratch buffers still come from `pmp`, starting at `base_page`).
+ *
+ * (x, y) is the rectangle's origin and `screen_phys_base`/
+ * `screen_stride` describe the framestore, all in the caller's own
+ * convention - THIS FUNCTION DOES NOT KNOW OR CARE about GraphicsV's
+ * bottom-left-origin Cartesian coordinate convention (see GraphicsV 13
+ * 2's parameter block doc). Reconciling row 0 in memory (whatever's at
+ * `screen_phys_base`) with "top" or "bottom" of the visible display,
+ * and with GraphicsV's own (x,y) convention, is deliberately deferred
+ * to step 4 (claiming the vector) - this step only proves "can this
+ * driver write a correctly-shaped, correctly-clipped rectangle
+ * directly into real screen memory and have it appear on the real
+ * display", which needs none of that yet.
+ *
+ * Callers MUST have already confirmed the framestore is physically
+ * contiguous across the full rectangle (see screen_info.h's
+ * v3d_verify_framestore_contiguous) - this function does not check
+ * that itself, since re-checking per call would be wasteful once the
+ * whole screen has already been verified once.
+ */
+_kernel_oserror *v3d_fill_screen(pmp_area_t *pmp, unsigned int base_page,
+                                   unsigned int x, unsigned int y,
+                                   unsigned int width, unsigned int height,
+                                   unsigned int clear_color_rgba,
+                                   unsigned int screen_phys_base,
+                                   unsigned int screen_stride,
+                                   unsigned int *tiles_x_out,
+                                   unsigned int *tiles_y_out);
+
 #endif /* CL_FILL_H */
