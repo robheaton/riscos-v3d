@@ -14,7 +14,7 @@
 ; request a real allocation via !Allocate to allocate@riscosopen.org.
 
 title-string:            V3DDriver
-help-string:              V3DDriver 0.01 (M0-M2 complete, M3 in progress, not for release)
+help-string:              V3DDriver 0.01 (M0-M2 complete, firmware clock-gate fix confirmed, M3 resuming, not for release)
 initialisation-code:      module_init
 finalisation-code:        module_final
 swi-chunk-base-number:    0xC0040

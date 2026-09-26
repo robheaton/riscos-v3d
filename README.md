@@ -1,4 +1,4 @@
-# V3DDriver — M0-M2 complete: real GPU-drawn pixels, hardware-verified
+# V3DDriver — M0-M2 complete, GPU clear reliable again: real GPU-drawn pixels, hardware-verified
 
 An independent RISC OS module driving the Raspberry Pi 4/CM4's
 VideoCore VI (V3D) GPU directly at the register level. As of
@@ -907,6 +907,19 @@ confirmed running clock rate in R1. Not yet tested on hardware - if
 this is right, `V3D_ClearTest` should now succeed on the very first
 call after `V3D_PowerOn`, on this exact board, without touching
 anything else.
+
+**Hardware result, attempt 13 (2026-09-26) - CONFIRMED FIXED.** Fresh
+reboot, `V3D_PowerOn` (returned `ok=1 rate=250000000`), then
+`V3D_ClearTest &DEADBEEF` straight after with nothing else run first:
+`phys=0x0304A000 readback=DEADBEEF` - exact match. This closes out the
+entire hang investigation that ran across attempts 1-13: the root
+cause was never address ranges, session history, control-list content,
+or the restart/recovery logic added and iterated on along the way - it
+was a firmware clock gate that this driver had simply never asked the
+firmware to open, present from the very first hardware test and
+intermittent only in the sense that whatever state the firmware
+happened to leave that clock in varied across boots/sessions. M3
+(sprite display) can now resume on solid ground.
 
 ## Testing on hardware
 
