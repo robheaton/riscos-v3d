@@ -118,12 +118,12 @@ static int g_pmp_fill_created = 0;
  * `block_index * PMP_FILL_BLOCK_PAGES`), rather than requiring hand-
  * checked arithmetic against each path's own precise worst-case need.
  *
- * PMP_FILL_BLOCK_PAGES=8192 (32MB) was picked as roughly double the
+ * PMP_FILL_BLOCK_PAGES=4608 was picked to comfortably exceed the
  * single biggest worst-case need of any one path (~4137 pages - two
  * PMP_MAX_PAGES_PER_CALL-sized buffers plus a small scratch, e.g.
  * V3D_CopyTest's source+dest or V3D_OverlapCopyTest's bounding buffer
- * + its own scratch-buffer pass), leaving comfortable headroom without
- * needing to size each block individually.
+ * + its own scratch-buffer pass) with ~470 pages of real margin,
+ * without needing to size each block individually.
  *
  * RAISED (2026-09-26, alongside PMP_MAX_PAGES_PER_CALL): before this,
  * SCREEN_COPY_BASE_PAGE hosted BOTH the tiny direct-copy scratch
@@ -132,8 +132,24 @@ static int g_pmp_fill_created = 0;
  * pages later - found by inspection while raising that cap, before it
  * became a real hardware bug. This uniform-block scheme is deliberately
  * harder to get subtly wrong the same way again.
+ *
+ * SHRUNK BACK DOWN (2026-09-26, hardware-diagnosed): an initial version
+ * used 8192-page blocks (49152 total) - real hardware testing then hit
+ * "Bad page number" on every call using OVERLAP_COPY_TEST_BASE_PAGE
+ * (32768 = 2^15) and every base after it, while every base below that
+ * kept working (fills and direct copies both stayed at 100% success in
+ * the same test run). Never confirmed which of two real explanations
+ * is the actual cause - a 16-bit-signed-style internal limit on PMP
+ * page indices, or OS_DynamicArea 0 silently clamping the requested
+ * max_pages below what was asked for (pmp_create's own comment already
+ * flags that `out->max_pages` can differ from the request; this driver
+ * never actually checked it) - because the fix is the same either way:
+ * stay comfortably under 32768 total. This shrink does that (6*4608 =
+ * 27648) using each path's own real worst-case need instead of a
+ * padded "roughly double" guess, rather than just picking a smaller
+ * arbitrary number.
  */
-#define PMP_FILL_BLOCK_PAGES 8192u
+#define PMP_FILL_BLOCK_PAGES 4608u
 #define PMP_FILL_BLOCK_COUNT 6u
 
 static _kernel_oserror *ensure_pmp_fill(void)
