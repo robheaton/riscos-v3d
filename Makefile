@@ -32,7 +32,7 @@ c/module.o: c/module.c c/v3d_regs.h c/io_map.h c/phys_buffer.h c/cl_clear.h c/me
 c/phys_buffer.o: c/phys_buffer.c c/phys_buffer.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/phys_buffer.c -o c/phys_buffer.o
 
-c/cl_clear.o: c/cl_clear.c c/cl_clear.h c/cl_builder.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/sprite.h
+c/cl_clear.o: c/cl_clear.c c/cl_clear.h c/cl_builder.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/sprite.h c/v3d_irq.h
 	$(CC) $(CFLAGS) -c c/cl_clear.c -o c/cl_clear.o
 
 c/sprite.o: c/sprite.c c/sprite.h
@@ -47,7 +47,7 @@ c/memsplit.o: c/memsplit.c c/memsplit.h c/bcmsupport.h
 c/v3d_clock.o: c/v3d_clock.c c/v3d_clock.h c/bcmsupport.h
 	$(CC) $(CFLAGS) -c c/v3d_clock.c -o c/v3d_clock.o
 
-c/v3d_irq.o: c/v3d_irq.c c/v3d_irq.h cmhg/V3DDriver.h
+c/v3d_irq.o: c/v3d_irq.c c/v3d_irq.h c/io_map.h c/v3d_regs.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/v3d_irq.c -o c/v3d_irq.o
 
 V3DDriver,ffa: $(OBJS)

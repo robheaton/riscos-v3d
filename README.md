@@ -1282,6 +1282,27 @@ confirmed working. Stage 2b next: unmask `V3D_CTL_INT_MSK_CLR` and wire
 real bin/render completion to it - the step where a genuine hardware
 interrupt fires for the first time.
 
+**Stage 2b (this commit)**: turns the interrupt on, but as a hybrid,
+not a full swap. `v3d_irq_ensure_ready()` (lazy, idempotent, called
+from `V3D_ClearTest`/`V3D_ClearToSprite` alongside the existing
+`ensure_pmp()`) claims the vector, resolves `HAL_IRQClear`, unmasks
+`V3D_CTL_INT_MSK_CLR` for `FLDONE`/`FRDONE` (mask everything first,
+then selectively unmask - matches the real Linux v3d driver's own
+`v3d_irq_enable()` pattern, not guessed), and calls `HAL_IRQEnable`.
+The handler now tracks separate `g_v3d_irq_bin_done_count`/
+`g_v3d_irq_render_done_count`. Deliberately **not** the only way
+completion is detected yet: `v3d_poll_counter()` now checks both the
+IRQ-driven counter and the original `BFC`/`RFC` register in the same
+loop, either one satisfying it - so if anything about the interrupt
+path is subtly wrong, reliability doesn't regress, it just falls back
+to exactly what already worked, while still being observable whether
+the interrupt fired correctly. `V3D_ClearTest` now also reports (`R2`/
+`R3`) how many times *this specific call's* completion was actually
+seen by the interrupt handler - temporary, stage-2b-only
+observability, to be removed once trust is established and the
+register-polling half can be dropped entirely. Not yet tested on
+hardware.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

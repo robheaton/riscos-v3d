@@ -45,6 +45,7 @@
 #include "v3d_regs.h"
 #include "io_map.h"
 #include "sprite.h"
+#include "v3d_irq.h"
 
 #define CL_PAGE_COUNT           1u  /* BCL+RCL combined, both tiny */
 #define RENDER_TARGET_PAGE_COUNT 4u /* 64*64*4 bytes = 16384 = 4 pages */
@@ -590,7 +591,20 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     out_err->errmess[pos] = '\0';
 }
 
+/*
+ * `irq_counter`/`irq_initial`: the real interrupt handler (v3d_irq.c)
+ * now maintains its own bin/render-done counters independently of
+ * this register poll - either signal satisfies this function
+ * (register changing, or the IRQ counter advancing past its captured
+ * "before" value), so a subtly-wrong interrupt path can't regress
+ * reliability, it just falls back to exactly what already worked,
+ * while still being observable whether the interrupt fired correctly.
+ * Once that's confirmed reliable on hardware, a later change can drop
+ * the register half and poll only the counter.
+ */
 static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
+                                          volatile unsigned int *irq_counter,
+                                          unsigned int irq_initial,
                                           _kernel_oserror *timeout_err,
                                           const char *what, int is_bin,
                                           unsigned int qba, unsigned int qea,
@@ -602,13 +616,23 @@ static _kernel_oserror *v3d_poll_counter(unsigned int reg, unsigned int initial,
     {
         io_mapping_t v3d;
         unsigned int burst;
-        _kernel_oserror *err = io_map(V3D_MB_BASE, &v3d);
+        _kernel_oserror *err;
+
+        if (*irq_counter != irq_initial)
+            return NULL;
+
+        err = io_map(V3D_MB_BASE, &v3d);
         if (err)
             return err;
 
         for (burst = 0; burst < 10000u; burst++)
         {
             if ((IO_WORD(v3d, reg) & 0xFFu) != initial)
+            {
+                io_unmap(&v3d);
+                return NULL;
+            }
+            if (*irq_counter != irq_initial)
             {
                 io_unmap(&v3d);
                 return NULL;
@@ -648,6 +672,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     unsigned int pixel_phys;
     io_mapping_t v3d;
     unsigned int last_bfc, last_rfc;
+    unsigned int last_bin_irq, last_render_irq;
     unsigned int page = base_page;
     diag_bufs_t diag_bufs;
 
@@ -780,6 +805,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
 
     v3d_flush_caches(&v3d);
     last_bfc = IO_WORD(v3d, V3D_CLE_BFC) & 0xFFu;
+    last_bin_irq = g_v3d_irq_bin_done_count;
 
     /* Matches the real Linux v3d driver's v3d_bin_job_run() exactly -
      * see the removed-code comment above. No CS/CA read, no restart
@@ -794,7 +820,9 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
 
     {
         static _kernel_oserror err_bin_timeout = { 7, "" };
-        err = v3d_poll_counter(V3D_CLE_BFC, last_bfc, &err_bin_timeout,
+        err = v3d_poll_counter(V3D_CLE_BFC, last_bfc,
+                                &g_v3d_irq_bin_done_count, last_bin_irq,
+                                &err_bin_timeout,
                                 "BFC (binning)", 1, bcl_start, bcl_end,
                                 &diag_bufs);
         if (err)
@@ -807,6 +835,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
 
     v3d_flush_caches(&v3d);
     last_rfc = IO_WORD(v3d, V3D_CLE_RFC) & 0xFFu;
+    last_render_irq = g_v3d_irq_render_done_count;
 
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering - see thread 0's comment */
@@ -815,7 +844,9 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
 
     {
         static _kernel_oserror err_render_timeout = { 8, "" };
-        err = v3d_poll_counter(V3D_CLE_RFC, last_rfc, &err_render_timeout,
+        err = v3d_poll_counter(V3D_CLE_RFC, last_rfc,
+                                &g_v3d_irq_render_done_count, last_render_irq,
+                                &err_render_timeout,
                                 "RFC (render)", 0, rcl_start, rcl_end,
                                 &diag_bufs);
         if (err)

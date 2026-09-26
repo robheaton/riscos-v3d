@@ -35,6 +35,31 @@
  *     if FLDONE/FRDONE is set acknowledge it (V3D_CTL_INT_CLR +
  *     HAL_IRQClear) and claim; otherwise pass on untouched.
  *
+ * Stage 2b (this version): actually turns the interrupt on.
+ * v3d_irq_ensure_ready() is the one entry point real submission code
+ * calls (lazily, idempotent, mirrors module.c's ensure_pmp() pattern)
+ * - claims the vector, resolves HAL_IRQClear, and unmasks
+ * V3D_CTL_INT_MSK_CLR for FLDONE|FRDONE (mask everything first, then
+ * selectively unmask, matching the real Linux v3d driver's own
+ * v3d_irq_enable() pattern - not guessed). The handler now tracks
+ * separate g_v3d_irq_bin_done_count/g_v3d_irq_render_done_count so
+ * waiting code can tell bin and render completion apart, matching what
+ * the existing BFC/RFC register polling already distinguishes.
+ *
+ * Deliberately NOT yet the only way completion is detected:
+ * cl_clear.c's v3d_poll_counter() now checks both the IRQ-driven
+ * counter and the original BFC/RFC register in the same loop, either
+ * one satisfying it - so if anything about the interrupt path is
+ * subtly wrong, behaviour doesn't regress, it just falls back to
+ * exactly what already worked, while still being observable whether
+ * the interrupt fired correctly. Removing the register-based half
+ * entirely is a later step, once that's been confirmed reliable.
+ *
+ * V3D_IRQTest remains a self-contained, isolated diagnostic (its own
+ * claim/test/release cycle) - it must not be run after real submission
+ * code has called v3d_irq_ensure_ready(), since its release() would
+ * tear down the permanent registration submission code now depends on.
+ *
  * Device number 10 = iDev_GPU_VC3D. Not available through any
  * documented enumeration API (RiscOSOpen's own "List of HAL devices"
  * page lists only Video/Audio/SysPeri/Comms/ExpCtl/HID categories -
@@ -65,6 +90,8 @@
  * 2b actually unmasks a V3D interrupt bit. */
 extern volatile unsigned int g_v3d_irq_claimed_count;
 extern volatile unsigned int g_v3d_irq_spurious_count;
+extern volatile unsigned int g_v3d_irq_bin_done_count;
+extern volatile unsigned int g_v3d_irq_render_done_count;
 
 _kernel_oserror *v3d_irq_claim(void);
 _kernel_oserror *v3d_irq_release(void);
@@ -88,5 +115,14 @@ _kernel_oserror *v3d_irq_resolve_clear(void);
  * interrupt. v3d_irq_resolve_clear() must have been called first.
  */
 _kernel_oserror *v3d_irq_test_call_clear(void);
+
+/*
+ * Idempotent - claims the vector, resolves HAL_IRQClear, and unmasks
+ * FLDONE|FRDONE, all exactly once no matter how many times called.
+ * Real submission code must call this (lazily, before its first real
+ * job) before g_v3d_irq_bin_done_count/g_v3d_irq_render_done_count
+ * mean anything.
+ */
+_kernel_oserror *v3d_irq_ensure_ready(void);
 
 #endif

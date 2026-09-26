@@ -25,11 +25,14 @@
 
 volatile unsigned int g_v3d_irq_claimed_count = 0;
 volatile unsigned int g_v3d_irq_spurious_count = 0;
+volatile unsigned int g_v3d_irq_bin_done_count = 0;
+volatile unsigned int g_v3d_irq_render_done_count = 0;
 
 static void *g_hal_irqclear_addr = NULL;
 static unsigned int g_hal_irqclear_sb = 0;
 static io_mapping_t g_v3d_permanent_mapping;
 static int g_v3d_permanent_mapped = 0;
+static int g_v3d_irq_ready = 0;
 
 /*
  * Raw call to a resolved HAL routine: sets R9 (sb) to the static-base
@@ -98,6 +101,8 @@ int v3d_irq_handler(_kernel_swi_regs *r, void *pw)
          * clear, matches the real Linux v3d driver's own IRQ handler. */
         IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_CLR) = sts;
         v3d_irq_call_clear();
+        if (sts & V3D_INT_FLDONE) g_v3d_irq_bin_done_count++;
+        if (sts & V3D_INT_FRDONE) g_v3d_irq_render_done_count++;
         g_v3d_irq_claimed_count++;
         return 0; /* VECTOR_CLAIM */
     }
@@ -192,5 +197,55 @@ _kernel_oserror *v3d_irq_test_call_clear(void)
     }
 
     v3d_irq_call_clear();
+    return NULL;
+}
+
+/*
+ * Mask everything off, then selectively unmask FLDONE|FRDONE - matches
+ * the real Linux v3d driver's own v3d_irq_enable() pattern
+ * (drivers/gpu/drm/v3d/v3d_irq.c: V3D_CORE_WRITE(INT_MSK_SET,
+ * ~V3D_CORE_IRQS) then V3D_CORE_WRITE(INT_MSK_CLR, V3D_CORE_IRQS)),
+ * not guessed. Requires the permanent mapping to already exist.
+ */
+static _kernel_oserror *v3d_irq_unmask(void)
+{
+    if (!g_v3d_permanent_mapped)
+    {
+        static _kernel_oserror err_not_mapped = {
+            2, "V3DDriver: v3d_irq_unmask called before registers mapped"
+        };
+        return &err_not_mapped;
+    }
+
+    IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
+    IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_CLR) =
+        (V3D_INT_FLDONE | V3D_INT_FRDONE);
+    return NULL;
+}
+
+_kernel_oserror *v3d_irq_ensure_ready(void)
+{
+    _kernel_oserror *err;
+
+    if (g_v3d_irq_ready)
+        return NULL;
+
+    err = v3d_irq_claim();
+    if (err)
+        return err;
+
+    err = v3d_irq_resolve_clear();
+    if (err)
+        return err;
+
+    err = v3d_irq_unmask();
+    if (err)
+        return err;
+
+    err = v3d_irq_hal_enable();
+    if (err)
+        return err;
+
+    g_v3d_irq_ready = 1;
     return NULL;
 }

@@ -332,6 +332,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
         case SWI_V3D_ClearTest:
         {
             unsigned int phys_addr, readback;
+            unsigned int bin_irq_before, render_irq_before;
             _kernel_oserror *err;
 
             if (!g_powered_on)
@@ -346,6 +347,17 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            /* Captured before submission so R2/R3 report whether *this*
+             * call's completion was actually seen by the interrupt
+             * handler, not just cumulative totals from earlier calls -
+             * temporary, stage-2b-only observability (see v3d_irq.h). */
+            bin_irq_before = g_v3d_irq_bin_done_count;
+            render_irq_before = g_v3d_irq_render_done_count;
+
             err = v3d_clear_test(&g_pmp, CLEAR_TEST_BASE_PAGE, r->r[0],
                                   &phys_addr, &readback);
             if (err)
@@ -353,6 +365,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
             r->r[0] = phys_addr;
             r->r[1] = readback;
+            r->r[2] = g_v3d_irq_bin_done_count - bin_irq_before;
+            r->r[3] = g_v3d_irq_render_done_count - render_irq_before;
             return NULL;
         }
 
@@ -371,6 +385,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             }
 
             err = ensure_pmp();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
             if (err)
                 return err;
 
