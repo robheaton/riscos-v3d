@@ -607,15 +607,14 @@ static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
 /* ---------------------------------------------------------------- */
 
 /*
- * Case-insensitive substring search for "NOAUTOSTART" in the module's
+ * Case-insensitive substring search for a fixed word in the module's
  * own *RMLoad command tail - deliberately not using strstr/strcasestr
  * (avoids depending on anything from string.h this codebase doesn't
  * already use elsewhere) and deliberately simple: this only needs to
- * recognise one fixed word, not general command-line parsing.
+ * recognise one fixed word at a time, not general command-line parsing.
  */
-static int cmd_tail_has_noautostart(const char *cmd_tail)
+static int cmd_tail_has_word(const char *cmd_tail, const char *target)
 {
-    static const char target[] = "NOAUTOSTART";
     unsigned int i;
 
     if (!cmd_tail)
@@ -651,32 +650,45 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
     g_powered_on = 0;
 
     /*
-     * Auto-start: claims GraphicsV immediately on load, same as a
-     * manual V3D_AccelStart, unless the module was loaded with
-     * "NoAutoStart" on its command tail (*RMLoad V3DDriver NoAutoStart)
-     * - a safety valve for testing/isolating this module given its
-     * history of real bugs only surfacing under live desktop traffic
-     * (see README's "GraphicsV Render accelerator" section), and given
-     * this compounds the still-unresolved reload-without-reboot
-     * freeze (a THIRD system vector's claim state to reason about on
-     * unload, on top of the IRQ vector and GraphicsV itself).
+     * SAFETY ROLLBACK (2026-09-27): auto-start (claiming GraphicsV
+     * unconditionally on load) is DISABLED BY DEFAULT again, pending
+     * investigation of a real, 100%-reproducible hard machine freeze
+     * (only the mouse cursor still moves; everything else needs a
+     * power cycle) triggered by simply opening Task Manager with
+     * acceleration active - confirmed on a FRESH boot, first load, no
+     * reload involved (a different, more serious bug than the existing
+     * reload-without-reboot freeze documented elsewhere in this file/
+     * README). A video capture showed Task Manager's "Dynamic areas"
+     * list (an auto-refreshing pane with small percentage-bar fills,
+     * redrawn on a timer with no user input at all) visibly corrupting
+     * - text labels disappearing while bar fills persisted - across
+     * several redraw cycles right before the freeze, strongly
+     * suggesting a real bug in this driver's accelerated fill/copy
+     * path under a usage pattern (unattended, timer-driven, high-
+     * frequency small redraws) that manual drag/resize/scroll testing
+     * in AccelTest.bas never exercised.
+     *
+     * Was previously the default (unless "NoAutoStart" was on the
+     * command tail) - now inverted: acceleration stays fully opt-in
+     * again (via a manual V3D_AccelStart) unless "AutoStart" is
+     * explicitly given on the command tail, for continued testing by
+     * anyone who understands the risk. Do NOT flip this back to
+     * default-on until the Task Manager freeze is root-caused and
+     * fixed, not just worked around - this is a routine, common action
+     * freezing the whole machine, on every single boot, not an edge
+     * case.
      *
      * Deliberately does NOT power on the GPU/PMP/IRQ machinery here -
      * that stays lazy, deferred to the first real accelerated
-     * GraphicsV call (v3d_accel_render_fill/copy already do this) -
-     * module_init runs very early in the boot sequence, before the
-     * system may be fully settled, and this module's own real GPU
-     * initialisation (firmware mailbox calls, clock enable, ASB gates)
-     * has no proven need to happen that early. Claiming the vector
-     * itself is cheap and inert until GraphicsV actually delivers a
-     * Render call.
+     * GraphicsV call (v3d_accel_render_fill/copy already do this).
      *
      * A failure to claim (e.g. OS_Claim itself erroring) does NOT fail
      * module_init - the module still loads and its test SWIs still
      * work either way; only the automatic acceleration is unavailable,
      * recoverable later via a manual V3D_AccelStart.
      */
-    if (!cmd_tail_has_noautostart(cmd_tail))
+    if (cmd_tail_has_word(cmd_tail, "AUTOSTART") &&
+        !cmd_tail_has_word(cmd_tail, "NOAUTOSTART"))
         (void) v3d_gfxv_start();
 
     /* Deliberately doing nothing else here: no other hardware is

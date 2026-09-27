@@ -1678,14 +1678,22 @@ Not yet run on hardware.
   well-grounded theories were tested and fixed, none resolved it.
   **Always reboot before loading a freshly-built module for testing.**
   This does not affect the module's actual operation once loaded - only
-  development-time reloading. **Now applies on every ordinary load, not
-  just ones where `V3D_AccelStart` was manually run** - see "Auto-start
-  at boot" below, since the module now claims `GraphicsV` automatically
-  on load, adding a second (really third, alongside the IRQ vector)
-  system vector's release path to whatever isn't currently understood
-  about this freeze.
+  development-time reloading. **UPDATE (2026-09-27): auto-start has
+  since been disabled by default again** (see "URGENT: Task Manager
+  freeze" below - a different, more serious bug) - so as of the current
+  build this only applies to sessions where `V3D_AccelStart` was
+  manually run, or the module was loaded with `AutoStart` on its
+  command tail, same as before auto-start was ever added.
 
-## Auto-start at boot (2026-09-27, hardware-verified)
+- **A second, separate, MORE SERIOUS freeze**: opening Task Manager
+  while `GraphicsV` acceleration is active hard-freezes the machine
+  100% of the time, confirmed on a fresh boot with no reload involved
+  at all (unlike the freeze above, which needs a reload first). See
+  "URGENT: Task Manager freeze" below for the full writeup. This is why
+  auto-start is currently disabled by default - acceleration is opt-in
+  only until this is root-caused and fixed.
+
+## Auto-start at boot (2026-09-27, hardware-verified; DISABLED BY DEFAULT since - see "URGENT: Task Manager freeze" below)
 
 The module now claims `GraphicsV` automatically in `module_init` - the
 moment it's loaded, acceleration is active, no manual `V3D_AccelStart`
@@ -1712,6 +1720,17 @@ module given its history of real bugs that only surfaced under live
 desktop traffic (see the "GraphicsV Render accelerator" sections
 above), and given every additional claimed system vector is one more
 thing to reason about for the still-unresolved reload freeze above.
+
+**UPDATE (2026-09-27): this section describes the ORIGINAL (now
+reverted) auto-start behaviour, kept for history.** A separate, more
+serious freeze (Task Manager, see "URGENT: Task Manager freeze" above)
+means auto-start is now OFF by default again - the condition is
+inverted from what's described here: `GraphicsV` stays opt-in
+(`V3D_AccelStart`) unless `AutoStart` (not `NoAutoStart`) is explicitly
+given on the command tail. The auto-start MECHANISM itself (the
+`cmd_tail_has_word` check, the idempotent `v3d_gfxv_start` call in
+`module_init`) is unchanged and still fully hardware-verified below -
+only the DEFAULT polarity changed.
 
 A failed auto-claim (e.g. `OS_Claim` itself erroring) does not fail
 `module_init` - the module still loads and its test SWIs still work
@@ -1842,13 +1861,63 @@ rejects (32bpp-only) and would be a separate, riskier piece of work
 (this driver has no screen-mode-change handling at all yet) - not
 pursued further for now.
 
-**Status: treated as complete for now** - the mechanism is hardware-
+**Status at the time: treated as complete** - the mechanism is hardware-
 proven correct (isolated buffer, first attempt; real framestore, first
-attempt) and the live dispatch wiring is proven harmless to existing
-traffic across two real-desktop test rounds. Whether it ever actually
-fires under genuine desktop use on THIS hardware/mode remains an open
-question, plausibly answered "no, and that's expected" by the colour-
-depth theory above.
+attempt) and the live dispatch wiring was believed harmless based on
+two real-desktop test rounds (ordinary drag/resize/scroll interaction).
+**Superseded almost immediately - see the next section**: a usage
+pattern those two rounds never happened to exercise (an unattended,
+timer-driven redraw of a small-percentage-bar list) turned out to
+freeze the machine hard.
+
+## URGENT: Task Manager freeze - auto-start disabled by default (2026-09-27)
+
+Real-world use immediately after the above (opening Task Manager, no
+special action beyond that) produced a **100% reproducible hard machine
+freeze** - confirmed on a completely fresh boot, first module load, no
+reload involved (a DIFFERENT, more serious bug than the pre-existing
+reload-without-reboot freeze documented above - that one needs a reload
+first; this one doesn't). Symptom: only the mouse cursor still moves
+(hardware cursor, IRQ/DMA-driven, decoupled from the rest of the
+system); everything else is completely unresponsive, requiring a power
+cycle. Happens every time, specifically when `GraphicsV` acceleration
+is active (`V3D_AccelStart` claimed) and Task Manager's window is
+opened.
+
+A screen-recording of the freeze, examined frame by frame, shows real
+visual corruption in the moments leading up to it, not just a sudden
+stop: Task Manager's "Dynamic areas" pane (a list of every RISC OS
+dynamic area with a small percentage-used bar next to each, too many
+entries to fit at once, so the OS periodically auto-scrolls/redraws it
+on a timer with **no user input involved at all**) alternates between
+fully correct and visibly garbled - text labels vanish while the
+coloured bar fills persist - across several redraw cycles, then the
+system locks up.
+
+**This usage pattern - unattended, timer-driven, high-frequency small
+redraws with no user interaction - is genuinely different from
+everything `AccelTest.bas`'s manual drag/resize/scroll testing has ever
+exercised**, and is a strong candidate root cause independent of which
+specific accelerated path (fill or copy) turns out to be responsible.
+Not yet root-caused - this needs dedicated investigation, likely
+starting from `V3D_RegSnapshot`-style register instrumentation captured
+right before/during a Task Manager open, same methodology already
+built for the (separate) reload freeze.
+
+**Immediate safety action taken**: auto-start is now OFF by default
+again (module version bumped to 0.03). Previously, unless `NoAutoStart`
+was on the command tail, `module_init` claimed `GraphicsV`
+unconditionally - meaning, after the previous milestone, EVERY ordinary
+boot was exposed to this freeze the moment anyone opened Task Manager,
+a completely routine action. The condition is now inverted: `GraphicsV`
+stays fully opt-in (`V3D_AccelStart`, exactly as it was before
+auto-start was ever added) unless `AutoStart` is explicitly given on
+the command tail (`*RMLoad V3DDriver,ffa AutoStart`), for anyone who
+understands the risk and wants to keep testing with it live. **Do not
+flip the default back to auto-start-on until this freeze is root-caused
+and fixed, not merely worked around** - unlike the reload freeze (which
+only bites during development-time reloading), this bites on ordinary
+end-user desktop use.
 
 ## Next milestones
 
