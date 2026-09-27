@@ -1644,6 +1644,29 @@ three of those four (vector claim leak, reset-pulse tracking, PMP
 Dynamic Area leak) were investigated but the actual reload freeze
 remains unresolved. Next milestones below.
 
+### Revisited (2026-09-27): proactive register instrumentation, not another fix attempt
+
+Per the note above, this needed a fundamentally different diagnostic
+approach - all four prior attempts were *fixes* aimed at a candidate
+resource leak (vector, clock state, PMP). None of them were actual
+*instrumentation*: this is a hard machine freeze, not a SWI timeout,
+so `cl_clear.c`'s own `diagnose_timeout()` register dump never gets a
+chance to run - nobody has actually seen real V3D hardware register
+state in the moments leading up to this specific freeze.
+
+**New**: `V3D_RegSnapshot` - a plain, read-only dump of
+`V3D_CTL_INT_STS`, `V3D_HUB_INT_STS`, `CT0CS`/`CT1CS`, `CT0CA`/`CT0EA`,
+`CT1CA`/`CT1EA` (no `V3D_PowerOn` required - plain register reads have
+always worked regardless of clock/power state, see M0/M1's own
+findings). `test/ReloadFreezeDiag.bas` mirrors `StressTest.bas`'s
+exact structure (the scenario that's reproduced this freeze
+consistently before) but calls this SWI and prints the results BEFORE
+every risky call, not just on failure - if the freeze happens again,
+whatever printed last is real forensic data about the exact hardware
+state immediately beforehand, rather than another guess.
+
+Not yet run on hardware.
+
 ## Known limitations
 
 - **Do not `*RMKill`/`*RMLoad` this module without a full reboot in

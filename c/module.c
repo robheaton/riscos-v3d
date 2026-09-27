@@ -693,6 +693,7 @@ enum
     SWI_V3D_OverlapCopyTest = 18,
     SWI_V3D_ScreenCopyOverlapTest = 19,
     SWI_V3D_AccelCopyLastError = 20,
+    SWI_V3D_RegSnapshot = 21,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1336,6 +1337,51 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
              * via `$addr%`. Empty string if no failure has occurred. */
             r->r[0] = (unsigned int) v3d_gfxv_copy_last_fail_msg();
             return NULL;
+
+        case SWI_V3D_RegSnapshot:
+        {
+            /* Proactive hardware register dump for the still-unresolved
+             * reload-without-reboot freeze (see README's "Known
+             * limitations" and "Real IRQ handling" sections) - a HARD
+             * MACHINE FREEZE, not a SWI timeout, meaning cl_clear.c's
+             * own diagnose_timeout() never gets a chance to run: the
+             * freeze happens before any bounded wait could time out.
+             * Every fix attempted so far (four of them) targeted a
+             * candidate resource leak; none of them were actual
+             * instrumentation - nobody has seen real V3D register
+             * state in the moments leading up to this specific freeze.
+             * This SWI is meant to be called and its output printed
+             * BEFORE each risky call in a reload-then-stress-test
+             * script, so if the freeze happens again, whatever printed
+             * last is real forensic data instead of another guess.
+             *
+             * Deliberately does NOT require V3D_PowerOn - plain
+             * register reads have always worked regardless of clock/
+             * power state (see M0/M1's own findings), and the whole
+             * point is to observe state that might be abnormal
+             * specifically because of that.
+             *
+             * Returns: V3D_CTL_INT_STS (R0), V3D_HUB_INT_STS (R1),
+             * V3D_CLE_CT0CS (R2), V3D_CLE_CT1CS (R3), V3D_CLE_CT0CA
+             * (R4), V3D_CLE_CT0EA (R5), V3D_CLE_CT1CA (R6), V3D_CLE_
+             * CT1EA (R7). */
+            io_mapping_t v3d;
+            _kernel_oserror *err = io_map(V3D_MB_BASE, &v3d);
+            if (err)
+                return err;
+
+            r->r[0] = IO_WORD(v3d, V3D_CTL_INT_STS);
+            r->r[1] = IO_WORD(v3d, V3D_HUB_INT_STS);
+            r->r[2] = IO_WORD(v3d, V3D_CLE_CT0CS);
+            r->r[3] = IO_WORD(v3d, V3D_CLE_CT1CS);
+            r->r[4] = IO_WORD(v3d, V3D_CLE_CT0CA);
+            r->r[5] = IO_WORD(v3d, V3D_CLE_CT0EA);
+            r->r[6] = IO_WORD(v3d, V3D_CLE_CT1CA);
+            r->r[7] = IO_WORD(v3d, V3D_CLE_CT1EA);
+
+            io_unmap(&v3d);
+            return NULL;
+        }
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see
