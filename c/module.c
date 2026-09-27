@@ -412,6 +412,67 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
 }
 
 /*
+ * Dithered/patterned twin of v3d_accel_render_fill (see README's
+ * "Dithered/patterned fills" section and gfxv_accel.c's
+ * ecf_decode_striped) - same self-initialisation and coordinate-flip
+ * as the solid case, but delegates to v3d_striped_fill_raw instead of
+ * v3d_fill_screen, computing the rectangle's own row-0 physical address
+ * the same way v3d_fill_screen does internally (screen_phys_base +
+ * y_top_down*stride + left*4) since v3d_striped_fill_raw needs that
+ * address directly, not an x/y pair.
+ *
+ * `row_phase` is passed as `y_top_down % 8u` - i.e. the rectangle's
+ * absolute on-screen top-down row number, not anything rectangle-
+ * relative - so the pattern stays anchored to the SCREEN as content
+ * moves/redraws, matching RISC OS's own dither-pattern convention (see
+ * cl_fill.h's v3d_striped_fill_raw comment for why this matters).
+ *
+ * Shares SCREEN_FILL_BASE_PAGE with the solid-fill path, not a
+ * dedicated base page: both paths' scratch buffers are used strictly
+ * sequentially (a real GraphicsV Render call always runs to completion,
+ * SVC/foreground-only, before any other could start - see gfxv_accel.h),
+ * so there is no real concurrent use to guard against, and the solid
+ * path's own scratch is already sized for a full-screen rectangle,
+ * comfortably larger than any single stripe's fill needs.
+ */
+_kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int bottom,
+                                                 unsigned int right, unsigned int top,
+                                                 const unsigned int colours[8])
+{
+    unsigned int clock_rate;
+    unsigned int width, height, y_top_down;
+    unsigned int target_phys_row0;
+    _kernel_oserror *err;
+
+    err = v3d_power_on(&clock_rate);
+    if (err)
+        return err;
+
+    err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    err = ensure_pmp_fill();
+    if (err)
+        return err;
+
+    err = v3d_irq_ensure_ready();
+    if (err)
+        return err;
+
+    width = right - left + 1u;
+    height = top - bottom + 1u;
+    y_top_down = g_screen_info.ywind_limit - top;
+
+    target_phys_row0 = g_screen_phys_base + y_top_down * g_screen_info.line_length
+                        + left * 4u;
+
+    return v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                                  width, height, colours, y_top_down % 8u,
+                                  target_phys_row0, g_screen_info.line_length);
+}
+
+/*
  * Step 5's equivalent of v3d_accel_render_fill, for op 1 (copy) - see
  * gfxv_accel.c's handle_render_copy. Same self-initialisation, same
  * GraphicsV-bottom-up-to-internal-top-down coordinate conversion,
@@ -694,6 +755,9 @@ enum
     SWI_V3D_ScreenCopyOverlapTest = 19,
     SWI_V3D_AccelCopyLastError = 20,
     SWI_V3D_RegSnapshot = 21,
+    SWI_V3D_StripedFillTest = 22,
+    SWI_V3D_AccelStripedStats = 23,
+    SWI_V3D_ScreenStripedFillTest = 24,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1026,6 +1090,81 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
             r->r[0] = tiles_x;
             r->r[1] = tiles_y;
+            return NULL;
+        }
+
+        case SWI_V3D_ScreenStripedFillTest:
+        {
+            /* Real-framestore counterpart of V3D_ScreenFillTest, for the
+             * new dithered-fill mechanism (see README's "Dithered/
+             * patterned fills" section and V3D_StripedFillTest, which
+             * proved the mechanism against a synthetic buffer only).
+             * Writes DIRECTLY into the real, live screen framestore -
+             * same visible-effect caveat as V3D_ScreenFillTest (the Wimp
+             * may redraw over it immediately - expected, not a bug).
+             *
+             * R0=x, R1=y, R2=width, R3=height, R4=row_phase, R5=pointer
+             * to 8 colour words in - same reasoning as
+             * V3D_StripedFillTest for passing colours via a pointer
+             * rather than individual registers. `row_phase` is left for
+             * the CALLER to choose here (unlike the live accelerator's
+             * own screen-anchored convention in
+             * v3d_accel_render_striped_fill) - this is a manual, one-
+             * shot test, not real desktop traffic, so there's nothing
+             * for the pattern to stay anchored against; passing 0
+             * simply means "the rectangle's own top row is colours[0]".
+             * No output registers - success is a rectangle visibly
+             * appearing on screen with the expected repeating stripes,
+             * same "did it visibly work" check as V3D_ScreenFillTest. */
+            unsigned int x = (unsigned int) r->r[0];
+            unsigned int y = (unsigned int) r->r[1];
+            unsigned int width = (unsigned int) r->r[2];
+            unsigned int height = (unsigned int) r->r[3];
+            unsigned int row_phase = (unsigned int) r->r[4];
+            const unsigned int *colours_in = (const unsigned int *) r->r[5];
+            unsigned int target_phys_row0;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    17, "V3DDriver: V3D_ScreenStripedFillTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_screen_framestore();
+            if (err)
+                return err;
+
+            if (width == 0u || height == 0u ||
+                x + width > g_screen_info.xwind_limit + 1u ||
+                y + height > g_screen_info.ywind_limit + 1u)
+            {
+                static _kernel_oserror err_out_of_bounds = {
+                    18, "V3DDriver: V3D_ScreenStripedFillTest rectangle is "
+                        "outside the current screen mode's bounds"
+                };
+                return &err_out_of_bounds;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            target_phys_row0 = g_screen_phys_base + y * g_screen_info.line_length
+                                + x * 4u;
+
+            err = v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                                         width, height, colours_in, row_phase,
+                                         target_phys_row0, g_screen_info.line_length);
+            if (err)
+                return err;
+
             return NULL;
         }
 
@@ -1382,6 +1521,76 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             io_unmap(&v3d);
             return NULL;
         }
+
+        case SWI_V3D_StripedFillTest:
+        {
+            /* Isolated test harness for the dithered-fill mechanism
+             * (see README's "Dithered/patterned fills" section,
+             * cl_fill.c's v3d_striped_fill_raw/v3d_striped_fill_test,
+             * and gfxv_accel.c's ecf_decode_striped) - same "prove it
+             * against a synthetic buffer before touching the real
+             * screen" methodology as V3D_FillTest, deliberately kept
+             * completely separate from the live GraphicsV handler.
+             *
+             * Takes 8 colours via a pointer, not individually in
+             * registers - BASIC's SYS only usefully offers R0-R9, and
+             * width/height/row_phase plus 8 colours already needs 11
+             * values; this also mirrors how the real ECF block is
+             * itself passed as a pointer, not inline register values.
+             *
+             * R0=width, R1=height, R2=row_phase, R3=pointer to 8
+             * colour words in. Returns physical address (R0), row
+             * stride in bytes (R1), and the *logical* address (R2) so
+             * a BASIC test script can sample pixels directly. */
+            unsigned int target_phys, stride;
+            void *target_log;
+            const unsigned int *colours_in;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    13, "V3DDriver: V3D_StripedFillTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            colours_in = (const unsigned int *) r->r[3];
+
+            err = v3d_striped_fill_test(&g_pmp_fill, 0, (unsigned int) r->r[0],
+                                          (unsigned int) r->r[1], colours_in,
+                                          (unsigned int) r->r[2],
+                                          &target_phys, &target_log, &stride);
+            if (err)
+                return err;
+
+            r->r[0] = target_phys;
+            r->r[1] = stride;
+            r->r[2] = (unsigned int) target_log;
+            return NULL;
+        }
+
+        case SWI_V3D_AccelStripedStats:
+            /* Real instrumentation for the dithered-fill path now
+             * sitting in the live GraphicsV handler - see
+             * gfxv_accel.c. Returns how many render-fill calls decoded
+             * as a genuine (non-solid) striped pattern (R0), how many
+             * were actually accelerated (R1), how many attempted-but-
+             * failed (R2), and the last failure's OS error number
+             * (R3). */
+            r->r[0] = g_gfxv_striped_count;
+            r->r[1] = g_gfxv_striped_claimed_count;
+            r->r[2] = g_gfxv_striped_error_count;
+            r->r[3] = g_gfxv_striped_last_fail_errnum;
+            return NULL;
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see

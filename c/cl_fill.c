@@ -439,3 +439,116 @@ _kernel_oserror *v3d_fill_screen(pmp_area_t *pmp, unsigned int base_page,
     return run_fill(pmp, base_page, width, height, clear_color_rgba,
                      target_phys, screen_stride, tiles_x_out, tiles_y_out);
 }
+
+_kernel_oserror *v3d_fill_raw(pmp_area_t *pmp, unsigned int base_page,
+                                unsigned int width, unsigned int height,
+                                unsigned int clear_color_rgba,
+                                unsigned int target_phys,
+                                unsigned int target_stride,
+                                unsigned int *tiles_x_out,
+                                unsigned int *tiles_y_out)
+{
+    return run_fill(pmp, base_page, width, height, clear_color_rgba,
+                     target_phys, target_stride, tiles_x_out, tiles_y_out);
+}
+
+_kernel_oserror *v3d_striped_fill_raw(pmp_area_t *pmp, unsigned int base_page,
+                                        unsigned int width, unsigned int height,
+                                        const unsigned int colours[8],
+                                        unsigned int row_phase,
+                                        unsigned int target_phys_row0,
+                                        unsigned int target_stride)
+{
+    unsigned int c;
+
+    /* row_phase is which colours[] index the rectangle's own row 0
+     * (target_phys_row0) falls on - see cl_fill.h's own comment for
+     * why this matters (ECF patterns are screen-anchored, not
+     * rectangle-anchored, to avoid a "marching ants" effect as content
+     * scrolls behind a fixed dither pattern - unconfirmed by the PRM
+     * text itself, but standard RISC OS dither-pattern behaviour;
+     * callers unsure of the real anchor can just pass 0, treating the
+     * rectangle's own top as the pattern's own top). For each distinct
+     * colour index c, the first row needing it is the smallest row
+     * R >= 0 with (row_phase + R) % 8 == c, i.e. R = (c - row_phase +
+     * 8) % 8 - then every 8th row after that, until height is reached.
+     */
+    for (c = 0; c < 8u; c++)
+    {
+        unsigned int first_row = (c + 8u - (row_phase % 8u)) % 8u;
+        unsigned int num_rows, dest_phys, dest_stride;
+        unsigned int tiles_x, tiles_y;
+        _kernel_oserror *err;
+
+        if (first_row >= height)
+            continue; /* this colour index never occurs in this rect */
+
+        num_rows = 1u + (height - 1u - first_row) / 8u;
+        dest_phys = target_phys_row0 + first_row * target_stride;
+        dest_stride = target_stride * 8u;
+
+        err = run_fill(pmp, base_page, width, num_rows, colours[c],
+                        dest_phys, dest_stride, &tiles_x, &tiles_y);
+        if (err)
+            return err;
+    }
+
+    return NULL;
+}
+
+_kernel_oserror *v3d_striped_fill_test(pmp_area_t *pmp, unsigned int base_page,
+                                         unsigned int width, unsigned int height,
+                                         const unsigned int colours[8],
+                                         unsigned int row_phase,
+                                         unsigned int *target_phys_out,
+                                         void **target_log_out,
+                                         unsigned int *target_stride_bytes_out)
+{
+    unsigned int tiles_x, tiles_y, padded_w, padded_h, stride, render_bytes, render_pages;
+    unsigned int render_phys;
+    void *render_log;
+    _kernel_oserror *err;
+
+    if (width == 0u || height == 0u)
+    {
+        static _kernel_oserror err_bad_size = {
+            10, "V3DDriver: V3D_StripedFillTest width/height must be non-zero"
+        };
+        return &err_bad_size;
+    }
+
+    /* Same padded-to-a-whole-tile-grid synthetic buffer as v3d_fill_test
+     * - see its own comment. Padding is computed from the REAL height,
+     * not the inflated per-stripe height each run_fill call underneath
+     * actually sees, since it must be big enough to hold every stripe's
+     * rows at their real (non-inflated) positions. */
+    tiles_x = div_round_up(width, TILE_SIZE);
+    tiles_y = div_round_up(height, TILE_SIZE);
+    padded_w = tiles_x * TILE_SIZE;
+    padded_h = tiles_y * TILE_SIZE;
+    stride = padded_w * 4u;
+    render_bytes = stride * padded_h;
+    render_pages = bytes_to_pages(render_bytes);
+
+    if (render_pages > PMP_MAX_PAGES_PER_CALL)
+    {
+        static _kernel_oserror err_too_big = {
+            14, "V3DDriver: V3D_StripedFillTest rectangle too large for "
+                "this test harness (pmp_alloc's per-call page cap) - try "
+                "a smaller width/height."
+        };
+        return &err_too_big;
+    }
+
+    err = pmp_alloc(pmp, base_page, render_pages, &render_phys, &render_log);
+    if (err) return err;
+
+    err = v3d_striped_fill_raw(pmp, base_page + render_pages, width, height,
+                                 colours, row_phase, render_phys, stride);
+    if (err) return err;
+
+    *target_phys_out = render_phys;
+    *target_log_out = render_log;
+    *target_stride_bytes_out = stride;
+    return NULL;
+}

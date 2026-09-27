@@ -87,4 +87,71 @@ _kernel_oserror *v3d_fill_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out);
 
+/*
+ * Lowest-level fill entry point: takes the target physical address and
+ * row stride directly, with no x/y/screen_stride convenience
+ * computation at all - needed for GraphicsV Render's dithered-fill
+ * support (see README's "Dithered/patterned fills" section), which
+ * fills only every 8th row of a rectangle (one GPU submission per
+ * distinct row colour in an up-to-8-row repeating pattern) using a
+ * store stride inflated to 8x the real row stride - `v3d_fill_screen`
+ * can't express this, since it derives its own row stride from
+ * `screen_stride` for BOTH the target-address computation and the
+ * store step, and those need to differ here (the target address must
+ * still use the framestore's real stride; only the store step's
+ * row-to-row spacing is inflated).
+ */
+_kernel_oserror *v3d_fill_raw(pmp_area_t *pmp, unsigned int base_page,
+                                unsigned int width, unsigned int height,
+                                unsigned int clear_color_rgba,
+                                unsigned int target_phys,
+                                unsigned int target_stride,
+                                unsigned int *tiles_x_out,
+                                unsigned int *tiles_y_out);
+
+/*
+ * Dithered/patterned fill: expresses an up-to-8-row repeating pattern
+ * (`colours[0..7]`) as up to 8 separate `v3d_fill_raw` submissions, one
+ * per distinct colour, each targeting only the rows that need it via a
+ * store stride inflated to 8x `target_stride` (see cl_fill.c's own
+ * comment for the derivation). A colour that never occurs in the
+ * rectangle (rectangle shorter than 8 rows) is skipped entirely, not
+ * submitted as a zero-height fill.
+ *
+ * `row_phase` is which `colours[]` index applies to the rectangle's own
+ * row 0 (i.e. `target_phys_row0`) - screen-anchored dither patterns
+ * (the RISC OS convention, to avoid "marching ants" as content
+ * scrolls) pass the rectangle's absolute on-screen row number modulo 8;
+ * a caller that only cares about the pattern being self-consistent
+ * within one rectangle (e.g. an isolated test) can just pass 0.
+ *
+ * `target_phys_row0`/`target_stride` follow `v3d_fill_raw`'s own
+ * convention: the REAL (uninflated) row stride, with inflation applied
+ * internally per stripe - callers must NOT pre-inflate these.
+ */
+_kernel_oserror *v3d_striped_fill_raw(pmp_area_t *pmp, unsigned int base_page,
+                                        unsigned int width, unsigned int height,
+                                        const unsigned int colours[8],
+                                        unsigned int row_phase,
+                                        unsigned int target_phys_row0,
+                                        unsigned int target_stride);
+
+/*
+ * Isolated test harness for v3d_striped_fill_raw, following the same
+ * pattern as v3d_fill_test (a freshly-allocated, padded PMP buffer,
+ * never the real screen) - see this project's established "prove it in
+ * isolation before touching the real framestore, prove that before
+ * wiring into the live GraphicsV handler" methodology (README.md).
+ * `base_page` covers both the render buffer AND (immediately after it,
+ * same accounting as v3d_fill_test) the CL/tile_alloc/tile_state
+ * scratch each underlying run_fill call needs.
+ */
+_kernel_oserror *v3d_striped_fill_test(pmp_area_t *pmp, unsigned int base_page,
+                                         unsigned int width, unsigned int height,
+                                         const unsigned int colours[8],
+                                         unsigned int row_phase,
+                                         unsigned int *target_phys_out,
+                                         void **target_log_out,
+                                         unsigned int *target_stride_bytes_out);
+
 #endif /* CL_FILL_H */

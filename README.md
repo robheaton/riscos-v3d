@@ -1726,6 +1726,130 @@ accelerated, all before the script ever called anything. Auto-start
 works: loading the module is now sufficient on its own, no manual
 opt-in required.
 
+## Dithered/patterned fills (2026-09-27, build-verified, not yet hardware-tested)
+
+The GraphicsV Render accelerator only claimed op 2 (fill) when the ECF
+block decoded as a genuine SOLID colour (all 8 lines' OR mask
+`0xFFFFFFFF`, all 8 EOR masks identical). Everything else - including
+RISC OS's own dithered/patterned desktop fills (e.g. some greyed-out
+icon backgrounds) - fell through unclaimed to the CPU path. Investigated
+whether this could be extended, expecting to need shader/texture-
+sampling support (this project has none, and neither does the reference
+project it verifies against - confirmed via `grep` turning up zero
+texture/TMU code in either).
+
+**Turned out not to be needed.** At 32bpp, each ECF line's OR/EOR mask
+is a full 32-bit word - exactly ONE pixel wide - so the fixed-function
+ECF mechanism can only vary the fill colour VERTICALLY (per scanline,
+cycling every 8 rows), never horizontally within a row. A "dithered
+fill" at this pixel depth is therefore never a true 2D texture - it's
+always expressible as up to 8 distinct row-colours repeating every 8
+rows. That means it can be built entirely from the *existing*,
+hardware-proven fixed-function fill machinery: up to 8 separate GPU
+submissions, one per distinct row colour, each one filling only "every
+8th row" of the target rectangle via a store stride inflated to 8x the
+real row stride (each submission's own tile grid only covers
+`ceil(rows_needing_this_colour / 1)` rows at that inflated stride - see
+`cl_fill.c`'s `v3d_striped_fill_raw`).
+
+`ecf_decode_solid` (`gfxv_accel.c`) generalised into `ecf_decode_striped`:
+same `OR==0xFFFFFFFF` check on all 8 lines, but no longer also requiring
+an identical EOR mask - it now decodes up to 8 independent colours
+(`colours_out[line] = ~eor_mask`). A genuine solid fill is simply the
+case where all 8 decoded colours happen to be equal - `handle_render_fill`
+checks for that itself and keeps using the cheaper single-submission
+path when so, only falling through to the up-to-8-submission striped
+path otherwise.
+
+**Screen-anchored, not rectangle-anchored**: `row_phase` (which
+`colours[]` index applies to the rectangle's own first row) is passed
+as the rectangle's absolute on-screen top-down row number, modulo 8
+(`v3d_accel_render_striped_fill` in `module.c`) - not 0/rectangle-
+relative - so the pattern stays locked to the screen as content
+scrolls or redraws, matching RISC OS's own conventional dither-pattern
+behaviour (avoiding a "marching ants" effect). This is standard RISC OS
+convention, not itself confirmed against the PRM text for this specific
+mechanism - low risk either way, since getting it wrong would only be a
+visual-consistency bug, not a hang or corruption.
+
+**Known, deliberate tradeoff**: up to 8x the GPU submissions of a solid
+fill for the same rectangle. Given this project's own earlier finding
+that even solid-fill acceleration's benefit is easy to not notice on a
+fast modern ARM core (see the "is there anything else..." discussion
+above), a small dithered rectangle could plausibly be a net loss versus
+just leaving it unclaimed for the CPU path. Not optimised for yet -
+first priority is proving correctness in isolation (this milestone),
+matching this project's established methodology throughout.
+
+New isolated test SWI `V3D_StripedFillTest` (see `test/StripedFillTest.bas`)
+exercises `v3d_striped_fill_test` against a synthetic PMP buffer only -
+deliberately not wired into any real GraphicsV traffic yet at test time,
+same "prove it standalone first" pattern as every other feature above.
+New live-path instrumentation `V3D_AccelStripedStats` mirrors
+`V3D_AccelStats`, tracking real desktop invocations of the new path
+separately from the existing solid-fill counters.
+
+**Confirmed on real hardware 2026-09-27, first attempt**: `StripedFillTest.bas`
+against a 200x67 rectangle with a genuine 4-colour repeating pattern -
+all 24 sample points matched (rows 0-20 spanning more than 2 full 8-row
+cycles, plus left/right edge samples confirming no unwanted horizontal
+variation within a row, plus the last row of a non-tile-aligned
+rectangle). The mechanism is proven correct against a synthetic buffer.
+
+**Real-framestore test (2026-09-27, hardware-verified, second attempt
+in a row with zero bugs found)**: new SWI `V3D_ScreenStripedFillTest`
+(mirroring `V3D_ScreenFillTest`, real framestore instead of a PMP test
+buffer, no screen-anchoring since a one-shot manual test has nothing to
+stay anchored against - `row_phase` is caller-supplied) and
+`test/ScreenStripedFillTest.bas`. A 150x100 rectangle at (400,300) with
+a 4-colour repeating pattern appeared correctly on the real desktop -
+clean horizontal stripes, correct position and size, no corruption.
+
+**Live-desktop test (2026-09-27) - wiring confirmed harmless, but the
+striped path itself was never actually exercised by real traffic.**
+`AccelTest.bas` (now also reporting `V3D_AccelStripedStats`) was run
+twice with genuine desktop interaction (dragging/resizing/scrolling
+windows, and on the second round deliberately opening greyed-out
+Filer/menu items to try to trigger a dithered redraw). Both rounds:
+**existing solid-fill and copy traffic stayed 100% accelerated with
+zero errors** (811/811 then 1246/1246 fills, 717 then 836 copies
+including all overlap-path ones) - the new striped-dispatch code causes
+no regression to the paths already proven live. **But `V3D_AccelStripedStats`
+reported 0 striped calls in both rounds** - the live handler was never
+even OFFERED a non-solid ECF fill to accelerate, so the striped path
+itself remains hardware-proven only in isolation (`V3D_StripedFillTest`)
+and via direct real-framestore injection (`V3D_ScreenStripedFillTest`),
+never via genuine Wimp-generated traffic.
+
+**Working theory for why, not yet independently confirmed**: dithered
+ECF fills are primarily a workaround for LOW colour-depth screen modes
+(256-colour, 16-colour), where the OS dithers two palette colours
+together to approximate an RGB value with no exact palette match. This
+driver's screen (confirmed back in Step 1) is 1920x1080 at **32bpp**,
+where every colour is exactly representable already - so RISC OS's own
+fill code plausibly has no reason to ever emit a non-solid ECF pattern
+on this specific hardware/mode at all, independent of what kind of UI
+element is being redrawn. Separately, greyed-out/disabled menu text
+specifically was a bad choice of trigger regardless of colour depth -
+RISC OS dims disabled icon TEXT via font/glyph rendering, not a filled
+rectangle, so it was never going to route through `GraphicsV` op 2 in
+the first place (consistent with this project's earlier, separate
+finding that text/icons/sprites can't be accelerated via `GraphicsV` at
+all - see "is it possible to add more..." discussion history).
+Confirming the colour-depth theory directly would mean testing at a
+lower `Log2BPP`, which `ensure_screen_framestore` currently outright
+rejects (32bpp-only) and would be a separate, riskier piece of work
+(this driver has no screen-mode-change handling at all yet) - not
+pursued further for now.
+
+**Status: treated as complete for now** - the mechanism is hardware-
+proven correct (isolated buffer, first attempt; real framestore, first
+attempt) and the live dispatch wiring is proven harmless to existing
+traffic across two real-desktop test rounds. Whether it ever actually
+fires under genuine desktop use on THIS hardware/mode remains an open
+question, plausibly answered "no, and that's expected" by the colour-
+depth theory above.
+
 ## Next milestones
 
 M2 (clear-to-colour) and M3 (display in a Wimp window) are both done

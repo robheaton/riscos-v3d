@@ -26,10 +26,18 @@
  * genuine SOLID fill (independent of whatever pixel was already there)
  * is or_mask=0xFFFFFFFF (forces every bit to 1 regardless of the
  * existing pixel) + eor_mask=~colour (flips down to the exact desired
- * value) - `colour = ~eor_mask` follows algebraically. Detected here
- * by checking every one of the 8 lines has or_mask==0xFFFFFFFF and an
- * IDENTICAL eor_mask (a genuine dithered/patterned fill would vary
- * eor_mask per line) - anything else is left unclaimed, not guessed at.
+ * value) - `colour = ~eor_mask` follows algebraically.
+ *
+ * DITHERED/PATTERNED FILLS (added 2026-09-27): at 32bpp each line's
+ * OR/EOR mask is a full 32-bit word - exactly one pixel wide - so any
+ * ECF pattern this hardware can express can only vary VERTICALLY (per
+ * scanline, cycling every 8 rows), never horizontally within a row.
+ * That means the same or_mask==0xFFFFFFFF condition, checked on all 8
+ * lines WITHOUT also requiring an identical eor_mask, captures every
+ * pattern this driver can accelerate - a genuine solid fill is simply
+ * the special case where the resulting 8 colours happen to all be
+ * equal. Anything failing the or_mask==0xFFFFFFFF check on any line is
+ * a real content-dependent blend and is left unclaimed, not guessed at.
  */
 #ifndef GFXV_ACCEL_H
 #define GFXV_ACCEL_H
@@ -59,6 +67,13 @@ extern volatile unsigned int g_gfxv_fail_min_area;
 extern volatile unsigned int g_gfxv_fail_max_area;
 extern volatile unsigned int g_gfxv_success_min_area;
 extern volatile unsigned int g_gfxv_success_max_area;
+
+/* Dithered/patterned fill instrumentation - see gfxv_accel.c's own
+ * comment. Exposed for V3D_AccelStripedStats. */
+extern volatile unsigned int g_gfxv_striped_count;
+extern volatile unsigned int g_gfxv_striped_claimed_count;
+extern volatile unsigned int g_gfxv_striped_error_count;
+extern volatile unsigned int g_gfxv_striped_last_fail_errnum;
 
 /* Op 1 (copy) instrumentation - see gfxv_accel.c's own comment.
  * Exposed for V3D_AccelCopyStats. */

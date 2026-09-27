@@ -18,6 +18,16 @@ REM normally for a bit (drag a window, resize one, scroll something,
 REM move icons) to generate genuine Wimp redraw traffic, then come back
 REM here and press a key to see the stats and release the vector again.
 REM
+REM To also exercise the newer dithered-fill path (V3D_AccelStripedStats
+REM below - see README's "Dithered/patterned fills" section), try to
+REM trigger some GREYED-OUT/disabled UI during this interaction period
+REM too - e.g. open a dialogue box and look at a disabled button/writable
+REM field, or open a menu with a greyed-out entry, or drag a "shaded"
+REM (write-protected/locked) Filer icon - RISC OS conventionally dithers
+REM these rather than using a flat grey, and that's exactly the ECF
+REM pattern shape this new path targets. A zero count there is still a
+REM perfectly valid result if nothing dithered happened to get redrawn.
+REM
 REM Before running: *RMLoad the built V3DDriver,ffa yourself.
 
 SYS "V3D_PowerOn" TO ok%, rate%
@@ -72,12 +82,26 @@ PRINT "  attempted but failed/too large:     "; copy_overlap_errors%
 IF copy_errors% > 0 OR copy_overlap_errors% > 0 THEN PROCcopyerrorinfo
 PRINT
 
+REM V3D_AccelStripedStats: R0=striped (non-solid) fill calls decoded,
+REM R1=actually accelerated, R2=attempted but failed, R3=last failure's
+REM error number - see README's "Dithered/patterned fills" section.
+REM Real desktop dithered fills are rarer than solid ones (e.g. some
+REM greyed-out icon backgrounds) - a small/zero count here is plausible
+REM even after real interaction, not necessarily a sign of a problem.
+SYS "V3D_AccelStripedStats" TO striped%, striped_claimed%, striped_errors%, striped_errnum%
+
+PRINT "GraphicsV striped (dithered) fill calls seen: "; striped%
+PRINT "  actually accelerated by the GPU:            "; striped_claimed%
+PRINT "  attempted but failed:                        "; striped_errors%
+IF striped_errors% > 0 THEN PRINT "  last failure error number:                   "; striped_errnum%
+PRINT
+
 SYS "V3D_AccelStop"
 PRINT "Released (V3D_AccelStop) - back to normal software rendering."
 PRINT
 IF calls% = 0 THEN PRINT "No GraphicsV traffic seen at all - try more" : PRINT "desktop interaction, or this may indicate something" : PRINT "isn't reaching this vector." : END
 
-IF claimed% > 0 OR copy_claimed% > 0 OR copy_overlap_claimed% > 0 THEN PRINT "At least one real accelerated fill or copy happened - check the desktop looked correct throughout." : END
+IF claimed% > 0 OR copy_claimed% > 0 OR copy_overlap_claimed% > 0 OR striped_claimed% > 0 THEN PRINT "At least one real accelerated fill or copy happened - check the desktop looked correct throughout." : END
 
 PRINT "GraphicsV traffic was seen, but nothing was accelerated."
 PRINT "Could be genuinely correct (no plain solid fills or"

@@ -34,6 +34,15 @@ extern _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bo
                                                 unsigned int right, unsigned int top,
                                                 unsigned int colour_rgba);
 
+/* Dithered/patterned twin of v3d_accel_render_fill - see module.c's own
+ * comment on v3d_accel_render_striped_fill. `colours[8]` and `row_phase`
+ * follow cl_fill.h's v3d_striped_fill_raw convention exactly (this
+ * function's caller, handle_render_fill, decodes them straight out of
+ * the real ECF block via ecf_decode_striped below). */
+extern _kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int bottom,
+                                                         unsigned int right, unsigned int top,
+                                                         const unsigned int colours[8]);
+
 /* Same idea, for op 1 (copy) - see module.c's own comment on
  * v3d_accel_render_copy. Direct, single-pass, non-overlapping only
  * (see cl_copy.h) - v3d_gfxv_handler checks for overlap itself before
@@ -99,6 +108,19 @@ volatile unsigned int g_gfxv_fail_min_area = 0xFFFFFFFFu;
 volatile unsigned int g_gfxv_fail_max_area = 0;
 volatile unsigned int g_gfxv_success_min_area = 0xFFFFFFFFu;
 volatile unsigned int g_gfxv_success_max_area = 0;
+
+/*
+ * Dithered/patterned fill instrumentation (see ecf_decode_striped and
+ * v3d_accel_render_striped_fill) - a genuinely different code path from
+ * the solid-fill one above (up to 8 GPU submissions instead of 1), so
+ * tracked separately rather than folded into the existing solid
+ * counters, same reasoning as op 1 (copy) getting its own counters
+ * instead of reusing op 2's.
+ */
+volatile unsigned int g_gfxv_striped_count = 0;
+volatile unsigned int g_gfxv_striped_claimed_count = 0;
+volatile unsigned int g_gfxv_striped_error_count = 0;
+volatile unsigned int g_gfxv_striped_last_fail_errnum = 0;
 
 /*
  * Op 1 (copy) instrumentation - added from the start this time, having
@@ -194,27 +216,40 @@ _kernel_oserror *v3d_gfxv_shutdown(void)
 }
 
 /*
- * Checks the 64-byte ECF block at `ecf` for the "genuine solid fill"
- * pattern - see gfxv_accel.h's top comment for the OR=0xFFFFFFFF /
- * constant-EOR derivation. Returns 1 and sets *colour_out if so, 0
- * otherwise (a real dithered/patterned fill, or something this driver
- * doesn't recognise - either way, not ours to accelerate).
+ * Checks the 64-byte ECF block at `ecf` for a pattern this driver can
+ * accelerate: at 32bpp each line's OR/EOR mask is a full 32-bit word -
+ * exactly one pixel wide - so the pattern can only vary VERTICALLY
+ * (per scanline, cycling every 8 rows), never horizontally within a
+ * row. That means ANY ECF block with OR=0xFFFFFFFF on every line
+ * (forcing every bit to 1 regardless of the existing pixel, same as
+ * the original solid-fill derivation - see gfxv_accel.h's top comment)
+ * decodes to up to 8 distinct row-colours, `colours_out[line] =
+ * ~ecf[line*2+1]` - a real 2D dithered texture (one that also varies
+ * horizontally) is NOT expressible this way and isn't seen here, since
+ * its OR mask couldn't be all-1s on every line.
+ *
+ * Returns 1 and fills *colours_out[0..7] if the OR=0xFFFFFFFF condition
+ * holds for all 8 lines, 0 otherwise (some other pattern this driver
+ * doesn't recognise - not ours to accelerate). A genuine solid fill is
+ * simply the case where all 8 decoded colours happen to be equal - the
+ * caller (handle_render_fill) checks for that itself to keep using the
+ * cheaper single-fill path instead of up to 8 GPU submissions.
  */
-static int ecf_decode_solid(const unsigned int *ecf, unsigned int *colour_out)
+static int ecf_decode_striped(const unsigned int *ecf, unsigned int colours_out[8])
 {
     unsigned int line;
-    unsigned int eor0 = ecf[1];
 
     for (line = 0; line < 8u; line++)
     {
         unsigned int or_mask = ecf[line * 2u];
         unsigned int eor_mask = ecf[line * 2u + 1u];
 
-        if (or_mask != 0xFFFFFFFFu || eor_mask != eor0)
+        if (or_mask != 0xFFFFFFFFu)
             return 0;
+
+        colours_out[line] = ~eor_mask;
     }
 
-    *colour_out = ~eor0;
     return 1;
 }
 
@@ -223,7 +258,9 @@ static void handle_render_fill(_kernel_swi_regs *r)
     const unsigned int *params;
     unsigned int left, bottom, right, top;
     const unsigned int *ecf;
-    unsigned int colour;
+    unsigned int colours[8];
+    unsigned int line;
+    int is_solid;
     _kernel_oserror *err;
 
     g_gfxv_fill_op_count++;
@@ -247,15 +284,26 @@ static void handle_render_fill(_kernel_swi_regs *r)
     bottom = params[3];
     ecf = (const unsigned int *) params[4];
 
-    if (!ecf_decode_solid(ecf, &colour))
-        return; /* a real pattern/dither fill - not ours to accelerate */
+    if (!ecf_decode_striped(ecf, colours))
+        return; /* a real content-dependent blend - not ours to accelerate */
 
-    g_gfxv_solid_count++;
+    is_solid = 1;
+    for (line = 1; line < 8u; line++)
+    {
+        if (colours[line] != colours[0])
+        {
+            is_solid = 0;
+            break;
+        }
+    }
 
+    if (is_solid)
     {
         unsigned int area = (right - left + 1u) * (top - bottom + 1u);
 
-        err = v3d_accel_render_fill(left, bottom, right, top, colour);
+        g_gfxv_solid_count++;
+
+        err = v3d_accel_render_fill(left, bottom, right, top, colours[0]);
         if (err)
         {
             g_gfxv_error_count++;
@@ -275,10 +323,25 @@ static void handle_render_fill(_kernel_swi_regs *r)
 
         if (area < g_gfxv_success_min_area) g_gfxv_success_min_area = area;
         if (area > g_gfxv_success_max_area) g_gfxv_success_max_area = area;
+
+        g_gfxv_claimed_count++;
+        r->r[4] = 0; /* claimed - see GraphicsV's own R4=0 convention */
+        return;
     }
 
-    g_gfxv_claimed_count++;
-    r->r[4] = 0; /* claimed - see GraphicsV's own R4=0 convention */
+    g_gfxv_striped_count++;
+
+    err = v3d_accel_render_striped_fill(left, bottom, right, top, colours);
+    if (err)
+    {
+        g_gfxv_striped_error_count++;
+        g_gfxv_striped_last_fail_errnum = (unsigned int) err->errnum;
+        return; /* GPU fill failed (e.g. timeout) - leave unclaimed, same
+                  * fail-safe reasoning as the solid path above. */
+    }
+
+    g_gfxv_striped_claimed_count++;
+    r->r[4] = 0; /* claimed */
 }
 
 static void handle_render_copy(_kernel_swi_regs *r)
