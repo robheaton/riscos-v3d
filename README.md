@@ -1662,7 +1662,7 @@ remains unresolved. Next milestones below.
   system vector's release path to whatever isn't currently understood
   about this freeze.
 
-## Auto-start at boot (2026-09-26, build-verified, not yet hardware-tested)
+## Auto-start at boot (2026-09-27, hardware-verified)
 
 The module now claims `GraphicsV` automatically in `module_init` - the
 moment it's loaded, acceleration is active, no manual `V3D_AccelStart`
@@ -1695,7 +1695,13 @@ A failed auto-claim (e.g. `OS_Claim` itself erroring) does not fail
 either way; only the automatic acceleration is unavailable, recoverable
 later via a manual `V3D_AccelStart`.
 
-Not yet hardware-tested.
+**Confirmed on real hardware 2026-09-27**: `AutoStartTest.bas` - which
+deliberately never calls `V3D_AccelStart` or `V3D_PowerOn` itself -
+after a plain `*RMLoad` (no `NoAutoStart`), reported 3803 `GraphicsV`
+handler invocations with 309 fills and 246 copies genuinely
+accelerated, all before the script ever called anything. Auto-start
+works: loading the module is now sufficient on its own, no manual
+opt-in required.
 
 ## Next milestones
 
