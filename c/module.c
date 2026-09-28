@@ -220,6 +220,54 @@ static _kernel_oserror *ensure_screen_framestore(void)
 }
 
 /*
+ * OS_ReadMonotonicTime (SWI &42) is a plain, standard, non-reentrant-
+ * risk SWI - returns centiseconds since boot in R0. Used to track real
+ * accelerated-call timing (see V3D_AccelTimingStats below).
+ */
+unsigned int v3d_read_centiseconds(void)
+{
+    _kernel_swi_regs regs;
+    if (_kernel_swi(0x42, &regs, &regs))
+        return 0u; /* diagnostic only - never let this become a new
+                     * source of failure */
+    return (unsigned int) regs.r[0];
+}
+
+static volatile unsigned int g_max_call_duration_cs = 0;
+
+/*
+ * Real accelerated-call timing, readable via V3D_AccelTimingStats.
+ * `g_calls_this_window`/`g_window_start_cs` track a simple 1-second
+ * sliding window of accelerated-call counts; `g_peak_calls_per_second`
+ * remembers the worst burst rate seen all session.
+ */
+static unsigned int g_window_start_cs = 0;
+static unsigned int g_calls_this_window = 0;
+volatile unsigned int g_peak_calls_per_second = 0;
+
+static void record_call_duration(unsigned int t_start)
+{
+    unsigned int t_end = v3d_read_centiseconds();
+    unsigned int elapsed = t_end - t_start; /* unsigned wraparound is
+                                              * harmless here - worst
+                                              * case one spuriously huge
+                                              * reading on the rare
+                                              * wrap, self-corrects next
+                                              * call */
+    if (elapsed > g_max_call_duration_cs)
+        g_max_call_duration_cs = elapsed;
+
+    if (t_end - g_window_start_cs >= 100u) /* new 1-second window */
+    {
+        g_window_start_cs = t_end;
+        g_calls_this_window = 0;
+    }
+    g_calls_this_window++;
+    if (g_calls_this_window > g_peak_calls_per_second)
+        g_peak_calls_per_second = g_calls_this_window;
+}
+
+/*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
  * reference (pm.cpp) - direct PM_GRAFX reset deassert + ASB master/slave
  * gate release. No firmware mailbox call required for this step.
@@ -405,10 +453,16 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
     height = top - bottom + 1u;
     y_top_down = g_screen_info.ywind_limit - top;
 
-    return v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
-                             left, y_top_down, width, height, colour_rgba,
-                             g_screen_phys_base, g_screen_info.line_length,
-                             &tiles_x, &tiles_y);
+    {
+        unsigned int t_start = v3d_read_centiseconds();
+        err = v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                                 left, y_top_down, width, height, colour_rgba,
+                                 g_screen_phys_base, g_screen_info.line_length,
+                                 &tiles_x, &tiles_y);
+        if (!err)
+            record_call_duration(t_start);
+    }
+    return err;
 }
 
 /*
@@ -467,9 +521,15 @@ _kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int b
     target_phys_row0 = g_screen_phys_base + y_top_down * g_screen_info.line_length
                         + left * 4u;
 
-    return v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
-                                  width, height, colours, y_top_down % 8u,
-                                  target_phys_row0, g_screen_info.line_length);
+    {
+        unsigned int t_start = v3d_read_centiseconds();
+        err = v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                                      width, height, colours, y_top_down % 8u,
+                                      target_phys_row0, g_screen_info.line_length);
+        if (!err)
+            record_call_duration(t_start);
+    }
+    return err;
 }
 
 /*
@@ -514,11 +574,17 @@ _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_b
     src_y_top_down = g_screen_info.ywind_limit - (src_bottom + height - 1u);
     dest_y_top_down = g_screen_info.ywind_limit - (dest_bottom + height - 1u);
 
-    return v3d_copy_screen(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
-                             src_left, src_y_top_down, dest_left, dest_y_top_down,
-                             width, height,
-                             g_screen_phys_base, g_screen_info.line_length,
-                             &tiles_x, &tiles_y);
+    {
+        unsigned int t_start = v3d_read_centiseconds();
+        err = v3d_copy_screen(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+                                 src_left, src_y_top_down, dest_left, dest_y_top_down,
+                                 width, height,
+                                 g_screen_phys_base, g_screen_info.line_length,
+                                 &tiles_x, &tiles_y);
+        if (!err)
+            record_call_duration(t_start);
+    }
+    return err;
 }
 
 /*
@@ -560,11 +626,17 @@ _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsign
     src_y_top_down = g_screen_info.ywind_limit - (src_bottom + height - 1u);
     dest_y_top_down = g_screen_info.ywind_limit - (dest_bottom + height - 1u);
 
-    return v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
-                             src_left, src_y_top_down, dest_left, dest_y_top_down,
-                             width, height,
-                             g_screen_phys_base, g_screen_info.line_length,
-                             &tiles_x, &tiles_y);
+    {
+        unsigned int t_start = v3d_read_centiseconds();
+        err = v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
+                                 src_left, src_y_top_down, dest_left, dest_y_top_down,
+                                 width, height,
+                                 g_screen_phys_base, g_screen_info.line_length,
+                                 &tiles_x, &tiles_y);
+        if (!err)
+            record_call_duration(t_start);
+    }
+    return err;
 }
 
 static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
@@ -650,33 +722,20 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
     g_powered_on = 0;
 
     /*
-     * SAFETY ROLLBACK (2026-09-27): auto-start (claiming GraphicsV
-     * unconditionally on load) is DISABLED BY DEFAULT again, pending
-     * investigation of a real, 100%-reproducible hard machine freeze
-     * (only the mouse cursor still moves; everything else needs a
-     * power cycle) triggered by simply opening Task Manager with
-     * acceleration active - confirmed on a FRESH boot, first load, no
-     * reload involved (a different, more serious bug than the existing
-     * reload-without-reboot freeze documented elsewhere in this file/
-     * README). A video capture showed Task Manager's "Dynamic areas"
-     * list (an auto-refreshing pane with small percentage-bar fills,
-     * redrawn on a timer with no user input at all) visibly corrupting
-     * - text labels disappearing while bar fills persisted - across
-     * several redraw cycles right before the freeze, strongly
-     * suggesting a real bug in this driver's accelerated fill/copy
-     * path under a usage pattern (unattended, timer-driven, high-
-     * frequency small redraws) that manual drag/resize/scroll testing
-     * in AccelTest.bas never exercised.
+     * Auto-start: claims GraphicsV immediately on load, so a plain
+     * *RMLoad is sufficient for live desktop acceleration - no manual
+     * V3D_AccelStart needed. A hard machine freeze under this (Task
+     * Manager specifically) was found and fixed (see README's "Task
+     * Manager freeze" section - a pmp_alloc/Service_MemoryMoved
+     * reentrancy issue, now resolved by caching scratch page claims
+     * instead of re-claiming them on every call) before this default
+     * was restored.
      *
-     * Was previously the default (unless "NoAutoStart" was on the
-     * command tail) - now inverted: acceleration stays fully opt-in
-     * again (via a manual V3D_AccelStart) unless "AutoStart" is
-     * explicitly given on the command tail, for continued testing by
-     * anyone who understands the risk. Do NOT flip this back to
-     * default-on until the Task Manager freeze is root-caused and
-     * fixed, not just worked around - this is a routine, common action
-     * freezing the whole machine, on every single boot, not an edge
-     * case.
+     * Opt-out: "NoAutoStart" on the command tail
+     * (*RMLoad V3DDriver,ffa NoAutoStart) skips the automatic claim,
+     * leaving the module in manual opt-in mode (V3D_AccelStart still
+     * works normally) - useful for isolating this module during
+     * testing.
      *
      * Deliberately does NOT power on the GPU/PMP/IRQ machinery here -
      * that stays lazy, deferred to the first real accelerated
@@ -687,8 +746,7 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
      * work either way; only the automatic acceleration is unavailable,
      * recoverable later via a manual V3D_AccelStart.
      */
-    if (cmd_tail_has_word(cmd_tail, "AUTOSTART") &&
-        !cmd_tail_has_word(cmd_tail, "NOAUTOSTART"))
+    if (!cmd_tail_has_word(cmd_tail, "NOAUTOSTART"))
         (void) v3d_gfxv_start();
 
     /* Deliberately doing nothing else here: no other hardware is
@@ -770,6 +828,8 @@ enum
     SWI_V3D_StripedFillTest = 22,
     SWI_V3D_AccelStripedStats = 23,
     SWI_V3D_ScreenStripedFillTest = 24,
+    SWI_V3D_AccelReentrantCount = 25,
+    SWI_V3D_AccelTimingStats = 26,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1602,6 +1662,23 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = g_gfxv_striped_claimed_count;
             r->r[2] = g_gfxv_striped_error_count;
             r->r[3] = g_gfxv_striped_last_fail_errnum;
+            return NULL;
+
+        case SWI_V3D_AccelReentrantCount:
+            /* Non-zero means a second GraphicsV Render fill/copy call
+             * landed while a previous one was still in flight and was
+             * safely skipped (see gfxv_accel.c's g_gfxv_busy) - a real
+             * safety net kept as a permanent, cheap diagnostic. */
+            r->r[0] = g_gfxv_reentrant_count;
+            return NULL;
+
+        case SWI_V3D_AccelTimingStats:
+            /* Real accelerated-call timing, cheap to keep permanently:
+             * the worst single call's duration ever seen, in
+             * centiseconds (R0), and the highest accelerated-call rate
+             * seen in any 1-second window all session (R1). */
+            r->r[0] = g_max_call_duration_cs;
+            r->r[1] = g_peak_calls_per_second;
             return NULL;
 
         default:

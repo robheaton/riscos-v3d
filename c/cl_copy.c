@@ -17,6 +17,7 @@
 #include "io_map.h"
 #include "v3d_irq.h"
 
+
 #define TILE_SIZE 64u
 
 static unsigned int div_round_up(unsigned int a, unsigned int b)
@@ -57,17 +58,135 @@ static void get_super_tiles(unsigned int tiles_x, unsigned int tiles_y,
     *frame_h_supertile = fh;
 }
 
+/*
+ * CIRCUIT BREAKER - see cl_fill.c's own wait_for_irq for the full
+ * writeup. Bounded by real wall-clock time (v3d_read_centiseconds),
+ * not just a spin count, since a backlogged GPU/interrupt pipeline
+ * doesn't make the loop itself run any slower. Checked every 4096
+ * iterations to avoid throttling the poll rate with a SWI call every
+ * single spin. Giving up here is always safe - the caller's existing
+ * fail-safe handling (gfxv_accel.c) leaves the call unclaimed on any
+ * error, falling back to normal CPU rendering.
+ */
+extern unsigned int v3d_read_centiseconds(void);
+#define CIRCUIT_BREAKER_TIMEOUT_CS 30u /* 300ms real time */
+
 static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
                                       unsigned int initial,
                                       _kernel_oserror *timeout_err)
 {
     unsigned int spin;
+    unsigned int start_cs = 0;
+    int have_start = 0;
+
     for (spin = 0; spin < 5000000u; spin++)
     {
         if (*counter != initial)
             return NULL;
+
+        if ((spin & 0xFFFu) == 0u)
+        {
+            unsigned int now_cs = v3d_read_centiseconds();
+            if (!have_start)
+            {
+                start_cs = now_cs;
+                have_start = 1;
+            }
+            else if (now_cs - start_cs >= CIRCUIT_BREAKER_TIMEOUT_CS)
+                return timeout_err;
+        }
     }
     return timeout_err;
+}
+
+/*
+ * CACHED SCRATCH ALLOCATION - see cl_fill.c's own identical mechanism
+ * (find_or_create_fill_scratch) for the full writeup (README's "Task
+ * Manager freeze" section) - not shared via a header, same "keep
+ * cl_fill.c and cl_copy.c independently diffable" reasoning as
+ * get_super_tiles/wait_for_irq above. Claims scratch pages ONCE per
+ * distinct base_page (generously, worst-case full-screen sized), then
+ * reuses them on every subsequent call, skipping pmp_alloc (and the
+ * Service_MemoryMoved broadcast it triggers) entirely after the first.
+ */
+#define WORST_CASE_TILES_X 30u
+#define WORST_CASE_TILES_Y 17u
+#define WORST_CASE_N_TILES (WORST_CASE_TILES_X * WORST_CASE_TILES_Y)
+#define MAX_CACHED_SCRATCH 4u
+
+typedef struct
+{
+    unsigned int base_page;
+    unsigned int cl_phys;         void *cl_log;
+    unsigned int rcl_phys;        void *rcl_log;        unsigned int rcl_pages;
+    unsigned int tile_alloc_phys; void *tile_alloc_log;  unsigned int tile_alloc_pages;
+    unsigned int tile_state_phys; void *tile_state_log;  unsigned int tile_state_pages;
+} copy_scratch_cache_t;
+
+static copy_scratch_cache_t g_copy_scratch_cache[MAX_CACHED_SCRATCH];
+static unsigned int g_copy_scratch_cache_count = 0;
+
+static copy_scratch_cache_t *find_or_create_copy_scratch(pmp_area_t *pmp, unsigned int base_page,
+                                                            unsigned int tile_alloc_pages_needed,
+                                                            unsigned int tile_state_pages_needed,
+                                                            unsigned int rcl_pages_needed,
+                                                            _kernel_oserror **err_out)
+{
+    unsigned int i;
+    copy_scratch_cache_t *slot;
+    unsigned int worst_tile_alloc_bytes, worst_tile_state_bytes, worst_rcl_bytes;
+    unsigned int worst_tile_alloc_pages, worst_tile_state_pages, worst_rcl_pages;
+    unsigned int page;
+
+    *err_out = NULL;
+
+    for (i = 0; i < g_copy_scratch_cache_count; i++)
+        if (g_copy_scratch_cache[i].base_page == base_page)
+            return &g_copy_scratch_cache[i];
+
+    if (g_copy_scratch_cache_count >= MAX_CACHED_SCRATCH)
+        return NULL;
+
+    worst_tile_alloc_bytes = WORST_CASE_N_TILES * TILE_SIZE;
+    worst_tile_alloc_bytes = (worst_tile_alloc_bytes + 4095u) & ~4095u;
+    worst_tile_alloc_bytes += TILE_SIZE * TILE_SIZE * 2u;
+    worst_tile_alloc_pages = bytes_to_pages(worst_tile_alloc_bytes);
+
+    worst_tile_state_bytes = WORST_CASE_N_TILES * 256u;
+    worst_tile_state_pages = bytes_to_pages(worst_tile_state_bytes);
+
+    worst_rcl_bytes = 64u + WORST_CASE_N_TILES * 40u + 64u;
+    worst_rcl_pages = bytes_to_pages(worst_rcl_bytes);
+
+    if (tile_alloc_pages_needed > worst_tile_alloc_pages ||
+        tile_state_pages_needed > worst_tile_state_pages ||
+        rcl_pages_needed > worst_rcl_pages)
+        return NULL;
+
+    slot = &g_copy_scratch_cache[g_copy_scratch_cache_count];
+    page = base_page;
+
+    *err_out = pmp_alloc(pmp, page, 1u, &slot->cl_phys, &slot->cl_log);
+    if (*err_out) return NULL;
+    page += 1u;
+
+    slot->rcl_pages = worst_rcl_pages;
+    *err_out = pmp_alloc(pmp, page, worst_rcl_pages, &slot->rcl_phys, &slot->rcl_log);
+    if (*err_out) return NULL;
+    page += worst_rcl_pages;
+
+    slot->tile_alloc_pages = worst_tile_alloc_pages;
+    *err_out = pmp_alloc(pmp, page, worst_tile_alloc_pages, &slot->tile_alloc_phys, &slot->tile_alloc_log);
+    if (*err_out) return NULL;
+    page += worst_tile_alloc_pages;
+
+    slot->tile_state_pages = worst_tile_state_pages;
+    *err_out = pmp_alloc(pmp, page, worst_tile_state_pages, &slot->tile_state_phys, &slot->tile_state_log);
+    if (*err_out) return NULL;
+
+    slot->base_page = base_page;
+    g_copy_scratch_cache_count++;
+    return slot;
 }
 
 /*
@@ -139,20 +258,36 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
         return &err_too_big;
     }
 
-    err = pmp_alloc(pmp, page, 1u, &cl_phys, &cl_log);
-    if (err) return err;
-    page += 1u;
+    {
+        copy_scratch_cache_t *cache = find_or_create_copy_scratch(
+            pmp, base_page, tile_alloc_pages, tile_state_pages, rcl_pages, &err);
+        if (err) return err;
 
-    err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
-    if (err) return err;
-    page += rcl_pages;
+        if (cache)
+        {
+            cl_phys = cache->cl_phys; cl_log = cache->cl_log;
+            rcl_phys = cache->rcl_phys; rcl_log_ptr = cache->rcl_log;
+            tile_alloc_phys = cache->tile_alloc_phys; tile_alloc_log = cache->tile_alloc_log;
+            tile_state_phys = cache->tile_state_phys; tile_state_log = cache->tile_state_log;
+        }
+        else
+        {
+            err = pmp_alloc(pmp, page, 1u, &cl_phys, &cl_log);
+            if (err) return err;
+            page += 1u;
 
-    err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
-    if (err) return err;
-    page += tile_alloc_pages;
+            err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
+            if (err) return err;
+            page += rcl_pages;
 
-    err = pmp_alloc(pmp, page, tile_state_pages, &tile_state_phys, &tile_state_log);
-    if (err) return err;
+            err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
+            if (err) return err;
+            page += tile_alloc_pages;
+
+            err = pmp_alloc(pmp, page, tile_state_pages, &tile_state_phys, &tile_state_log);
+            if (err) return err;
+        }
+    }
 
     {
         unsigned int i;
@@ -391,6 +526,59 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * unclaimed) takes over instead of this driver attempting something
  * only partially tested.
  */
+/*
+ * Cached scratch PIXEL buffer for the overlap-safe path - same
+ * reasoning and mechanism as find_or_create_copy_scratch above, but
+ * for the actual scratch pixel data (not the CL/tile_alloc/tile_state
+ * machinery run_copy claims for itself). Claimed once at
+ * PMP_MAX_PAGES_PER_CALL (the largest size this path ever allows
+ * anyway - see the size check this replaces), keyed by base_page, and
+ * reused thereafter regardless of the ACTUAL width/height being
+ * copied on any given call (the buffer is always big enough; only the
+ * portion actually used varies). This also fixes a second, related
+ * problem: the offset this function hands to run_copy for ITS OWN
+ * scratch (previously `base_page + scratch_pages`, where
+ * `scratch_pages` varies with width/height) needs to be STABLE across
+ * calls of different sizes for run_copy's own cache lookup to ever
+ * hit - it now always passes `base_page + PMP_MAX_PAGES_PER_CALL`, a
+ * fixed constant, instead.
+ */
+#define MAX_CACHED_OVERLAP_SCRATCH 2u
+
+typedef struct
+{
+    unsigned int base_page;
+    unsigned int scratch_phys; void *scratch_log;
+} overlap_scratch_cache_t;
+
+static overlap_scratch_cache_t g_overlap_scratch_cache[MAX_CACHED_OVERLAP_SCRATCH];
+static unsigned int g_overlap_scratch_cache_count = 0;
+
+static overlap_scratch_cache_t *find_or_create_overlap_scratch(pmp_area_t *pmp, unsigned int base_page,
+                                                                  _kernel_oserror **err_out)
+{
+    unsigned int i;
+    overlap_scratch_cache_t *slot;
+
+    *err_out = NULL;
+
+    for (i = 0; i < g_overlap_scratch_cache_count; i++)
+        if (g_overlap_scratch_cache[i].base_page == base_page)
+            return &g_overlap_scratch_cache[i];
+
+    if (g_overlap_scratch_cache_count >= MAX_CACHED_OVERLAP_SCRATCH)
+        return NULL;
+
+    slot = &g_overlap_scratch_cache[g_overlap_scratch_cache_count];
+
+    *err_out = pmp_alloc(pmp, base_page, PMP_MAX_PAGES_PER_CALL, &slot->scratch_phys, &slot->scratch_log);
+    if (*err_out) return NULL;
+
+    slot->base_page = base_page;
+    g_overlap_scratch_cache_count++;
+    return slot;
+}
+
 _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_page,
                                                unsigned int src_x, unsigned int src_y,
                                                unsigned int dest_x, unsigned int dest_y,
@@ -431,21 +619,37 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
         return &err_too_big;
     }
 
-    err = pmp_alloc(pmp, base_page, scratch_pages, &scratch_phys, &scratch_log);
-    if (err) return err;
+    {
+        overlap_scratch_cache_t *cache = find_or_create_overlap_scratch(pmp, base_page, &err);
+        if (err) return err;
+
+        if (cache)
+        {
+            scratch_phys = cache->scratch_phys;
+            scratch_log = cache->scratch_log;
+        }
+        else
+        {
+            err = pmp_alloc(pmp, base_page, scratch_pages, &scratch_phys, &scratch_log);
+            if (err) return err;
+        }
+    }
 
     src_phys = screen_phys_base + src_y * screen_stride + src_x * 4u;
     dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * 4u;
 
     /* Pass 1: real source -> scratch (always non-overlapping - scratch
-     * is fresh driver memory nothing else touches). */
-    err = run_copy(pmp, base_page + scratch_pages, width, height,
+     * is fresh driver memory nothing else touches). Fixed offset
+     * (PMP_MAX_PAGES_PER_CALL, not the variable `scratch_pages`) so
+     * run_copy's own scratch cache lookup is stable across differently-
+     * sized calls - see this function's own top comment. */
+    err = run_copy(pmp, base_page + PMP_MAX_PAGES_PER_CALL, width, height,
                     src_phys, scratch_phys, screen_stride, scratch_stride,
                     &tiles_x, &tiles_y);
     if (err) return err;
 
     /* Pass 2: scratch -> real destination (same reasoning). */
-    err = run_copy(pmp, base_page + scratch_pages, width, height,
+    err = run_copy(pmp, base_page + PMP_MAX_PAGES_PER_CALL, width, height,
                     scratch_phys, dest_phys, scratch_stride, screen_stride,
                     &tiles_x, &tiles_y);
     if (err) return err;

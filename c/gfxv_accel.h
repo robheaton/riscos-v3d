@@ -75,6 +75,13 @@ extern volatile unsigned int g_gfxv_striped_claimed_count;
 extern volatile unsigned int g_gfxv_striped_error_count;
 extern volatile unsigned int g_gfxv_striped_last_fail_errnum;
 
+/* Reentrancy diagnostic - see gfxv_accel.c's own g_gfxv_busy comment.
+ * Non-zero means a second GraphicsV Render fill/copy call landed while
+ * a previous one was still being processed, and was safely skipped
+ * rather than risking corruption of shared scratch state. Exposed for
+ * V3D_AccelReentrantCount. */
+extern volatile unsigned int g_gfxv_reentrant_count;
+
 /* Op 1 (copy) instrumentation - see gfxv_accel.c's own comment.
  * Exposed for V3D_AccelCopyStats. */
 extern volatile unsigned int g_gfxv_copy_op_count;

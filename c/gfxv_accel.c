@@ -123,6 +123,22 @@ volatile unsigned int g_gfxv_striped_error_count = 0;
 volatile unsigned int g_gfxv_striped_last_fail_errnum = 0;
 
 /*
+ * Reentrancy guard around the actual fill/copy work: if a second
+ * GraphicsV Render call ever lands while this handler is still
+ * mid-flight on a first one (e.g. still spinning in wait_for_irq,
+ * which does not disable interrupts), both calls would otherwise
+ * share the exact same static PMP scratch pages (g_pmp_fill at
+ * SCREEN_FILL_BASE_PAGE/SCREEN_COPY_BASE_PAGE) - two concurrent
+ * run_fill/run_copy calls could submit interleaved, mutually-
+ * corrupting control lists to the same CL/tile_alloc/tile_state
+ * buffers. The nested call is left completely unclaimed (no GPU work
+ * attempted, R4 untouched) rather than risking that - same fail-safe
+ * philosophy as every other failure path in this driver.
+ */
+static volatile int g_gfxv_busy = 0;
+volatile unsigned int g_gfxv_reentrant_count = 0;
+
+/*
  * Op 1 (copy) instrumentation - added from the start this time, having
  * learned from op 2's own live-test experience (a real bug and a real
  * throughput/reliability question both only became visible once actual
@@ -425,16 +441,34 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
     g_gfxv_call_count++;
 
     reason = ((unsigned int) r->r[4]) & GRAPHICSV_REASON_MASK;
+    op = (unsigned int) r->r[1];
+
     if (reason != GRAPHICSV_REASON_RENDER)
         return 1; /* not ours - VECTOR_PASSON, R4 untouched */
 
     g_gfxv_render_count++;
 
-    op = (unsigned int) r->r[1];
-    if (op == RENDER_OP_FILL)
-        handle_render_fill(r);
-    else if (op == RENDER_OP_COPY)
-        handle_render_copy(r);
+    if (op == RENDER_OP_FILL || op == RENDER_OP_COPY)
+    {
+        /* Reentrancy guard - see g_gfxv_busy's own top comment. Checked
+         * immediately before touching any shared scratch state, not
+         * before the call/render counters above, so those stay accurate
+         * diagnostics regardless of whether this guard ever trips. */
+        if (g_gfxv_busy)
+        {
+            g_gfxv_reentrant_count++;
+            return 1; /* leave unclaimed - do NOT touch shared PMP
+                        * scratch state while a call is already in
+                        * flight; R4 untouched */
+        }
+
+        g_gfxv_busy = 1;
+        if (op == RENDER_OP_FILL)
+            handle_render_fill(r);
+        else
+            handle_render_copy(r);
+        g_gfxv_busy = 0;
+    }
     /* op 0 (no-op) and any other value: not ours, R4 left untouched */
 
     return 1; /* VECTOR_PASSON regardless - see gfxv_accel.h */

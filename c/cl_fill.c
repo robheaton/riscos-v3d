@@ -97,18 +97,168 @@ static void get_super_tiles(unsigned int tiles_x, unsigned int tiles_y,
  * still unproven. If a real hardware timeout ever shows up here, port
  * the diagnostics over then, with real failure data to shape them
  * around instead of guessing what's worth logging in advance.
+ *
+ * CIRCUIT BREAKER: bounded by real wall-clock time
+ * (v3d_read_centiseconds, an OS_ReadMonotonicTime wrapper), not just a
+ * raw spin-count - a tight loop's real-world duration depends on
+ * system load, and a stalled GPU/interrupt pipeline doesn't make the
+ * loop itself run any slower, so counting iterations alone doesn't
+ * bound real elapsed time. Checked only every 4096 fast inner
+ * iterations, not every single one, since a SWI call is far more
+ * expensive than a plain memory read and doing it every iteration
+ * would itself throttle the poll rate. Giving up here is always safe:
+ * the caller's own existing fail-safe handling (see gfxv_accel.c)
+ * leaves the GraphicsV call unclaimed on any error, falling back to
+ * normal CPU rendering.
  */
+extern unsigned int v3d_read_centiseconds(void);
+#define CIRCUIT_BREAKER_TIMEOUT_CS 30u /* 300ms real time */
+
 static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
                                       unsigned int initial,
                                       _kernel_oserror *timeout_err)
 {
     unsigned int spin;
+    unsigned int start_cs = 0;
+    int have_start = 0;
+
     for (spin = 0; spin < 5000000u; spin++)
     {
         if (*counter != initial)
             return NULL;
+
+        if ((spin & 0xFFFu) == 0u)
+        {
+            unsigned int now_cs = v3d_read_centiseconds();
+            if (!have_start)
+            {
+                start_cs = now_cs;
+                have_start = 1;
+            }
+            else if (now_cs - start_cs >= CIRCUIT_BREAKER_TIMEOUT_CS)
+                return timeout_err;
+        }
     }
-    return timeout_err;
+    return timeout_err; /* absolute safety net if the clock itself is
+                          * ever unavailable - see v3d_read_centiseconds's
+                          * own defensive 0-on-error return */
+}
+
+/*
+ * CACHED SCRATCH ALLOCATION - claims scratch pages ONCE per distinct
+ * `base_page` (generously, for a worst-case full-screen-sized
+ * operation), then reuses the same already-claimed pages on every
+ * subsequent call at that base_page, rather than calling `pmp_alloc`
+ * fresh every time. This matters beyond just avoiding SWI overhead:
+ * `pmp_alloc`'s page-claim step (OS_DynamicArea reason 21)
+ * unconditionally broadcasts `Service_MemoryMoved`, a genuinely
+ * synchronous service call reaching directly into every registered
+ * handler - including the Wimp module's own, which does real SVC-mode
+ * bookkeeping. Every accelerated fill used to call `pmp_alloc` four
+ * separate times (cl/rcl/tile_alloc/tile_state), each broadcasting
+ * this from INSIDE a GraphicsV call the Wimp itself had just
+ * dispatched to us - the Wimp's own reentrant bookkeeping running
+ * nested inside a redraw it was still mid-dispatch of. This was the
+ * real root cause of a hard machine freeze under specific live desktop
+ * conditions (Task Manager's own Dynamic Areas display watching this
+ * driver's own memory churn) - see README's "Task Manager freeze"
+ * section for the full investigation.
+ *
+ * Safe by construction: the CL/RCL are always rebuilt from scratch
+ * below, and tile_alloc/tile_state are always explicitly zeroed before
+ * use, regardless of whether the underlying pages were freshly claimed
+ * or are being reused - only the SOURCE of the physical/logical
+ * addresses changes, none of the control-list-building or GPU-
+ * submission logic does. A request exceeding the worst-case cached
+ * size (an unusually large screen) falls back to the original uncached
+ * behaviour for that one call rather than trying to grow the cache.
+ */
+#define WORST_CASE_TILES_X 30u  /* covers up to 1920px wide (30*64) */
+#define WORST_CASE_TILES_Y 17u  /* covers up to 1088px tall (17*64) */
+#define WORST_CASE_N_TILES (WORST_CASE_TILES_X * WORST_CASE_TILES_Y)
+#define MAX_CACHED_SCRATCH 4u
+
+typedef struct
+{
+    unsigned int base_page; /* 0xFFFFFFFFu = unused slot */
+    unsigned int cl_phys;         void *cl_log;
+    unsigned int rcl_phys;        void *rcl_log;        unsigned int rcl_pages;
+    unsigned int tile_alloc_phys; void *tile_alloc_log;  unsigned int tile_alloc_pages;
+    unsigned int tile_state_phys; void *tile_state_log;  unsigned int tile_state_pages;
+} fill_scratch_cache_t;
+
+static fill_scratch_cache_t g_fill_scratch_cache[MAX_CACHED_SCRATCH];
+static unsigned int g_fill_scratch_cache_count = 0;
+
+/*
+ * Finds the cache slot for `base_page`, claiming one (at generous
+ * worst-case sizing) if this is the first time it's been seen. Returns
+ * NULL (with *err_out left NULL) if the actual request exceeds the
+ * worst-case cached size or the cache table is full - the caller falls
+ * back to its own original uncached pmp_alloc sequence in that case.
+ * Returns NULL with *err_out SET if the one-time claim itself fails.
+ */
+static fill_scratch_cache_t *find_or_create_fill_scratch(pmp_area_t *pmp, unsigned int base_page,
+                                                            unsigned int tile_alloc_pages_needed,
+                                                            unsigned int tile_state_pages_needed,
+                                                            unsigned int rcl_pages_needed,
+                                                            _kernel_oserror **err_out)
+{
+    unsigned int i;
+    fill_scratch_cache_t *slot;
+    unsigned int worst_tile_alloc_bytes, worst_tile_state_bytes, worst_rcl_bytes;
+    unsigned int worst_tile_alloc_pages, worst_tile_state_pages, worst_rcl_pages;
+    unsigned int page;
+
+    *err_out = NULL;
+
+    for (i = 0; i < g_fill_scratch_cache_count; i++)
+        if (g_fill_scratch_cache[i].base_page == base_page)
+            return &g_fill_scratch_cache[i];
+
+    if (g_fill_scratch_cache_count >= MAX_CACHED_SCRATCH)
+        return NULL;
+
+    worst_tile_alloc_bytes = WORST_CASE_N_TILES * TILE_SIZE;
+    worst_tile_alloc_bytes = (worst_tile_alloc_bytes + 4095u) & ~4095u;
+    worst_tile_alloc_bytes += TILE_SIZE * TILE_SIZE * 2u;
+    worst_tile_alloc_pages = bytes_to_pages(worst_tile_alloc_bytes);
+
+    worst_tile_state_bytes = WORST_CASE_N_TILES * 256u;
+    worst_tile_state_pages = bytes_to_pages(worst_tile_state_bytes);
+
+    worst_rcl_bytes = 64u + WORST_CASE_N_TILES * 40u + 64u;
+    worst_rcl_pages = bytes_to_pages(worst_rcl_bytes);
+
+    if (tile_alloc_pages_needed > worst_tile_alloc_pages ||
+        tile_state_pages_needed > worst_tile_state_pages ||
+        rcl_pages_needed > worst_rcl_pages)
+        return NULL; /* bigger than our worst case - caller falls back */
+
+    slot = &g_fill_scratch_cache[g_fill_scratch_cache_count];
+    page = base_page;
+
+    *err_out = pmp_alloc(pmp, page, 1u, &slot->cl_phys, &slot->cl_log);
+    if (*err_out) return NULL;
+    page += 1u;
+
+    slot->rcl_pages = worst_rcl_pages;
+    *err_out = pmp_alloc(pmp, page, worst_rcl_pages, &slot->rcl_phys, &slot->rcl_log);
+    if (*err_out) return NULL;
+    page += worst_rcl_pages;
+
+    slot->tile_alloc_pages = worst_tile_alloc_pages;
+    *err_out = pmp_alloc(pmp, page, worst_tile_alloc_pages, &slot->tile_alloc_phys, &slot->tile_alloc_log);
+    if (*err_out) return NULL;
+    page += worst_tile_alloc_pages;
+
+    slot->tile_state_pages = worst_tile_state_pages;
+    *err_out = pmp_alloc(pmp, page, worst_tile_state_pages, &slot->tile_state_phys, &slot->tile_state_log);
+    if (*err_out) return NULL;
+
+    slot->base_page = base_page;
+    g_fill_scratch_cache_count++;
+    return slot;
 }
 
 /*
@@ -194,20 +344,39 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
         return &err_too_big;
     }
 
-    err = pmp_alloc(pmp, page, 1u, &cl_phys, &cl_log);
-    if (err) return err;
-    page += 1u;
+    {
+        fill_scratch_cache_t *cache = find_or_create_fill_scratch(
+            pmp, base_page, tile_alloc_pages, tile_state_pages, rcl_pages, &err);
+        if (err) return err;
 
-    err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
-    if (err) return err;
-    page += rcl_pages;
+        if (cache)
+        {
+            cl_phys = cache->cl_phys; cl_log = cache->cl_log;
+            rcl_phys = cache->rcl_phys; rcl_log_ptr = cache->rcl_log;
+            tile_alloc_phys = cache->tile_alloc_phys; tile_alloc_log = cache->tile_alloc_log;
+            tile_state_phys = cache->tile_state_phys; tile_state_log = cache->tile_state_log;
+        }
+        else
+        {
+            /* Bigger than our cached worst-case (or the cache table is
+             * full) - fall back to the original uncached sequence for
+             * just this one call. */
+            err = pmp_alloc(pmp, page, 1u, &cl_phys, &cl_log);
+            if (err) return err;
+            page += 1u;
 
-    err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
-    if (err) return err;
-    page += tile_alloc_pages;
+            err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
+            if (err) return err;
+            page += rcl_pages;
 
-    err = pmp_alloc(pmp, page, tile_state_pages, &tile_state_phys, &tile_state_log);
-    if (err) return err;
+            err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
+            if (err) return err;
+            page += tile_alloc_pages;
+
+            err = pmp_alloc(pmp, page, tile_state_pages, &tile_state_phys, &tile_state_log);
+            if (err) return err;
+        }
+    }
 
     /* Zero tile-alloc/tile-state scratch - see cl_clear.c's own comment
      * on why (recycled RISC OS pages, not guaranteed-zero fresh memory). */

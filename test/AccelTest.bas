@@ -96,6 +96,23 @@ PRINT "  attempted but failed:                        "; striped_errors%
 IF striped_errors% > 0 THEN PRINT "  last failure error number:                   "; striped_errnum%
 PRINT
 
+REM V3D_AccelReentrantCount: non-zero means a second GraphicsV Render
+REM call landed while a previous one was still being processed, and
+REM was safely skipped rather than risking corruption of shared
+REM scratch state (see gfxv_accel.c's reentrancy guard). Should always
+REM read 0 in normal use.
+SYS "V3D_AccelReentrantCount" TO reentrant%
+PRINT "GraphicsV calls skipped as reentrant (diagnostic): "; reentrant%
+PRINT
+
+REM V3D_AccelTimingStats: R0=worst single accelerated call's duration
+REM ever seen (centiseconds), R1=highest accelerated-call rate seen in
+REM any 1-second window all session.
+SYS "V3D_AccelTimingStats" TO max_dur_cs%, peak_rate%
+PRINT "Worst single accelerated call duration: "; max_dur_cs%; " cs ("; max_dur_cs%*10; " ms)"
+PRINT "Peak accelerated calls in any 1-second window: "; peak_rate%
+PRINT
+
 SYS "V3D_AccelStop"
 PRINT "Released (V3D_AccelStop) - back to normal software rendering."
 PRINT

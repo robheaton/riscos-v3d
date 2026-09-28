@@ -1693,7 +1693,7 @@ Not yet run on hardware.
   auto-start is currently disabled by default - acceleration is opt-in
   only until this is root-caused and fixed.
 
-## Auto-start at boot (2026-09-27, hardware-verified; DISABLED BY DEFAULT since - see "URGENT: Task Manager freeze" below)
+## Auto-start at boot (2026-09-27, hardware-verified; briefly disabled by default after a freeze was found - root-caused, fixed, and RE-ENABLED as of 2026-09-28, see "Task Manager freeze: ROOT-CAUSED AND FIXED FOR REAL" below)
 
 The module now claims `GraphicsV` automatically in `module_init` - the
 moment it's loaded, acceleration is active, no manual `V3D_AccelStart`
@@ -1870,7 +1870,158 @@ pattern those two rounds never happened to exercise (an unattended,
 timer-driven redraw of a small-percentage-bar list) turned out to
 freeze the machine hard.
 
-## URGENT: Task Manager freeze - auto-start disabled by default (2026-09-27)
+## Task Manager freeze: root-caused and fixed (2026-09-27)
+
+**Root cause found.** Real timing instrumentation (`V3D_AccelTimingStats`,
+added specifically to test this) showed a normal accelerated GraphicsV
+call completing in ~10ms, with ordinary desktop interaction already
+producing bursts of up to 176 accelerated calls/second. Under Task
+Manager's own redraw traffic, a screen-beacon diagnostic captured at
+the moment of freeze showed one accelerated call's wall-clock duration
+had hit `cl_fill.c`/`cl_copy.c`'s `wait_for_irq` spin-loop's old
+5,000,000-iteration bound - a ~300x slowdown from the 10ms baseline.
+That loop runs entirely in SVC mode, so a multi-second stall there
+blocks the WHOLE machine for its entire duration - matching the
+freeze's exact signature (only the hardware cursor, DMA/interrupt-
+driven and decoupled from the CPU, kept moving; everything else was
+genuinely unresponsive because the CPU was stuck in this one spin loop,
+not because anything had actually crashed).
+
+**Why Task Manager specifically**: real RISC OS source (Switcher's own
+`s/Switcher`, `calc_slotsize`/`calc_rmasize`, called unconditionally on
+EVERY Wimp Null event while the Task window is open) shows Task
+Manager re-checks memory/dynamic-area sizes and force-redraws on any
+change, every single poll - a plausible feedback loop, since this
+driver's own PMP scratch allocations (used by every accelerated
+fill/copy) change exactly the RMA/Dynamic Area sizes Task Manager is
+watching, potentially triggering yet more redraws in response to the
+very acceleration meant to speed them up. This likely pushed the real
+accelerated-call rate far above the 176/sec baseline measured during
+ordinary dragging, backlogging the GPU/interrupt pipeline until
+individual calls' wall-clock latency spiked into the seconds.
+
+**The actual bug**: `wait_for_irq`'s timeout was a raw spin-COUNT
+(5,000,000 iterations), not a real-time bound. That protects against a
+tight loop that itself runs slowly, but does nothing against a
+genuinely backlogged GPU/interrupt pipeline, where the loop runs at
+normal speed but the IRQ it's waiting for is simply delayed for a long
+real-world time - iteration count alone can't distinguish "this will
+never happen" from "this is coming, just slowly," and wasn't bounding
+real elapsed time at all.
+
+**The fix**: `wait_for_irq` (duplicated independently in `cl_fill.c`
+and `cl_copy.c`, per this project's established convention of not
+touching the separately-proven `cl_clear.c` path) now bounds real
+wall-clock time via `v3d_read_centiseconds` (the same
+`OS_ReadMonotonicTime` wrapper proven safe by the timing-stats work
+above), checked every 4096 inner iterations rather than every single
+one (a SWI call is far more expensive than a plain memory read, so
+checking every iteration would itself throttle the poll). Bailing out
+after `CIRCUIT_BREAKER_TIMEOUT_CS` (30 centiseconds = 300ms - a ~30x
+margin above the measured 10ms normal case, generous enough for
+legitimately larger operations, while cutting a multi-second stall
+short roughly 10x faster) is always safe: the caller's existing
+fail-safe handling (`gfxv_accel.c`) already leaves any failed
+GraphicsV call unclaimed, falling back to normal CPU rendering - a
+fast bailout is strictly better than a slow one, never worse, since
+"gave up and let the CPU draw it instead" was always the safe outcome
+this driver falls back to on any error.
+
+**Diagnostic methodology that got here** (worth remembering for future
+hangs): a reentrancy guard ruled out concurrent-call corruption first;
+a single unmistakable red/green "is a call in flight" screen beacon
+(bypassing the GPU entirely, so it survives even a CPU lockup) ruled
+out a permanently wedged GPU submission; real timing counters
+(readable safely via an ordinary, non-freezing test run) established a
+normal baseline; only then did a targeted screen-beacon reading confirm
+the specific call that stalled. Several earlier attempts at fine-
+grained, colour/position-coded screen beacons proved genuinely hard to
+read back reliably from a phone photo (JPEG colour grading, cropping,
+and small pixel gaps all introduced real ambiguity) - the large,
+binary-state (red/green) signal and the plain numeric counters were
+what actually resolved this, not the detailed bar charts. Reading the
+actual RISC OS Task Manager source (Switcher) directly, rather than
+inferring its behaviour from the outside, was what explained *why*
+Task Manager specifically triggers this and nothing else tested so far
+does.
+
+**UPDATE: hardware-tested, did NOT fix the freeze.** The circuit
+breaker is real and correct (a raw spin-count timeout genuinely doesn't
+bound real elapsed time under load, and this fix stands on its own
+merits), but the freeze still happened afterward, identically. The
+big-flag diagnostic (see above) was re-checked at this freeze and came
+back GREEN - meaning the last accelerated call had ALREADY finished
+cleanly, contradicting the "one call stalls for seconds" theory this
+fix targeted. In hindsight, the earlier duration-beacon reading showing
+~3 seconds was very likely a real but non-fatal slow call captured
+SOMEWHERE during that test run, not the actual freeze event itself -
+a red herring, not the cause.
+
+**Second theory tested and also ruled out**: this handler always
+returns `VECTOR_PASSON`, even after successfully claiming a call,
+meaning the kernel's own downstream GraphicsV claimant (the HAL video
+bridge) still runs afterward for the same event - theorised that some
+edge case in that downstream interaction, not this driver's own work,
+could be the real cause. Tested directly: after a successful claim,
+return `VECTOR_CLAIM` instead, stopping the chain right there. **Still
+froze, big-flag still GREEN.** This rules out the downstream-claimant
+interaction as well.
+
+**Third theory tested: mere claiming/init, independent of real GPU work
+("dry run").** Built a version that still runs every setup step (GPU
+power-on, PMP Dynamic Area, IRQ vector claim) but deliberately skips
+the actual `v3d_fill_screen`/`v3d_copy_screen`/etc call, falling back
+to CPU rendering every time. **Did NOT freeze.** This isolates the bug
+to real GPU-drawn content actually appearing on screen - ruling out
+"just being an active GraphicsV claimant" as sufficient on its own.
+
+**Fourth theory tested: CPU/GPU cache coherency.** Added a genuine
+CPU-side readback check (`check_fill_cache_coherency`) right after
+every live accelerated solid fill, comparing the actual pixel value
+against what was requested - 597 checks, 0 mismatches during ordinary
+use. Cross-checked by reading `phys_buffer.c` directly: every PMP
+scratch buffer is already explicitly mapped non-cacheable (a real fix
+from earlier in this project), and `pmp_alloc` always releases the
+previous claim at a base page before reclaiming it (no leak from
+reusing the same base page on every call, confirmed by reading the
+code, not assumed). **Ruled out.**
+
+**Fifth theory tested: high-frequency Dynamic Area churn on its own.**
+New `V3D_PMPChurnTest` SWI does 5000 rapid `pmp_alloc` calls (real
+`OS_DynamicArea`/`OS_Memory` SWIs) with ZERO V3D hardware interaction -
+no GPU submission, nothing rendered at all - run while Task Manager was
+open. Completed cleanly in 190ms. **Ruled out.**
+
+**Where this leaves things**: every hypothesis specific to this
+driver's own code has now been tested and ruled out on real hardware -
+reentrancy, IRQ-wait timeout, downstream vector-chain interaction, mere
+claiming/init, CPU/GPU cache coherency, PMP memory leak, and
+high-frequency Dynamic Area churn in isolation. The only confirmed
+fact remaining: dry-run (no real GPU-drawn content) never freezes;
+real acceleration (actual GPU register writes, rendering, and real
+pixel output) eventually does, while this driver's own instrumentation
+shows every individual call it can see completing cleanly every time.
+This is a genuinely deep, elusive bug at this point - possibly
+something cumulative across many real submissions rather than any
+single call's fault, or a GraphicsV call type this driver's own "busy"
+instrumentation doesn't cover, or an interaction not yet visible to
+anything tried so far. The circuit-breaker fix and reentrancy guard
+both remain in place as real, defensible improvements on their own
+merits, even though neither was the root cause.
+
+**Practical status**: acceleration remains reliable for ordinary
+desktop use (thousands of successful, correct accelerated calls in
+every test that didn't involve Task Manager) - this is now a narrow,
+specific, documented limitation (Task Manager only) rather than a
+general reliability problem. Auto-start stays OFF by default until
+this is properly root-caused. Continuing to narrow this down further
+would need either a fundamentally different diagnostic angle (much
+richer real-time V3D register capture, or a way to make the freeze
+reproducible via script rather than needing manual Task Manager
+interaction each time) or a decision to accept this as a known
+limitation for now.
+
+## URGENT: Task Manager freeze - auto-start disabled by default (2026-09-27; RESOLVED 2026-09-28, see "Task Manager freeze: ROOT-CAUSED AND FIXED FOR REAL" below - auto-start is back on by default)
 
 Real-world use immediately after the above (opening Task Manager, no
 special action beyond that) produced a **100% reproducible hard machine
@@ -1918,6 +2069,110 @@ flip the default back to auto-start-on until this freeze is root-caused
 and fixed, not merely worked around** - unlike the reload freeze (which
 only bites during development-time reloading), this bites on ordinary
 end-user desktop use.
+
+## Task Manager freeze: ROOT-CAUSED AND FIXED FOR REAL (2026-09-28)
+
+The investigation above (circuit breaker, VECTOR_CLAIM, cache
+coherency, thin rectangles, PMP churn in isolation) ruled out a long
+list of real, well-reasoned hypotheses one at a time, but none of them
+were the actual cause - each fix or test that looked promising still
+froze identically, or failed to reproduce anything at all. The real
+answer needed reading RISC OS's own kernel source directly, not more
+guessing from outside.
+
+**The actual mechanism**: `pmp_alloc`'s physical-page claim step
+(`OS_DynamicArea` reason 21) unconditionally broadcasts
+`Service_MemoryMoved` - confirmed directly in the real kernel source
+(`Kernel/s/ChangeDyn`, `DynArea_PMP_PhysOp` → `PMPMemoryMoved` →
+`Issue_Service`, no exceptions, every single call). Service calls in
+RISC OS are genuinely synchronous - the kernel calls directly into
+every registered handler, in the same call stack, immediately. **The
+Wimp module itself has a real, non-trivial handler for this exact
+service call** - confirmed synchronous free-pool/page-table bookkeeping
+in SVC mode, with interrupts deliberately re-enabled mid-handler (an
+old documented MOS-bug workaround).
+
+Every accelerated fill or copy used to call `pmp_alloc` up to four
+separate times (one each for the CL, RCL, tile_alloc, and tile_state
+scratch buffers) - meaning up to four `Service_MemoryMoved` broadcasts
+per operation, each one reaching back into the Wimp module's own
+internal bookkeeping. Critically, this always happened from **inside**
+a `GraphicsV` call the Wimp itself had just dispatched to us - meaning
+the Wimp's own reentrant bookkeeping ran nested inside a redraw it was
+still in the middle of issuing. This is a fundamentally different, far
+nastier kind of reentrancy than anything tested earlier in this
+investigation (which all focused on this driver's own vector-handler
+reentrancy, already proven not to be the issue) - it's the *Wimp*
+re-entering *itself*, indirectly, via our driver's own memory
+management calls.
+
+This also explains, precisely, why neither `V3D_PMPChurnTest` nor
+`ThinRectStressTest` (isolated, no-Task-Manager-needed stress tests
+built earlier in this investigation) ever reproduced it, despite both
+doing thousands of real, rapid page claims: **both call this driver
+directly via SWI, bypassing `GraphicsV` entirely** - neither one ever
+triggers a `pmp_alloc` from *inside* a live Wimp-dispatched redraw, so
+neither could ever expose this specific hazard. Only genuine
+`GraphicsV`-routed traffic (ordinary dragging, or Task Manager) ever
+does that - and Task Manager's own Dynamic Areas list (confirmed via a
+real screen recording to be the ONLY part of its window that
+continuously redraws/flickers, everything else static) directly
+displays this driver's own "V3DFill" dynamic area, watching exactly
+the memory churn our own accelerated calls generate.
+
+**The fix**: claim scratch pages ONCE per distinct base page
+(generously, sized for a worst-case full-screen operation - 30x17
+tiles), then reuse the same already-claimed pages on every subsequent
+call, skipping `pmp_alloc` - and therefore the `Service_MemoryMoved`
+broadcast - entirely after the first use. Implemented independently in
+both `cl_fill.c` (`find_or_create_fill_scratch`) and `cl_copy.c`
+(`find_or_create_copy_scratch`, plus a matching cache for the overlap-
+copy path's own scratch pixel buffer), following this project's
+existing convention of keeping the two files independently diffable.
+Safe by construction: the CL/RCL are always rebuilt from scratch on
+every call regardless, and tile_alloc/tile_state are always explicitly
+zeroed before use - only the *source* of the physical/logical
+addresses changes from "always freshly claimed" to "claimed once, then
+reused"; none of the control-list-building or GPU-submission logic
+changes at all. A request bigger than the cached worst-case size (an
+unusually large screen) falls back to the original uncached behaviour
+for that one call rather than trying to grow the cache.
+
+**Confirmed on real hardware 2026-09-28**: the exact same test that
+had reliably frozen the machine on every previous build - `*RMLoad`,
+`V3D_AccelStart`, open Task Manager - ran cleanly with substantial
+interaction (scrolling the Dynamic Areas list, resizing the window,
+dragging other windows, left open for an extended period). Immediately
+followed by a full `AccelTest.bas` run *with Task Manager still open*:
+**14,852 GraphicsV handler invocations, 3,216 real accelerated
+operations (1164 fills + 1968 direct copies + 84 overlap copies), zero
+failures, zero cache-coherency mismatches.** The bug is fixed, not
+just worked around - the actual `Service_MemoryMoved` reentrancy
+hazard is eliminated from the hot path, not merely made less likely to
+trigger.
+
+**Status**: auto-start has been RE-ENABLED by default (module version
+0.04) now that the root cause is understood and fixed - a plain
+`*RMLoad` is once again sufficient for live desktop acceleration, no
+manual `V3D_AccelStart` needed (opt out via `NoAutoStart` on the
+command tail if you want manual control instead). The temporary
+diagnostic instrumentation accumulated during this investigation
+(screen beacons, the dry-run toggle, the per-pixel cache-coherency
+check, `V3D_PMPChurnTest`) has been removed - the real, permanent
+fixes (scratch-page caching, the wall-clock circuit breaker, the
+reentrancy guard, `V3D_AccelReentrantCount`/`V3D_AccelTimingStats` as
+lightweight ongoing diagnostics) remain in place.
+
+**Methodology note worth remembering for future hard-to-reproduce
+bugs on this project**: real kernel source access
+(`~/Development/BCM2835/RiscOS/Sources`) was decisive here, twice -
+once to rule out Switcher's own Service-call handler as trivial
+(saving time chasing a dead end), and once to find the Wimp module's
+own handler as the real hazard. Guessing from outside the black box
+(spin-count timeouts, vector-chain protocol details, cache flags) took
+many builds and found real, worthwhile improvements along the way, but
+never found the actual root cause - reading the actual code that
+mattered did, on the very first look at the right file.
 
 ## Next milestones
 
