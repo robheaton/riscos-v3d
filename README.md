@@ -1673,25 +1673,44 @@ Not yet run on hardware.
   between.** Doing so reliably freezes the machine outright (a hard,
   unrecoverable freeze requiring a physical reset) the moment any real
   GPU work is exercised afterward - confirmed reproducible across many
-  hardware tests. Root cause not found despite dedicated investigation
-  (see "Real IRQ handling" above for the full history) - several
-  well-grounded theories were tested and fixed, none resolved it.
-  **Always reboot before loading a freshly-built module for testing.**
-  This does not affect the module's actual operation once loaded - only
-  development-time reloading. **UPDATE (2026-09-27): auto-start has
-  since been disabled by default again** (see "URGENT: Task Manager
-  freeze" below - a different, more serious bug) - so as of the current
-  build this only applies to sessions where `V3D_AccelStart` was
-  manually run, or the module was loaded with `AutoStart` on its
-  command tail, same as before auto-start was ever added.
+  hardware tests. **Always reboot before loading a freshly-built module
+  for testing.** This does not affect the module's actual operation
+  once loaded - only development-time reloading. Since auto-start is
+  back on by default (see below), this now bites on every ordinary
+  reload, not just ones where `V3D_AccelStart` was manually run.
 
-- **A second, separate, MORE SERIOUS freeze**: opening Task Manager
-  while `GraphicsV` acceleration is active hard-freezes the machine
-  100% of the time, confirmed on a fresh boot with no reload involved
-  at all (unlike the freeze above, which needs a reload first). See
-  "URGENT: Task Manager freeze" below for the full writeup. This is why
-  auto-start is currently disabled by default - acceleration is opt-in
-  only until this is root-caused and fixed.
+  STILL UNRESOLVED as of 2026-09-28, despite real progress on a
+  related-looking bug: the Task Manager freeze (below) turned out to
+  share a root cause with nothing at all to do with this one. Real
+  kernel-source research found that `pmp_alloc`'s claim step broadcasts
+  `Service_MemoryMoved` synchronously into the Wimp's own bookkeeping -
+  the actual cause of the Task Manager freeze - and `cl_clear.c` (used
+  by `V3D_ClearTest`/`V3D_ClearToSprite`, exactly what `StressTest.bas`
+  exercises) had the exact same unpatched, repeated-`pmp_alloc`
+  pattern, so the same caching fix was applied there too as a
+  reasonable hypothesis for THIS freeze. **Tested on real hardware with
+  auto-start completely disabled (isolating out any GraphicsV
+  involvement) - the reload freeze still happens, at the same point,
+  with that fix in place.** This cleanly rules out `Service_
+  MemoryMoved`/repeated-`pmp_alloc` as this freeze's cause - it's a
+  genuinely different bug from the one just fixed, sharing only
+  superficial symptoms (both are reload-adjacent hard freezes). The
+  `cl_clear.c` caching change is harmless and stays (real, if modest,
+  overhead reduction), but the actual root cause here remains open.
+  Four earlier fix attempts (dangling vector claim, reset-pulsing a
+  warm core, a leaked PMP Dynamic Area, a diagnostic bisection build)
+  and this fifth one have now all failed to resolve it. Real V3D
+  register-state forensic data (via `V3D_RegSnapshot`/
+  `test/ReloadFreezeDiag.bas`, built earlier but not yet run) is the
+  next step, not another guess.
+
+- **A second, separate freeze, ROOT-CAUSED AND FIXED**: opening Task
+  Manager while `GraphicsV` acceleration was active used to hard-freeze
+  the machine 100% of the time, confirmed on a fresh boot with no
+  reload involved at all (unlike the freeze above, which needs a
+  reload first). See "Task Manager freeze: ROOT-CAUSED AND FIXED FOR
+  REAL" below for the full writeup - this is fixed, and auto-start is
+  back on by default as a result.
 
 ## Auto-start at boot (2026-09-27, hardware-verified; briefly disabled by default after a freeze was found - root-caused, fixed, and RE-ENABLED as of 2026-09-28, see "Task Manager freeze: ROOT-CAUSED AND FIXED FOR REAL" below)
 

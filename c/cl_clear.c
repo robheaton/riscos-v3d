@@ -330,6 +330,94 @@ static _kernel_oserror *v3d_poll_counter(volatile unsigned int *irq_counter,
 }
 
 /*
+ * CACHED SCRATCH ALLOCATION - claims each of the four scratch buffers
+ * (cl/render_target/tile_alloc/tile_state) ONCE per distinct
+ * `base_page`, then reuses them on every subsequent call, instead of
+ * calling `pmp_alloc` fresh every time. This is a deliberate, narrow
+ * exception to this file's own "hardware-proven M2/M3 path, don't
+ * touch it" convention (see this file's top comment) - justified by
+ * real evidence, not a style preference: `pmp_alloc`'s claim step
+ * (OS_DynamicArea reason 21) unconditionally broadcasts
+ * `Service_MemoryMoved`, a genuinely synchronous kernel service call
+ * reaching into the Wimp module's own real bookkeeping handler for it
+ * - confirmed to be the root cause of a hard machine freeze in the
+ * GraphicsV-routed fill/copy paths (see cl_fill.c's own identical
+ * mechanism and README's "Task Manager freeze" section) when this
+ * broadcast happens from inside a live Wimp-dispatched call. This
+ * file's own v3d_clear_run had the exact same four-calls-per-job
+ * `pmp_alloc` pattern, unpatched until now - worth fixing given the
+ * same evidence applies, and while investigating a SEPARATE, still-
+ * unresolved freeze (module reload without an intervening reboot) that
+ * happens to run through this exact code path.
+ *
+ * Unlike cl_fill.c/cl_copy.c, no "worst-case" sizing logic is needed
+ * here: every one of this function's buffer sizes is a fixed compile-
+ * time constant (CL_PAGE_COUNT, RENDER_TARGET_PAGE_COUNT or
+ * SPRITE_RENDER_PAGE_COUNT depending on caller, TILE_ALLOC_PAGE_COUNT,
+ * TILE_STATE_PAGE_COUNT - this file only ever does one fixed-size
+ * 64x64 single-tile clear), so whatever size is requested the first
+ * time at a given base_page is simply cached directly - defensively
+ * falling back to an uncached pmp_alloc if a later call at the same
+ * base_page ever asks for something bigger, exactly like the fill/copy
+ * caches do, even though that should never actually happen given this
+ * file's own fixed call pattern.
+ */
+#define MAX_CACHED_CLEAR_SCRATCH 2u
+
+typedef struct
+{
+    unsigned int base_page;
+    unsigned int cl_phys;           void *cl_log;
+    unsigned int render_phys;       void *render_log;       unsigned int render_pages;
+    unsigned int tile_alloc_phys;   void *tile_alloc_log;
+    unsigned int tile_state_phys;   void *tile_state_log;
+} clear_scratch_cache_t;
+
+static clear_scratch_cache_t g_clear_scratch_cache[MAX_CACHED_CLEAR_SCRATCH];
+static unsigned int g_clear_scratch_cache_count = 0;
+
+static clear_scratch_cache_t *find_or_create_clear_scratch(pmp_area_t *pmp, unsigned int base_page,
+                                                              unsigned int render_page_count,
+                                                              _kernel_oserror **err_out)
+{
+    unsigned int i;
+    clear_scratch_cache_t *slot;
+    unsigned int page;
+
+    *err_out = NULL;
+
+    for (i = 0; i < g_clear_scratch_cache_count; i++)
+        if (g_clear_scratch_cache[i].base_page == base_page)
+            return &g_clear_scratch_cache[i];
+
+    if (g_clear_scratch_cache_count >= MAX_CACHED_CLEAR_SCRATCH)
+        return NULL;
+
+    slot = &g_clear_scratch_cache[g_clear_scratch_cache_count];
+    page = base_page;
+
+    *err_out = pmp_alloc(pmp, page, CL_PAGE_COUNT, &slot->cl_phys, &slot->cl_log);
+    if (*err_out) return NULL;
+    page += CL_PAGE_COUNT;
+
+    slot->render_pages = render_page_count;
+    *err_out = pmp_alloc(pmp, page, render_page_count, &slot->render_phys, &slot->render_log);
+    if (*err_out) return NULL;
+    page += render_page_count;
+
+    *err_out = pmp_alloc(pmp, page, TILE_ALLOC_PAGE_COUNT, &slot->tile_alloc_phys, &slot->tile_alloc_log);
+    if (*err_out) return NULL;
+    page += TILE_ALLOC_PAGE_COUNT;
+
+    *err_out = pmp_alloc(pmp, page, TILE_STATE_PAGE_COUNT, &slot->tile_state_phys, &slot->tile_state_log);
+    if (*err_out) return NULL;
+
+    slot->base_page = base_page;
+    g_clear_scratch_cache_count++;
+    return slot;
+}
+
+/*
  * Shared by v3d_clear_test and v3d_clear_to_sprite. `render_page_count`
  * sizes the render-target buffer (callers needing extra room before
  * the pixel data - e.g. a sprite header - pass more pages);
@@ -358,21 +446,40 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     unsigned int page = base_page;
     diag_bufs_t diag_bufs;
 
-    err = pmp_alloc(pmp, page, CL_PAGE_COUNT, &cl_phys, &cl_log);
-    if (err) return err;
-    page += CL_PAGE_COUNT;
+    {
+        clear_scratch_cache_t *cache = find_or_create_clear_scratch(pmp, base_page,
+                                                                       render_page_count, &err);
+        if (err) return err;
 
-    err = pmp_alloc(pmp, page, render_page_count, &render_phys, &render_log);
-    if (err) return err;
-    page += render_page_count;
+        if (cache)
+        {
+            cl_phys = cache->cl_phys; cl_log = cache->cl_log;
+            render_phys = cache->render_phys; render_log = cache->render_log;
+            tile_alloc_phys = cache->tile_alloc_phys; tile_alloc_log = cache->tile_alloc_log;
+            tile_state_phys = cache->tile_state_phys; tile_state_log = cache->tile_state_log;
+        }
+        else
+        {
+            /* Bigger than cached (shouldn't happen given this file's
+             * fixed call pattern) or the cache table is full - fall
+             * back to the original uncached sequence for this call. */
+            err = pmp_alloc(pmp, page, CL_PAGE_COUNT, &cl_phys, &cl_log);
+            if (err) return err;
+            page += CL_PAGE_COUNT;
+
+            err = pmp_alloc(pmp, page, render_page_count, &render_phys, &render_log);
+            if (err) return err;
+            page += render_page_count;
+
+            err = pmp_alloc(pmp, page, TILE_ALLOC_PAGE_COUNT, &tile_alloc_phys, &tile_alloc_log);
+            if (err) return err;
+            page += TILE_ALLOC_PAGE_COUNT;
+
+            err = pmp_alloc(pmp, page, TILE_STATE_PAGE_COUNT, &tile_state_phys, &tile_state_log);
+            if (err) return err;
+        }
+    }
     pixel_phys = render_phys + render_header_bytes;
-
-    err = pmp_alloc(pmp, page, TILE_ALLOC_PAGE_COUNT, &tile_alloc_phys, &tile_alloc_log);
-    if (err) return err;
-    page += TILE_ALLOC_PAGE_COUNT;
-
-    err = pmp_alloc(pmp, page, TILE_STATE_PAGE_COUNT, &tile_state_phys, &tile_state_log);
-    if (err) return err;
 
     /*
      * Zero the tile-alloc and tile-state scratch buffers before the
