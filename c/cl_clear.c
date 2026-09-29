@@ -199,6 +199,7 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     unsigned int sts = 0, cs = 0, ca = 0, ea = 0;
     unsigned int rb_qba = 0, rb_qea = 0;
     unsigned int mmu_ctl = 0, hub_sts = 0, vio_id = 0, vio_addr = 0;
+    unsigned int asb_m = 0, asb_s = 0;
     unsigned int pos = 0;
     int recover_attempted = 0, recover_ok = 0;
 
@@ -207,6 +208,18 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
         sts = IO_WORD(v3d, V3D_CTL_INT_STS);
         mmu_ctl = IO_WORD(v3d, V3D_MMU_CTL);
         hub_sts = IO_WORD(v3d, V3D_HUB_INT_STS);
+        /* Added 2026-09-28: first real reload-freeze repro that hit this
+         * bounded timeout instead of a hard freeze showed CT0CA/CT0EA/
+         * CT0QBA/CT0QEA all read 0xFFFFFFFF while CS/STS/MMU_CTL read a
+         * clean 0 in the same io_map session - only the CLE's address/
+         * queue registers looked unclocked, not the whole block.
+         * v3d_ensure_clock_on (module.c) only clears this ASB gate when
+         * the firmware's OWN clock-already-on check is false, so a
+         * second/reload PowerOn skips the clear even if the gate itself
+         * has independently ended up re-stopped. ASB_REQ_STOP set here
+         * would confirm that theory directly. */
+        asb_m = IO_WORD(v3d, ASB_V3D_M_CTRL);
+        asb_s = IO_WORD(v3d, ASB_V3D_S_CTRL);
         if (mmu_ctl & V3D_MMU_CTL_ENABLE)
         {
             vio_id = IO_WORD(v3d, V3D_MMU_VIO_ID);
@@ -258,6 +271,21 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     append_str(out_err->errmess, &pos, ")");
     if (recover_attempted)
         append_str(out_err->errmess, &pos, recover_ok ? " REC=stopped" : " REC=timeout");
+    /* Compact fixed-width "(XY)" form, not "(clear)"/"(STOP+ACK)" -
+     * the first cut of this added ~50 bytes across both fields and
+     * pushed a realistic (non-MMU) message to 258 bytes, past
+     * ERRMESS_CAPACITY, silently truncating tSt= off the end (caught
+     * on the very first real hardware hit of this exact code, 2026-09-
+     * 28). X = 'S' if ASB_REQ_STOP set else '-', Y = 'A' if ASB_ACK
+     * set else '-'. */
+    append_str(out_err->errmess, &pos, " ASBM=");
+    append_hex32(out_err->errmess, &pos, asb_m);
+    append_str(out_err->errmess, &pos, (asb_m & ASB_REQ_STOP) ? "(S" : "(-");
+    append_str(out_err->errmess, &pos, (asb_m & ASB_ACK) ? "A)" : "-)");
+    append_str(out_err->errmess, &pos, " ASBS=");
+    append_hex32(out_err->errmess, &pos, asb_s);
+    append_str(out_err->errmess, &pos, (asb_s & ASB_REQ_STOP) ? "(S" : "(-");
+    append_str(out_err->errmess, &pos, (asb_s & ASB_ACK) ? "A)" : "-)");
     append_str(out_err->errmess, &pos, " STS=");
     append_hex32(out_err->errmess, &pos, sts);
     if (sts & V3D_INT_OUTOMEM) append_str(out_err->errmess, &pos, "(OOM)");
@@ -285,10 +313,13 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     append_hex32(out_err->errmess, &pos, qea);
     append_str(out_err->errmess, &pos, "/r");
     append_hex32(out_err->errmess, &pos, rb_qea);
+    /* render_target dropped from this message (2026-09-28, freed room
+     * for ASBM/ASBS above) - it's the render phase's own buffer, the
+     * least relevant of the three to a BIN-phase timeout specifically;
+     * still in diag_bufs_t and available to a future render-phase
+     * diagnostic if needed. */
     append_str(out_err->errmess, &pos, " tAl=");
     append_hex32(out_err->errmess, &pos, bufs->tile_alloc);
-    append_str(out_err->errmess, &pos, " rTg=");
-    append_hex32(out_err->errmess, &pos, bufs->render_target);
     append_str(out_err->errmess, &pos, " tSt=");
     append_hex32(out_err->errmess, &pos, bufs->tile_state);
     out_err->errmess[pos] = '\0';

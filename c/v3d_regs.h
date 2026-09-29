@@ -131,6 +131,25 @@
 #define V3D_CORE0         (PERIPHERAL_BASE + 0xC04000u)
 #define V3D_CTL_IDENT0    (V3D_CORE0 + 0x00u)
 #define V3D_CTL_SLCACTL   (V3D_CORE0 + 0x24u)
+/* Only 16 of this register's 32 bits are real, documented fields - the
+ * other 16 (bits 31-28, 23-20, 15-12, 7-4) are genuinely reserved, not
+ * covered by any of the four fields below. Confirmed 2026-09-29
+ * against the real Linux kernel's own drivers/gpu/drm/v3d/v3d_regs.h,
+ * not guessed - v3d_flush_caches (cl_packets.h) used to blindly write
+ * 0xFFFFFFFF here, setting all 16 reserved bits on every single flush
+ * (twice per fill/copy/clear call) that the real driver, across every
+ * version, never touches. Real silicon reserved bits are not a safe
+ * "probably harmless" write - see GFXH-1897 (cl_packets.h) for a
+ * confirmed example of this exact hardware being genuinely sensitive
+ * to cache-register writes outside the documented sequence. */
+#define V3D_SLCACTL_TVCCS_SHIFT  24u
+#define V3D_SLCACTL_TDCCS_SHIFT  16u
+#define V3D_SLCACTL_UCC_SHIFT    8u
+#define V3D_SLCACTL_ICC_SHIFT    0u
+#define V3D_SLCACTL_ALL4(v)      (((v) & 0xFu) << V3D_SLCACTL_TVCCS_SHIFT | \
+                                   ((v) & 0xFu) << V3D_SLCACTL_TDCCS_SHIFT | \
+                                   ((v) & 0xFu) << V3D_SLCACTL_UCC_SHIFT   | \
+                                   ((v) & 0xFu) << V3D_SLCACTL_ICC_SHIFT)
 #define V3D_CTL_L2TCACTL  (V3D_CORE0 + 0x30u)
 #define V3D_CTL_L2TFLSTA  (V3D_CORE0 + 0x34u)
 #define V3D_CTL_L2TFLEND  (V3D_CORE0 + 0x38u)

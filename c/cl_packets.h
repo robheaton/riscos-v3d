@@ -339,12 +339,75 @@ static inline void emit_load_tile_buffer_rt0(cl_buf_t *b, unsigned int input_for
     cl_u32(b, addr);
 }
 
+/*
+ * GFXH-1897 (2026-09-28): a real, Broadcom-acknowledged V3D hardware
+ * erratum, not a guess - found by reading the upstream Linux v3d
+ * driver's own v3d_clean_caches() after this project's reload-without-
+ * reboot freeze investigation got its first-ever real register
+ * forensics (see cl_clear.c's diagnose_timeout comment) showing CT0's
+ * CA/EA/QBA/QEA stuck reading 0xFFFFFFFF while everything else - CS,
+ * STS, MMU, the IDENT block, CT1 - read clean. Upstream polls exactly
+ * this bit for exactly this reason before every L2TCACTL write, only
+ * skipping it on V3D >= 7.1: writing V3D_CTL_L2TCACTL to start a new
+ * L2T flush while a PREVIOUS flush's L2TFLS bit is still set (hasn't
+ * finished draining) can clobber L2TCACTL and corrupt cache state -
+ * a hardware hazard, not a soft/recoverable failure. This driver's
+ * hardware is confirmed V3D 4.2 (V3D_CTL_IDENT0/V3D_HUB_IDENT1, well
+ * under 7.1), so the erratum applies unconditionally here - no version
+ * check needed, unlike upstream.
+ *
+ * Directly relevant to the reload freeze: this function is called
+ * twice per fill/copy/clear operation (bin phase, then render phase),
+ * and `module_final` does nothing to wait for an in-flight flush to
+ * drain before the module unloads. If `*RMKill` happens while the
+ * previous session's last operation still has a flush draining, the
+ * NEW instance's very first v3d_flush_caches call would hit this exact
+ * hazard on its first write to L2TCACTL - never checked or guarded
+ * against before now. Bounded by real wall-clock time
+ * (v3d_read_centiseconds), matching upstream's 100ms bound and this
+ * project's own established circuit-breaker convention (see cl_fill.c/
+ * cl_copy.c's wait_for_irq) rather than a raw spin count. Checked
+ * every 256 iterations, not every one, since a SWI call is far more
+ * expensive than a plain memory read. Gives up and proceeds anyway on
+ * timeout rather than failing the call - matches upstream's own choice
+ * (it logs and continues, doesn't abort), and this bit clearing within
+ * 100ms is the expected case; hitting the timeout at all would itself
+ * be a sign of a deeper problem no amount of waiting here fixes.
+ *
+ * NOTE: isolation-tested 2026-09-29 against the still-unresolved
+ * reload-without-reboot freeze (see README/memory) by temporarily
+ * disabling this loop entirely - the freeze's zero-output symptom
+ * persisted unchanged, cleanly ruling this loop out as that bug's
+ * cause. Kept unconditionally regardless: it's a correct fix for a
+ * real, separately-confirmed hardware erratum either way.
+ */
+extern unsigned int v3d_read_centiseconds(void);
+
 static inline void v3d_flush_caches(io_mapping_t *v3d)
 {
+    unsigned int spin, start_cs = 0;
+    int have_start = 0;
+
+    for (spin = 0; IO_WORD(*v3d, V3D_CTL_L2TCACTL) & V3D_L2TCACTL_L2TFLS; spin++)
+    {
+        if ((spin & 0xFFu) == 0u)
+        {
+            unsigned int now_cs = v3d_read_centiseconds();
+            if (!have_start) { start_cs = now_cs; have_start = 1; }
+            else if (now_cs - start_cs >= 10u) /* 100ms, matches upstream */
+                break;
+        }
+    }
+
     IO_WORD(*v3d, V3D_CTL_L2TFLSTA) = 0;
     IO_WORD(*v3d, V3D_CTL_L2TFLEND) = 0xFFFFFFFFu;
     IO_WORD(*v3d, V3D_CTL_L2TCACTL) = V3D_L2TCACTL_L2TFLS | V3D_L2TCACTL_FLM_FLUSH;
-    IO_WORD(*v3d, V3D_CTL_SLCACTL) = 0xFFFFFFFFu;
+    /* Was a blind 0xFFFFFFFF - see V3D_CTL_SLCACTL's own comment in
+     * v3d_regs.h for why that set 16 genuinely reserved bits the real
+     * driver never touches. 0xF into each of the 4 real fields matches
+     * the real driver's v3d_invalidate_slices() exactly (invalidate
+     * all instances of each cache), touching nothing else. */
+    IO_WORD(*v3d, V3D_CTL_SLCACTL) = V3D_SLCACTL_ALL4(0xFu);
 }
 
 #endif /* CL_PACKETS_H */

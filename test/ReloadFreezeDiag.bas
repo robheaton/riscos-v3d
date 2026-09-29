@@ -63,7 +63,10 @@ PRINT N%; " iterations completed with no freeze."
 END
 
 DEF PROCsnapshot(label$)
-  SYS "V3D_RegSnapshot" TO intsts%, hubsts%, ct0cs%, ct1cs%, ct0ca%, ct0ea%, ct1ca%, ct1ea%
+  SYS "V3D_RegSnapshot" TO intsts%, hubsts%, ct0cs%, ct1cs%, ct0ca%, ct0ea%, ct1ca%, ct1ea%, asbm%, asbs%
   PRINT label$; ": INTSTS="; ~intsts%; " HUBSTS="; ~hubsts%; " CT0CS="; ~ct0cs%; " CT1CS="; ~ct1cs%
   PRINT "  CT0CA="; ~ct0ca%; " CT0EA="; ~ct0ea%; " CT1CA="; ~ct1ca%; " CT1EA="; ~ct1ea%
+  REM ASBM/ASBS bit0=REQ_STOP, bit1=ACK - see module.c's V3D_RegSnapshot
+  REM comment for why these were added (2026-09-28 reload-freeze forensics)
+  PRINT "  ASBM="; ~asbm%; " ASBS="; ~asbs%
 ENDPROC

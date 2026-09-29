@@ -708,9 +708,58 @@ static int cmd_tail_has_word(const char *cmd_tail, const char *target)
     return 0;
 }
 
+/*
+ * Diagnostic added 2026-09-28: Rob recalled a past session where a fix
+ * placed in module_final appeared not to take effect, raising the
+ * question of whether *RMKill genuinely invokes this entry point at
+ * all (as opposed to running it but with insufficient cleanup code
+ * inside it - the three separate, confirmed, already-fixed bugs here
+ * historically were all the latter, not this). Nothing in git history
+ * or memory confirms the entry point itself was ever skipped, but it's
+ * cheap and completely safe to check directly (OS_SetVarVal, no V3D
+ * hardware touched at all) rather than trust either recollection.
+ * Called from module_init too, as a control: module_init is already
+ * proven to run reliably (auto-start, every SWI, this whole project)
+ * on every load, so if V3DDriver$InitRan gets set but
+ * V3DDriver$FinalRan never does, that isolates the problem to
+ * something specific about module_final's context rather than a bug
+ * in this diagnostic itself. Test: *Unset the relevant variable(s),
+ * reload/kill the module, then *Show V3DDriver$*Ran* - "yes" confirms
+ * that entry point ran, no output confirms it didn't.
+ */
+static _kernel_oserror *set_ran_marker(const char *var_name)
+{
+    _kernel_swi_regs regs;
+    regs.r[0] = (int) var_name;
+    regs.r[1] = (int) "yes";
+    regs.r[2] = 3; /* strlen("yes") */
+    regs.r[3] = 0;
+    regs.r[4] = 0; /* VarType_String */
+    /* 0x24, NOT 0x20 - 0x20 is OS_Release (vector release), confirmed
+     * the hard way: an earlier build using 0x20 by mistake (misremembered,
+     * never actually checked against the real SWI list) surfaced as
+     * "Bad vector release" the first time its error was actually
+     * looked at, instead of silently discarded - see the riscos.com
+     * numeric SWI list (OS_Release=0x20, OS_ReadUnsigned=0x21,
+     * OS_GenerateEvent=0x22, OS_ReadVarVal=0x23, OS_SetVarVal=0x24),
+     * fetched 2026-09-29, not trusted from memory a second time. */
+    return _kernel_swi(0x24 /* OS_SetVarVal */, &regs, &regs);
+}
+
 _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
 {
     (void) podule_base;
+
+    /* V3DDriver$InitRan/$FinalRan (see set_ran_marker): confirmed on
+     * real hardware 2026-09-29 that module_final DOES run on *RMKill -
+     * both markers appeared as expected. Discarded here (like
+     * module_final's own call) now that it's proven correct - a
+     * diagnostic marker must never be able to block the module from
+     * loading. Kept permanently, not ripped out: cheap, harmless, and
+     * this exact question ("does an entry point actually run") is
+     * worth being able to re-check instantly in a future session
+     * without rebuilding anything. */
+    (void) set_ran_marker("V3DDriver$InitRan");
 
     /* Captured here, not discarded: v3d_irq_claim() needs this exact
      * value later - see v3d_irq_set_private_word's comment in
@@ -762,6 +811,8 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
     (void) fatal;
     (void) podule_base;
     (void) pw;
+
+    (void) set_ran_marker("V3DDriver$FinalRan");
 
     /* Must run unconditionally, even if IRQ handling was never used
      * this session - see v3d_irq_shutdown's own comment for why a
@@ -1575,7 +1626,26 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
              * Returns: V3D_CTL_INT_STS (R0), V3D_HUB_INT_STS (R1),
              * V3D_CLE_CT0CS (R2), V3D_CLE_CT1CS (R3), V3D_CLE_CT0CA
              * (R4), V3D_CLE_CT0EA (R5), V3D_CLE_CT1CA (R6), V3D_CLE_
-             * CT1EA (R7). */
+             * CT1EA (R7).
+             *
+             * R8/R9 (ASB_V3D_M_CTRL/ASB_V3D_S_CTRL) added 2026-09-28
+             * after a live reload-freeze repro FINALLY produced a
+             * bounded diagnose_timeout() instead of a hard freeze:
+             * CT0CS read STOP (never started), but CT0CA/CT0EA/CT0QBA/
+             * CT0QEA all read 0xFFFFFFFF while CS/STS/MMU_CTL read a
+             * clean 0 in the SAME io_map session - i.e. only the CLE's
+             * address/queue registers looked like an unclocked-bus
+             * read, not the whole V3D block. `v3d_ensure_clock_on`
+             * (module.c) only clears the ASB master/slave gate
+             * (ASB_V3D_M_CTRL/S_CTRL, ASB_REQ_STOP) when the FIRMWARE's
+             * own clock_already_on check is false - meaning on a
+             * second/reload PowerOn, where the firmware still reports
+             * the clock on, that gate-clear is skipped entirely even
+             * if the ASB gate itself has independently ended up
+             * re-stopped. These two registers directly test that:
+             * ASB_REQ_STOP set here at the moment of a timeout would
+             * confirm it; ASB_ACK's state says whether the gate is
+             * actually granted either way. */
             io_mapping_t v3d;
             _kernel_oserror *err = io_map(V3D_MB_BASE, &v3d);
             if (err)
@@ -1589,6 +1659,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[5] = IO_WORD(v3d, V3D_CLE_CT0EA);
             r->r[6] = IO_WORD(v3d, V3D_CLE_CT1CA);
             r->r[7] = IO_WORD(v3d, V3D_CLE_CT1EA);
+            r->r[8] = IO_WORD(v3d, ASB_V3D_M_CTRL);
+            r->r[9] = IO_WORD(v3d, ASB_V3D_S_CTRL);
 
             io_unmap(&v3d);
             return NULL;
