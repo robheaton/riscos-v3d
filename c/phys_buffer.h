@@ -80,6 +80,17 @@ _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
                               unsigned int num_pages);
 
 /*
+ * Defensive crash-recovery cleanup (see phys_buffer.c for the full
+ * reasoning): finds any existing Dynamic Area already named `name`
+ * (left behind by a crashed previous instance that never got to run
+ * module_final) and releases its physical pages, without attempting
+ * to remove the area itself. Call once per name at module_init, before
+ * this instance creates its own PMP area of that name. Never fails
+ * module_init - always returns NULL.
+ */
+_kernel_oserror *pmp_cleanup_stale(const char *name);
+
+/*
  * Dynamic Area ResizePMP handler (reason 6), wired up via the .cmhg
  * generic-veneers mechanism. Unconditionally refuses any resize
  * requested via OS_ChangeDynamicArea - this PMP's size is only ever

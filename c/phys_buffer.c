@@ -13,6 +13,8 @@
 enum
 {
     DA_Create      = 0,
+    DA_Info        = 2,
+    DA_Enumerate   = 3,
     DA_ClaimPages  = 21,
     DA_MapPages    = 22,
 };
@@ -196,6 +198,95 @@ _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
             return err;
 
         done += chunk;
+    }
+
+    return NULL;
+}
+
+static int names_equal(const char *a, const char *b)
+{
+    /* No <string.h>/strcmp - matches this codebase's existing convention
+     * (see module.c's cmd_tail_has_word, same reasoning). */
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+/*
+ * Defensive cleanup for a crash/hard-freeze, not a clean *RMKill -
+ * Rob's own idea (2026-09-29). module_final already releases this
+ * module's own PMP pages on a clean unload (confirmed on real hardware
+ * to genuinely run every time - see README's "reload freeze" writeup),
+ * but module_final categorically cannot run after a hard freeze or a
+ * forced power-cycle, which is exactly the scenario this whole
+ * "always reboot before reloading" limitation is about. A crashed
+ * instance's Dynamic Area (created fresh every load - pmp_create
+ * always passes area number -1, "allocate new", never reusing an
+ * existing one by name) would be left holding physical pages locked
+ * forever, with nothing to ever release them, since nothing else in
+ * the system knows this module used to own them.
+ *
+ * Deliberately does NOT attempt to remove the stale Dynamic Area
+ * itself (OS_DynamicArea reason 1) - checked directly against the real
+ * PRM: removal shrinks the area to zero via OS_ChangeDynamicArea
+ * first, which invokes the area's registered resize handler
+ * (PreShrink/PostShrink) - and this driver's own handler
+ * (v3d_da_resize_handler) unconditionally REFUSES every resize
+ * request. Attempting a full removal could plausibly error out in a
+ * way never exercised on real hardware, in exactly the crash-recovery
+ * path that most needs to be reliable. Releasing the pages (the
+ * genuinely scarce resource) via the same pmp_release() every clean
+ * unload already uses is the well-understood, low-risk part of this;
+ * leaving an empty zombie Dynamic Area behind is a real but much
+ * smaller cost (spare logical address space, of which a 32-bit system
+ * has a great deal) than an untested op on a hardware-freeze-prone
+ * driver.
+ *
+ * Walks every Dynamic Area in the system (OS_DynamicArea 3, enumerate)
+ * looking for one already named `name` - reason 2 (info) needs an area
+ * number, not a name, so there's no direct lookup, only linear search.
+ * Cheap and bounded (a RISC OS system has a modest, fixed-ish number of
+ * areas) and only ever runs once per module load, at module_init.
+ * Silently continues on any per-area error (a transient lookup
+ * failure isn't worth aborting the whole scan over) and returns
+ * non-fatally either way - matches this driver's existing "auto-start
+ * claim failure doesn't fail module_init" philosophy.
+ */
+_kernel_oserror *pmp_cleanup_stale(const char *name)
+{
+    _kernel_swi_regs regs;
+    int area_num;
+
+    regs.r[0] = (int) DA_Enumerate;
+    regs.r[1] = -1;
+    if (_kernel_swi(SWI_OS_DynamicArea, &regs, &regs))
+        return NULL;
+    area_num = regs.r[1];
+
+    while (area_num != -1)
+    {
+        _kernel_swi_regs info;
+
+        info.r[0] = (int) DA_Info;
+        info.r[1] = area_num;
+        if (!_kernel_swi(SWI_OS_DynamicArea, &info, &info))
+        {
+            const char *area_name = (const char *) info.r[8];
+
+            if (area_name && names_equal(area_name, name))
+            {
+                pmp_area_t stale;
+                stale.area_num     = (unsigned int) area_num;
+                stale.logical_base = (unsigned char *) info.r[3];
+                stale.max_pages    = (unsigned int) info.r[5] / PAGE_SIZE;
+                (void) pmp_release(&stale, 0, stale.max_pages);
+            }
+        }
+
+        regs.r[0] = (int) DA_Enumerate;
+        regs.r[1] = area_num;
+        if (_kernel_swi(SWI_OS_DynamicArea, &regs, &regs))
+            return NULL;
+        area_num = regs.r[1];
     }
 
     return NULL;

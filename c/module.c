@@ -761,6 +761,21 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
      * without rebuilding anything. */
     (void) set_ran_marker("V3DDriver$InitRan");
 
+    /* Defensive crash-recovery cleanup (Rob's own idea, 2026-09-29) -
+     * see pmp_cleanup_stale's own comment in phys_buffer.c for the full
+     * reasoning, including why it deliberately does NOT try to remove
+     * the stale Dynamic Area itself, only release its pages. Must run
+     * before this instance's own pmp_create calls (both lazy, on first
+     * real use) - doing it unconditionally here, not lazily alongside
+     * them, means it happens exactly once per load regardless of
+     * whether this instance ever ends up using PMP itself. Pure OS-
+     * level Dynamic Area bookkeeping, no V3D hardware touched - doesn't
+     * conflict with this function's existing "stays lazy about the
+     * GPU/PMP/IRQ machinery" principle below, that's specifically about
+     * V3D hardware access, not general OS resource hygiene. */
+    (void) pmp_cleanup_stale("V3DBuf");
+    (void) pmp_cleanup_stale("V3DFill");
+
     /* Captured here, not discarded: v3d_irq_claim() needs this exact
      * value later - see v3d_irq_set_private_word's comment in
      * v3d_irq.h for why a raw hardware vector needs it passed
