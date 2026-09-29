@@ -1667,6 +1667,91 @@ state immediately beforehand, rather than another guess.
 
 Not yet run on hardware.
 
+### Revisited again (2026-09-28/29): real register forensics, `module_final` confirmed running, two real cache bugs fixed - still unresolved
+
+`test/ReloadFreezeDiag.bas` finally ran on hardware. First result: froze
+with zero output, before even its first line - earlier than the
+established "iteration 2 ClearTest" signature. Bisecting the same calls
+by hand (typed individually, then all on one line with no gaps) never
+reproduced it at all, matching this bug's established non-determinism
+(slow/human-paced calls never froze in any of this project's testing;
+fast, back-to-back calls did).
+
+**First-ever bounded reproduction.** A shortened repro (register
+snapshot, `PowerOn`, `ClearTest`, all on one line) finally hit
+`cl_clear.c`'s own `diagnose_timeout()` instead of a hard freeze - real
+V3D register state, captured for the first time in this bug's whole
+history: `CS=0x00000000(STOP) STS=0x00000000 MMU=0x00000000
+CA=0xFFFFFFFF EA=0xFFFFFFFF QBA=w.../r0xFFFFFFFF QEA=w.../r0xFFFFFFFF`.
+Within the same register-mapping session, `CS`/`STS`/`MMU` read clean
+while `CA`/`EA`/`QBA`/`QEA` (the bin thread's address/queue registers)
+all read the classic "nothing answered this read" pattern - genuinely
+CT0-specific, not a whole-block failure (confirmed separately: the
+`V3D_HUB_IDENT0/1/2`/`V3D_CTL_IDENT0` block reads back the exact known-
+good values, and CT1 - untouched this session - reads a clean `0, 0`,
+not `0xFFFFFFFF`, ruling out "that's just what an untouched register
+looks like").
+
+**ASB bus gate theory, tested and ruled out.** `v3d_ensure_clock_on`
+only clears the ASB master/slave bus gate when the firmware's own
+clock-already-on flag is false - meaning a second/reload `PowerOn`
+skips that clear entirely, even if the gate had independently ended up
+re-stopped. A plausible mechanism for exactly this symptom - directly
+tested by extending `V3D_RegSnapshot` and `diagnose_timeout` to also
+read `ASB_V3D_M_CTRL`/`S_CTRL`. Result: both read clear, not stopped,
+at the exact moment `CA`/`EA` were reading garbage. Cleanly falsified,
+not left dangling.
+
+**`module_final` confirmed to genuinely run on every `*RMKill`.** Added
+`V3DDriver$InitRan`/`$FinalRan` system-variable markers, checkable via
+`*Show` independent of any V3D hardware - both fire as expected on real
+hardware. Rules out "cleanup silently never executes" as the
+explanation for any of this bug's failed fix attempts. (Real
+methodology stumble worth recording: the first version of this
+diagnostic used SWI `0x20` believing it was `OS_SetVarVal` - it's
+actually `OS_Release`, caught only because returning its error instead
+of discarding it surfaced "Bad vector release" instead of a sensible
+failure. Correct number is `0x24`. A reminder to verify SWI numbers
+against a real source rather than trust memory, same lesson `io_map.h`
+already documents for `OS_Memory` 14/15.)
+
+**Two real, independently-verified hardware bugs found** by reading the
+upstream Linux `drivers/gpu/drm/v3d` driver source directly (not
+guessed), each its own fix attempt on this freeze, hardware-tested,
+neither of which turned out to be it:
+
+- **GFXH-1897**, a named, Broadcom-acknowledged V3D silicon erratum on
+  V3D < 7.1 (this hardware is 4.2): writing `V3D_CTL_L2TCACTL` to start
+  a new L2T flush while a previous flush's `L2TFLS` bit is still set can
+  clobber `L2TCACTL` and corrupt cache state. `v3d_flush_caches` now
+  polls `L2TFLS` with a 100ms wall-clock bound before every flush,
+  matching upstream exactly.
+- **`V3D_CTL_SLCACTL` reserved bits**: `v3d_flush_caches` wrote a blind
+  `0xFFFFFFFF` into this register on every flush (twice per fill/copy/
+  clear call). Only 16 of its 32 bits are real, documented fields
+  (`TVCCS`/`TDCCS`/`UCC`/`ICC`) - the other 16 are genuinely reserved,
+  never touched by the real driver across any version. Now writes only
+  the four real fields (`V3D_SLCACTL_ALL4()`). (Checked and ruled out
+  the same fetch's other two steps, `v3d_flush_l3`/`v3d_invalidate_l2c`
+  - both are version-gated no-ops on V3D 4.2, not a real gap here.)
+
+**Neither fix resolves the freeze**, alone or together - hardware-
+tested, including an isolation test with the GFXH-1897 guard
+temporarily disabled to check whether its new register read explained
+the freeze moving earlier (it didn't - the zero-output symptom
+persisted either way). **Seven failed fix attempts now.** Both cache
+fixes are kept regardless (real, correct, independent of whether they
+explain this bug), and the `V3DDriver$*Ran` markers and `V3D_RegSnapshot`
+`ASBM`/`ASBS` fields stay as permanent, low-cost diagnostics.
+
+**Paused, Rob's own call, not abandoned.** Ten-plus hardware round-trips
+in this round alone, on top of the twenty-plus before it. The three
+remaining patches in the same upstream "Fix RPi 4 system hangs" series
+(flush MMU TLB/cache during runtime resume, clean caches before
+suspend, reduce autosuspend delay) are PM-runtime-specific and this
+driver has no equivalent framework - not yet actually checked in
+detail, the most concrete lead if this is resumed.
+
 ## Known limitations
 
 - **Do not `*RMKill`/`*RMLoad` this module without a full reboot in
@@ -1679,30 +1764,23 @@ Not yet run on hardware.
   back on by default (see below), this now bites on every ordinary
   reload, not just ones where `V3D_AccelStart` was manually run.
 
-  STILL UNRESOLVED as of 2026-09-28, despite real progress on a
-  related-looking bug: the Task Manager freeze (below) turned out to
-  share a root cause with nothing at all to do with this one. Real
-  kernel-source research found that `pmp_alloc`'s claim step broadcasts
-  `Service_MemoryMoved` synchronously into the Wimp's own bookkeeping -
-  the actual cause of the Task Manager freeze - and `cl_clear.c` (used
-  by `V3D_ClearTest`/`V3D_ClearToSprite`, exactly what `StressTest.bas`
-  exercises) had the exact same unpatched, repeated-`pmp_alloc`
-  pattern, so the same caching fix was applied there too as a
-  reasonable hypothesis for THIS freeze. **Tested on real hardware with
-  auto-start completely disabled (isolating out any GraphicsV
-  involvement) - the reload freeze still happens, at the same point,
-  with that fix in place.** This cleanly rules out `Service_
-  MemoryMoved`/repeated-`pmp_alloc` as this freeze's cause - it's a
-  genuinely different bug from the one just fixed, sharing only
-  superficial symptoms (both are reload-adjacent hard freezes). The
-  `cl_clear.c` caching change is harmless and stays (real, if modest,
-  overhead reduction), but the actual root cause here remains open.
-  Four earlier fix attempts (dangling vector claim, reset-pulsing a
-  warm core, a leaked PMP Dynamic Area, a diagnostic bisection build)
-  and this fifth one have now all failed to resolve it. Real V3D
-  register-state forensic data (via `V3D_RegSnapshot`/
-  `test/ReloadFreezeDiag.bas`, built earlier but not yet run) is the
-  next step, not another guess.
+  STILL UNRESOLVED as of 2026-09-29, now **PAUSED after seven failed
+  fix attempts** (dangling vector claim, reset-pulsing a warm core, a
+  leaked PMP Dynamic Area, a diagnostic bisection build, `cl_clear.c`
+  scratch-page caching, a GFXH-1897 hardware-erratum guard, and a
+  `V3D_CTL_SLCACTL` reserved-bits fix) - see "Revisited again
+  (2026-09-28/29)" above for the full writeup of the last two, both
+  real, independently-verified bugs against the real hardware
+  erratum/register documentation, neither of which turned out to be
+  the cause. Real V3D register forensics were finally captured (first
+  time in this bug's whole history) and the ASB bus gate theory was
+  directly tested and ruled out. `module_final` is now confirmed,
+  directly, to genuinely run on every `*RMKill` - ruling out "cleanup
+  silently never executes" as the explanation for any of the seven
+  attempts. Paused at Rob's own call given the hardware-cycle cost so
+  far, not abandoned - the three still-unchecked patches from the same
+  upstream erratum series (PM-runtime cache/MMU handling) are the most
+  concrete lead if this is picked back up.
 
 - **A second, separate freeze, ROOT-CAUSED AND FIXED**: opening Task
   Manager while `GraphicsV` acceleration was active used to hard-freeze
