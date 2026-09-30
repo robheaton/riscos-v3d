@@ -54,4 +54,22 @@ _kernel_oserror *v3d_clear_to_sprite(pmp_area_t *pmp, unsigned int base_page,
                                       void **sprite_area_log_out,
                                       unsigned int *readback_pixel_out);
 
+/*
+ * 16bpp screen-mode-support Phase 2 diagnostic (2026-09-30) - isolated,
+ * throwaway, NOT meant to become permanent (see cl_clear.c's own
+ * comment on this function). Runs the same proven clear+store job as
+ * v3d_clear_test, except the render-target STORE format is the
+ * caller's own `format_code` (not the hardcoded RGBA8=27) and the
+ * clear colour/readback are both 16-bit, not 32-bit. Exists purely to
+ * settle, empirically, which of two candidate V3D format codes
+ * (ABGR1555=4, RGBA5551=45) actually matches RISC OS's real RGB555
+ * 16bpp screen layout - see README/memory for why this can't be
+ * determined from documentation alone.
+ */
+_kernel_oserror *v3d_16bpp_format_test(pmp_area_t *pmp, unsigned int base_page,
+                                        unsigned int format_code,
+                                        unsigned int clear_color16,
+                                        unsigned int *render_target_phys_out,
+                                        unsigned int *readback_pixel_out);
+
 #endif /* CL_CLEAR_H */

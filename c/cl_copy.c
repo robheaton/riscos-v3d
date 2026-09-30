@@ -203,6 +203,7 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int width, unsigned int height,
                                    unsigned int src_phys, unsigned int dest_phys,
                                    unsigned int src_stride, unsigned int dest_stride,
+                                   unsigned int format_code,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out)
 {
@@ -358,9 +359,9 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
              * hardware-confirmed for Load specifically - that's
              * exactly what this file's own test exists to check). */
             emit_tile_coordinates(&rcl, col, row);
-            emit_load_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, src_stride, src_phys);
+            emit_load_tile_buffer_rt0(&rcl, format_code, src_stride, src_phys);
             emit_end_of_loads(&rcl);
-            emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, dest_stride, dest_phys);
+            emit_store_tile_buffer_rt0(&rcl, format_code, dest_stride, dest_phys);
             emit_end_of_tile_marker(&rcl);
         }
     }
@@ -474,7 +475,88 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
     }
 
     err = run_copy(pmp, base_page + 2u * buf_pages, width, height,
-                    src_phys, dest_phys, stride, stride, tiles_x_out, tiles_y_out);
+                    src_phys, dest_phys, stride, stride, 27 /* RGBA8 */,
+                    tiles_x_out, tiles_y_out);
+    if (err) return err;
+
+    *src_log_out = src_log;
+    *dest_log_out = dest_log;
+    *stride_bytes_out = stride;
+    return NULL;
+}
+
+/*
+ * 16bpp screen-mode-support Phase 3 diagnostic (2026-09-30): isolated
+ * synthetic-buffer proof for the copy path's LOAD side at 16-bit
+ * width, before anything touches the real screen framestore. Phase 2
+ * only proved the STORE side (a GPU-side clear+store, never a load);
+ * emit_load_tile_buffer_rt0 was already flagged elsewhere in this
+ * project as "genuinely new territory, never exercised in the
+ * reference implementation" even at the already-proven 32bpp width,
+ * and has never been tested at 16-bit granularity at all until this.
+ *
+ * Near-identical to v3d_copy_test above, with three changes: 2-byte
+ * stride instead of 4, format_code=45 (RGBA5551 - confirmed correct
+ * for RISC OS's real 16bpp layout, see README/memory) instead of 27,
+ * and a 16-bit-safe test pattern (x/y both masked to 5 bits so the
+ * combined value always fits 16 bits, still unique enough per-pixel to
+ * tell "genuinely copied" apart from leftover content).
+ */
+_kernel_oserror *v3d_copy_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
+                                       unsigned int width, unsigned int height,
+                                       void **src_log_out, void **dest_log_out,
+                                       unsigned int *stride_bytes_out,
+                                       unsigned int *tiles_x_out,
+                                       unsigned int *tiles_y_out)
+{
+    unsigned int tiles_x, tiles_y, padded_w, padded_h, stride, buf_bytes, buf_pages;
+    unsigned int src_phys, dest_phys;
+    void *src_log, *dest_log;
+    _kernel_oserror *err;
+    unsigned int x, y;
+
+    if (width == 0u || height == 0u)
+    {
+        static _kernel_oserror err_bad_size = {
+            10, "V3DDriver: V3D_CopyTest16bpp width/height must be non-zero"
+        };
+        return &err_bad_size;
+    }
+
+    tiles_x = div_round_up(width, TILE_SIZE);
+    tiles_y = div_round_up(height, TILE_SIZE);
+    padded_w = tiles_x * TILE_SIZE;
+    padded_h = tiles_y * TILE_SIZE;
+    stride = padded_w * 2u;
+    buf_bytes = stride * padded_h;
+    buf_pages = bytes_to_pages(buf_bytes);
+
+    if (buf_pages > PMP_MAX_PAGES_PER_CALL)
+    {
+        static _kernel_oserror err_too_big = {
+            14, "V3DDriver: V3D_CopyTest16bpp rectangle too large for this "
+                "test harness (pmp_alloc's per-call page cap)"
+        };
+        return &err_too_big;
+    }
+
+    err = pmp_alloc(pmp, base_page, buf_pages, &src_phys, &src_log);
+    if (err) return err;
+
+    err = pmp_alloc(pmp, base_page + buf_pages, buf_pages, &dest_phys, &dest_log);
+    if (err) return err;
+
+    for (y = 0; y < padded_h; y++)
+    {
+        volatile unsigned short *row_ptr =
+            (volatile unsigned short *) ((unsigned char *) src_log + y * stride);
+        for (x = 0; x < padded_w; x++)
+            row_ptr[x] = (unsigned short) (((x & 0x1Fu) << 5) | (y & 0x1Fu));
+    }
+
+    err = run_copy(pmp, base_page + 2u * buf_pages, width, height,
+                    src_phys, dest_phys, stride, stride, 45 /* RGBA5551 */,
+                    tiles_x_out, tiles_y_out);
     if (err) return err;
 
     *src_log_out = src_log;
@@ -489,14 +571,16 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int width, unsigned int height,
                                    unsigned int screen_phys_base,
                                    unsigned int screen_stride,
+                                   unsigned int bytes_per_pixel,
+                                   unsigned int format_code,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out)
 {
-    unsigned int src_phys = screen_phys_base + src_y * screen_stride + src_x * 4u;
-    unsigned int dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * 4u;
+    unsigned int src_phys = screen_phys_base + src_y * screen_stride + src_x * bytes_per_pixel;
+    unsigned int dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * bytes_per_pixel;
 
     return run_copy(pmp, base_page, width, height, src_phys, dest_phys,
-                     screen_stride, screen_stride, tiles_x_out, tiles_y_out);
+                     screen_stride, screen_stride, format_code, tiles_x_out, tiles_y_out);
 }
 
 /*
@@ -585,6 +669,8 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
                                                unsigned int width, unsigned int height,
                                                unsigned int screen_phys_base,
                                                unsigned int screen_stride,
+                                               unsigned int bytes_per_pixel,
+                                               unsigned int format_code,
                                                unsigned int *tiles_x_out,
                                                unsigned int *tiles_y_out)
 {
@@ -606,7 +692,7 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
     tiles_y = div_round_up(height, TILE_SIZE);
     padded_w = tiles_x * TILE_SIZE;
     padded_h = tiles_y * TILE_SIZE;
-    scratch_stride = padded_w * 4u;
+    scratch_stride = padded_w * bytes_per_pixel;
     scratch_bytes = scratch_stride * padded_h;
     scratch_pages = bytes_to_pages(scratch_bytes);
 
@@ -635,8 +721,8 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
         }
     }
 
-    src_phys = screen_phys_base + src_y * screen_stride + src_x * 4u;
-    dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * 4u;
+    src_phys = screen_phys_base + src_y * screen_stride + src_x * bytes_per_pixel;
+    dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * bytes_per_pixel;
 
     /* Pass 1: real source -> scratch (always non-overlapping - scratch
      * is fresh driver memory nothing else touches). Fixed offset
@@ -645,13 +731,13 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
      * sized calls - see this function's own top comment. */
     err = run_copy(pmp, base_page + PMP_MAX_PAGES_PER_CALL, width, height,
                     src_phys, scratch_phys, screen_stride, scratch_stride,
-                    &tiles_x, &tiles_y);
+                    format_code, &tiles_x, &tiles_y);
     if (err) return err;
 
     /* Pass 2: scratch -> real destination (same reasoning). */
     err = run_copy(pmp, base_page + PMP_MAX_PAGES_PER_CALL, width, height,
                     scratch_phys, dest_phys, scratch_stride, screen_stride,
-                    &tiles_x, &tiles_y);
+                    format_code, &tiles_x, &tiles_y);
     if (err) return err;
 
     *tiles_x_out = tiles_x;
@@ -724,7 +810,8 @@ _kernel_oserror *v3d_copy_overlap_test(pmp_area_t *pmp, unsigned int base_page,
 
     err = v3d_copy_screen_overlapping(pmp, base_page + buf_pages,
                                         0, 0, shift_x, shift_y, width, height,
-                                        buf_phys, stride, tiles_x_out, tiles_y_out);
+                                        buf_phys, stride, 4u /* bytes/pixel */,
+                                        27 /* RGBA8 */, tiles_x_out, tiles_y_out);
     if (err) return err;
 
     *buf_log_out = buf_log;

@@ -62,6 +62,20 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
                                  unsigned int *tiles_y_out);
 
 /*
+ * 16bpp counterpart of v3d_copy_test (2026-09-30 - see cl_copy.c's own
+ * comment for the full reasoning) - isolated synthetic-buffer proof
+ * for the copy path's LOAD side at 16-bit width, before the real
+ * screen framestore is ever touched at this depth. Same contract as
+ * v3d_copy_test, just 2 bytes/pixel and RGBA5551 throughout.
+ */
+_kernel_oserror *v3d_copy_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
+                                       unsigned int width, unsigned int height,
+                                       void **src_log_out, void **dest_log_out,
+                                       unsigned int *stride_bytes_out,
+                                       unsigned int *tiles_x_out,
+                                       unsigned int *tiles_y_out);
+
+/*
  * Same Load+Store copy, but targeting the real screen framestore
  * directly - no PMP allocation for source or dest at all (that memory
  * already exists; only the CL/tile_alloc/tile_state scratch buffers
@@ -74,6 +88,16 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
  * rectangles at (src_x,src_y) and (dest_x,dest_y) do not overlap -
  * this function does not check that itself (see this header's top
  * comment on why overlapping copies are out of scope for now).
+ *
+ * `bytes_per_pixel`/`format_code` (added for 16bpp support, 2026-09-30
+ * - see README/memory for the real-hardware derivation) must match
+ * the screen's actual current mode: 4/27 (RGBA8) for 32bpp, 2/45
+ * (RGBA5551 - confirmed to share RISC OS's own RGB555 channel
+ * positions, not guessed) for 16bpp. Getting these wrong from the
+ * actual active mode would corrupt the copy, not just misrender it -
+ * callers must derive both from the same screen-info read that
+ * produced `screen_phys_base`/`screen_stride`, never a stale or
+ * assumed value.
  */
 _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int src_x, unsigned int src_y,
@@ -81,6 +105,8 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int width, unsigned int height,
                                    unsigned int screen_phys_base,
                                    unsigned int screen_stride,
+                                   unsigned int bytes_per_pixel,
+                                   unsigned int format_code,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out);
 
@@ -97,6 +123,9 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * with a clear error rather than silently chunked, so the caller's own
  * fallback (leaving the GraphicsV call unclaimed, same as everywhere
  * else in this driver) takes over instead.
+ *
+ * `bytes_per_pixel`/`format_code` - see v3d_copy_screen's own comment,
+ * same contract and same real-hardware-derived values.
  */
 _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_page,
                                                unsigned int src_x, unsigned int src_y,
@@ -104,6 +133,8 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
                                                unsigned int width, unsigned int height,
                                                unsigned int screen_phys_base,
                                                unsigned int screen_stride,
+                                               unsigned int bytes_per_pixel,
+                                               unsigned int format_code,
                                                unsigned int *tiles_x_out,
                                                unsigned int *tiles_y_out);
 

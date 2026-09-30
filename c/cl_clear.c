@@ -676,6 +676,197 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     return NULL;
 }
 
+/*
+ * 16bpp screen-mode-support Phase 2 diagnostic (2026-09-30): an
+ * isolated, throwaway test, NOT meant to become permanent - determines
+ * empirically which V3D render-target format code (candidates:
+ * ABGR1555=4, RGBA5551=45, both plausible matches for RISC OS's real
+ * RGB555 16bpp screen format per the real PRM Video chapter - R bits
+ * 0-4, G bits 5-9, B bits 10-14, bit 15 reserved) actually matches
+ * RISC OS's own bit layout, rather than guessing and risking exactly
+ * the kind of silent channel swap this project already hit once (the
+ * Task Manager beacon diagnostic's R/B mixup).
+ *
+ * Deliberately a near-verbatim copy of v3d_clear_run's own proven
+ * structure (this file's "hardware-proven M2/M3 path, don't touch it"
+ * convention means a new function here, not a modification of that
+ * one) with exactly four things changed: format_code is a parameter
+ * instead of the hardcoded 27 (RGBA8), clear_color16 is passed as a
+ * 16-bit value (zero-extended into the clear-colours packet's 32-bit
+ * color_low field - that field is already wide enough to hold a
+ * narrower value untouched), the store stride is 2 bytes/pixel instead
+ * of 4, and the readback reads a 16-bit halfword instead of a 32-bit
+ * word. Everything else - INCLUDING the internal tile-buffer rendering
+ * config (bpp0=0/type0=2, left unchanged) - stays identical to the
+ * proven 32bpp path. bpp0/type0 configure internal tile-buffer
+ * precision, a separate concept from the final stored format (which
+ * output_format alone controls) - left alone here to keep this test
+ * isolated to exactly the one question it exists to answer, not two
+ * at once.
+ *
+ * No sprite-header prefix (unlike v3d_clear_run's general form) and
+ * its own dedicated scratch pages via plain, uncached pmp_alloc calls
+ * (a one-off manual diagnostic, not a hot GraphicsV-routed path, so
+ * the scratch-caching mechanism the real freeze fixes needed doesn't
+ * apply here) - callers must pass a base_page well clear of
+ * CLEAR_TEST_BASE_PAGE/CLEAR_SPRITE_BASE_PAGE's own ranges.
+ */
+_kernel_oserror *v3d_16bpp_format_test(pmp_area_t *pmp, unsigned int base_page,
+                                        unsigned int format_code,
+                                        unsigned int clear_color16,
+                                        unsigned int *render_target_phys_out,
+                                        unsigned int *readback_pixel_out)
+{
+    unsigned int cl_phys, render_phys, tile_alloc_phys, tile_state_phys;
+    void *cl_log, *render_log, *tile_alloc_log, *tile_state_log;
+    _kernel_oserror *err;
+    cl_buf_t bcl, rcl;
+    unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
+    io_mapping_t v3d;
+    unsigned int last_bin_irq, last_render_irq;
+    unsigned int page = base_page;
+    diag_bufs_t diag_bufs;
+
+    err = pmp_alloc(pmp, page, CL_PAGE_COUNT, &cl_phys, &cl_log);
+    if (err) return err;
+    page += CL_PAGE_COUNT;
+
+    err = pmp_alloc(pmp, page, RENDER_TARGET_PAGE_COUNT, &render_phys, &render_log);
+    if (err) return err;
+    page += RENDER_TARGET_PAGE_COUNT;
+
+    err = pmp_alloc(pmp, page, TILE_ALLOC_PAGE_COUNT, &tile_alloc_phys, &tile_alloc_log);
+    if (err) return err;
+    page += TILE_ALLOC_PAGE_COUNT;
+
+    err = pmp_alloc(pmp, page, TILE_STATE_PAGE_COUNT, &tile_state_phys, &tile_state_log);
+    if (err) return err;
+
+    {
+        unsigned int i;
+        volatile unsigned int *p;
+
+        p = (volatile unsigned int *) tile_alloc_log;
+        for (i = 0; i < (TILE_ALLOC_PAGE_COUNT * PAGE_SIZE) / 4u; i++)
+            p[i] = 0;
+
+        p = (volatile unsigned int *) tile_state_log;
+        for (i = 0; i < (TILE_STATE_PAGE_COUNT * PAGE_SIZE) / 4u; i++)
+            p[i] = 0;
+    }
+
+    diag_bufs.cl = cl_phys;
+    diag_bufs.render_target = render_phys;
+    diag_bufs.tile_alloc = tile_alloc_phys;
+    diag_bufs.tile_state = tile_state_phys;
+
+    cl_init(&bcl, cl_log, cl_phys, PAGE_SIZE);
+    bcl_start = cl_paddr(&bcl);
+    emit_tile_binning_mode_cfg(&bcl, CL_CLEAR_TEST_WIDTH, CL_CLEAR_TEST_HEIGHT);
+    emit_flush_vcd_cache(&bcl);
+    emit_occlusion_query_counter(&bcl, 0);
+    emit_start_tile_binning(&bcl);
+
+    emit_clip_window(&bcl, 0, 0, CL_CLEAR_TEST_WIDTH, CL_CLEAR_TEST_HEIGHT);
+    emit_cfg_bits(&bcl, 1, 1, 1, 0, 0, 0, 0, 7, 0, 0, 1, 0, 0, 0, 0);
+    emit_point_size(&bcl, 1.0f);
+    emit_line_width(&bcl, 1.0f);
+    emit_clipper_xy_scaling(&bcl, (CL_CLEAR_TEST_WIDTH / 2) * 256.0f,
+                             (CL_CLEAR_TEST_HEIGHT / 2) * -256.0f);
+    emit_clipper_z_scale_and_offset(&bcl, 0.5f, 0.5f);
+    emit_clipper_z_min_max(&bcl, 0.0f, 1.0f);
+    emit_viewport_offset(&bcl, CL_CLEAR_TEST_WIDTH / 2, CL_CLEAR_TEST_HEIGHT / 2, 0, 0);
+    emit_color_write_masks(&bcl, 0);
+    emit_blend_constant_color(&bcl, 0, 0, 0, 0);
+    emit_zero_all_flat_shade_flags(&bcl);
+    emit_zero_all_non_perspective_flags(&bcl);
+    emit_zero_all_centroid_flags(&bcl);
+    emit_transform_feedback_specs(&bcl, 0, 0);
+    emit_occlusion_query_counter(&bcl, 0);
+    emit_sample_state(&bcl, 0xF, 1.0f);
+    emit_vcm_cache_size(&bcl, 4, 4);
+
+    emit_flush(&bcl);
+    bcl_end = cl_paddr(&bcl);
+
+    cl_init(&rcl, (unsigned char *) cl_log + bcl.offset,
+            cl_phys + bcl.offset, PAGE_SIZE - bcl.offset);
+    rcl_start = cl_paddr(&rcl);
+    emit_tile_rendering_mode_cfg_common(&rcl, CL_CLEAR_TEST_WIDTH,
+                                         CL_CLEAR_TEST_HEIGHT, 2);
+    emit_tile_rendering_mode_cfg_clear_colors(&rcl, 0, clear_color16, 0);
+    emit_tile_rendering_mode_cfg_color_rt0(&rcl, 0, 2, 0);
+    emit_tile_rendering_mode_cfg_zs_clear(&rcl, 0, 1.0f);
+    emit_tile_list_initial_block_size(&rcl, 0, 1);
+    emit_multicore_tile_list_set_base(&rcl, tile_alloc_phys);
+    emit_multicore_supertile_cfg(&rcl, 1, 1, 1, 1, 1, 1, 1, 0, 0);
+
+    emit_tile_coordinates(&rcl, 0, 0);
+    emit_end_of_loads(&rcl);
+    emit_store_tile_buffer_none(&rcl);
+    emit_clear_tile_buffers(&rcl);
+    emit_end_of_tile_marker(&rcl);
+
+    emit_tile_coordinates(&rcl, 0, 0);
+    emit_end_of_loads(&rcl);
+    emit_store_tile_buffer_rt0(&rcl, format_code,
+                                CL_CLEAR_TEST_WIDTH * 2, render_phys);
+    emit_end_of_tile_marker(&rcl);
+
+    emit_end_of_rendering(&rcl);
+    rcl_end = cl_paddr(&rcl);
+
+    err = io_map(V3D_MB_BASE, &v3d);
+    if (err) return err;
+
+    IO_WORD(v3d, V3D_PTB_BPOS) = 0;
+    v3d_flush_caches(&v3d);
+    last_bin_irq = g_v3d_irq_bin_done_count;
+
+    IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
+    IO_WORD(v3d, V3D_CLE_CT0QMS) = TILE_ALLOC_PAGE_COUNT * PAGE_SIZE;
+    IO_WORD(v3d, V3D_CLE_CT0QTS) = tile_state_phys | V3D_CLE_CT0QTS_ENABLE;
+    IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
+    IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end;
+
+    io_unmap(&v3d);
+
+    {
+        static _kernel_oserror err_bin_timeout = { 7, "" };
+        err = v3d_poll_counter(&g_v3d_irq_bin_done_count, last_bin_irq,
+                                &err_bin_timeout,
+                                "BFC (binning)", 1, bcl_start, bcl_end,
+                                &diag_bufs);
+        if (err)
+            return err;
+    }
+
+    err = io_map(V3D_MB_BASE, &v3d);
+    if (err) return err;
+
+    v3d_flush_caches(&v3d);
+    last_render_irq = g_v3d_irq_render_done_count;
+
+    IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
+    IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end;
+
+    io_unmap(&v3d);
+
+    {
+        static _kernel_oserror err_render_timeout = { 8, "" };
+        err = v3d_poll_counter(&g_v3d_irq_render_done_count, last_render_irq,
+                                &err_render_timeout,
+                                "RFC (render)", 0, rcl_start, rcl_end,
+                                &diag_bufs);
+        if (err)
+            return err;
+    }
+
+    *render_target_phys_out = render_phys;
+    *readback_pixel_out = (unsigned int) *(volatile unsigned short *) render_log;
+    return NULL;
+}
+
 _kernel_oserror *v3d_clear_test(pmp_area_t *pmp, unsigned int base_page,
                                  unsigned int clear_color_rgba,
                                  unsigned int *render_target_phys_out,

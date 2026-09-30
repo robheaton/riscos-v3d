@@ -98,6 +98,10 @@ static _kernel_oserror *v3d_test_buffer(unsigned int *phys_addr_out,
 /* Uses PMP pages 32-41 (10 pages) - well clear of ClearTest's range. */
 #define CLEAR_SPRITE_BASE_PAGE 32u
 
+/* Uses PMP pages 48-56 (9 pages) - well clear of ClearToSprite's range
+ * (ends at 41), comfortably inside g_pmp's 64-page limit. */
+#define FORMAT16_TEST_BASE_PAGE 48u
+
 /*
  * Separate, much bigger PMP area for V3D_FillTest (step 2 of the
  * planned GraphicsV Render accelerator - see README.md). The shared
@@ -151,6 +155,62 @@ static int g_pmp_fill_created = 0;
  */
 #define PMP_FILL_BLOCK_PAGES 4608u
 #define PMP_FILL_BLOCK_COUNT 6u
+/* Small dedicated slot for V3D_CopyTest16bpp (2026-09-30, 16bpp
+ * support Phase 3), NOT a 7th full PMP_FILL_BLOCK_PAGES block - this
+ * is a tiny, isolated synthetic-buffer test, not a full-screen
+ * accelerator path like the other six blocks, so it doesn't need to
+ * match their much larger size.
+ *
+ * 64 was a real hardware-confirmed undercount, not a guess left
+ * uncorrected: a first attempt at this value hit "Bad page number",
+ * and the ensure_pmp_fill diagnostic added alongside it (below)
+ * proved the OS had granted the full requested total - the actual
+ * problem was this constant being too small, not any OS-level
+ * clamping. cl_copy.c's own scratch-caching (find_or_create_copy_
+ * scratch) always claims WORST-CASE-sized buffers (sized for
+ * WORST_CASE_TILES_X*Y=510 tiles) regardless of how small the actual
+ * request is, by design, so later differently-sized calls at the same
+ * base_page can reuse them - for a 100x80 test that's 49 pages of
+ * scratch alone, plus 16 for the two (tiny, exactly-sized) test
+ * buffers = 65 minimum, computed precisely and confirmed by hand
+ * after the fact, not estimated in advance. 100 gives real margin
+ * above that confirmed number. */
+#define COPY_TEST_16BPP_EXTRA_PAGES 100u
+
+/*
+ * Minimal manual decimal formatting for the one diagnostic below that
+ * needs it (page counts) - matches this codebase's existing "no
+ * <string.h>, no libc formatting" convention (see module.c's own
+ * cmd_tail_has_word, cl_clear.c's append_str/append_hex32 for hex).
+ * Bounds-checked against errmess's real 252-byte size (kernel.h) even
+ * though this specific message is always short and fixed-shape.
+ */
+static unsigned int append_str_bounded(char *dst, unsigned int pos, const char *s)
+{
+    while (*s && pos < 251u)
+        dst[pos++] = *s++;
+    return pos;
+}
+
+static unsigned int append_uint_decimal(char *dst, unsigned int pos, unsigned int v)
+{
+    char digits[10];
+    unsigned int n = 0;
+
+    if (v == 0u)
+    {
+        if (pos < 251u) dst[pos++] = '0';
+        return pos;
+    }
+    while (v > 0u && n < 10u)
+    {
+        digits[n++] = (char) ('0' + (v % 10u));
+        v /= 10u;
+    }
+    while (n > 0u && pos < 251u)
+        dst[pos++] = digits[--n];
+    return pos;
+}
 
 static _kernel_oserror *ensure_pmp_fill(void)
 {
@@ -161,12 +221,49 @@ static _kernel_oserror *ensure_pmp_fill(void)
 
     /* PMP logical-window reservation is cheap (no real memory
      * committed until pages are actually claimed via pmp_alloc), so
-     * there's no cost to sizing this generously. */
-    err = pmp_create("V3DFill", PMP_FILL_BLOCK_COUNT * PMP_FILL_BLOCK_PAGES
-                      * PAGE_SIZE, PMP_FILL_BLOCK_COUNT * PMP_FILL_BLOCK_PAGES,
-                      &g_pmp_fill);
-    if (err)
-        return err;
+     * there's no cost to sizing this generously. Total is the six
+     * regular blocks plus the one small COPY_TEST_16BPP_EXTRA_PAGES
+     * slot (see its own comment for why that one isn't a matching
+     * seventh full block). */
+    {
+        unsigned int requested_pages = PMP_FILL_BLOCK_COUNT * PMP_FILL_BLOCK_PAGES
+                                        + COPY_TEST_16BPP_EXTRA_PAGES;
+
+        err = pmp_create("V3DFill", requested_pages * PAGE_SIZE,
+                          requested_pages, &g_pmp_fill);
+        if (err)
+            return err;
+
+        /* CHECKED, not assumed (2026-09-30) - this project's own history
+         * already flagged this exact gap: OS_DynamicArea 0 can silently
+         * grant FEWER pages than requested (pmp_create's own docs note
+         * the returned value, regs.r[9]/g_pmp_fill.max_pages, can
+         * differ), and until now nothing here ever compared it against
+         * what was actually asked for - a previous session only found a
+         * working total (27648) by trial and error after a "Bad page
+         * number" failure, without confirming the REAL limit. Proved
+         * useful immediately: when COPY_TEST_16BPP_EXTRA_PAGES was
+         * first undersized, this check did NOT fire, directly proving
+         * the OS had granted the full request and the real bug was
+         * elsewhere (that constant's own value) - see its comment. */
+        if (g_pmp_fill.max_pages < requested_pages)
+        {
+            /* Built dynamically, not a fixed static string - the whole
+             * point of this diagnostic is to report the REAL numbers
+             * rather than send us back to guessing. */
+            static _kernel_oserror err_clamped;
+            unsigned int pos = 0;
+
+            err_clamped.errnum = 31;
+            pos = append_str_bounded(err_clamped.errmess, pos,
+                                      "V3DDriver: V3DFill area granted only ");
+            pos = append_uint_decimal(err_clamped.errmess, pos, g_pmp_fill.max_pages);
+            pos = append_str_bounded(err_clamped.errmess, pos, " pages, requested ");
+            pos = append_uint_decimal(err_clamped.errmess, pos, requested_pages);
+            err_clamped.errmess[pos] = '\0';
+            return &err_clamped;
+        }
+    }
 
     g_pmp_fill_created = 1;
     return NULL;
@@ -178,6 +275,7 @@ static _kernel_oserror *ensure_pmp_fill(void)
 #define SCREEN_COPY_BASE_PAGE          (3u * PMP_FILL_BLOCK_PAGES) /* V3D_ScreenCopyTest / accel direct copy */
 #define OVERLAP_COPY_TEST_BASE_PAGE    (4u * PMP_FILL_BLOCK_PAGES) /* V3D_OverlapCopyTest */
 #define SCREEN_COPY_OVERLAP_BASE_PAGE  (5u * PMP_FILL_BLOCK_PAGES) /* V3D_ScreenCopyOverlapTest / accel overlap copy */
+#define COPY_TEST_16BPP_BASE_PAGE      (6u * PMP_FILL_BLOCK_PAGES) /* V3D_CopyTest16bpp */
 
 /*
  * Step 3 of the planned GraphicsV Render accelerator: caches the
@@ -185,8 +283,17 @@ static _kernel_oserror *ensure_pmp_fill(void)
  * v3d_get_framestore_phys's own comment for why this is
  * checked for real, not assumed) plus the mode info needed to target
  * it, computed once and reused - re-verifying contiguity across the
- * whole screen on every single fill call would be wasteful, and the
- * mode isn't expected to change without a module reload anyway.
+ * whole screen on every single fill call would be wasteful.
+ *
+ * UPDATE (2026-09-30): "the mode isn't expected to change without a
+ * module reload anyway" (the original reasoning here) turned out to
+ * be a real gap, not a safe assumption - a live screen mode switch
+ * while this module stayed loaded would have silently kept targeting
+ * the OLD geometry. v3d_service_handler (below) now clears
+ * g_screen_framestore_verified on Service_ModeChange, so the next real
+ * accelerated call re-derives everything from scratch instead of
+ * trusting a stale cache - this flag is no longer "verify once for the
+ * module's whole lifetime", just "verify once per mode".
  */
 static int g_screen_framestore_verified = 0;
 static v3d_screen_info_t g_screen_info;
@@ -203,10 +310,23 @@ static _kernel_oserror *ensure_screen_framestore(void)
     if (err)
         return err;
 
-    if (g_screen_info.log2_bpp != 5u)
+    /* Widened from 32bpp-only to also accept 16bpp (2026-09-30, real
+     * 16bpp screen support - see README/memory) - this function only
+     * verifies/caches GEOMETRY, which is equally valid to compute for
+     * either depth. Whether a given ACCELERATED OPERATION is actually
+     * ready for the active depth is a separate question each caller
+     * answers for itself: copy uses screen_bpp_params (below, accepts
+     * both), fill still explicitly requires 32bpp via
+     * require_32bpp_for_fill (below) until its own internals are
+     * generalized (Phase 4, not done yet) - fill's own cl_fill.c still
+     * hardcodes RGBA8/4-bytes-per-pixel throughout, so letting a 16bpp
+     * call reach it here would silently corrupt the screen rather than
+     * safely fail, exactly the "worse than a crash" failure mode
+     * gfxv_accel.h's own top comment already warns about. */
+    if (g_screen_info.log2_bpp != 5u && g_screen_info.log2_bpp != 4u)
     {
         static _kernel_oserror err_bad_bpp = {
-            16, "V3DDriver: V3D_ScreenFillTest only supports 32bpp modes"
+            16, "V3DDriver: only 32bpp and 16bpp screen modes are supported"
         };
         return &err_bad_bpp;
     }
@@ -217,6 +337,93 @@ static _kernel_oserror *ensure_screen_framestore(void)
 
     g_screen_framestore_verified = 1;
     return NULL;
+}
+
+/*
+ * Copy's own per-depth parameters (2026-09-30, 16bpp support) - the
+ * two values every accelerated copy needs beyond plain geometry:
+ * bytes/pixel for address arithmetic (src_x/dest_x are PIXEL
+ * coordinates, not byte offsets) and the V3D render-target format
+ * code for the Load/Store packets themselves. 45=RGBA5551 is not a
+ * guess - confirmed on real hardware (V3D_16bppFormatTest,
+ * README/memory) to place its channels at the exact same bit
+ * positions RISC OS's own RGB555 16bpp format uses, so colours need
+ * no extra conversion at the call site. Only ever called after a
+ * successful ensure_screen_framestore(), which already restricts
+ * g_screen_info.log2_bpp to 4 or 5 - the error case here is a
+ * defensive backstop, not expected to actually trigger.
+ */
+static _kernel_oserror *screen_bpp_params(unsigned int *bytes_per_pixel_out,
+                                           unsigned int *format_code_out)
+{
+    if (g_screen_info.log2_bpp == 5u)
+    {
+        *bytes_per_pixel_out = 4u;
+        *format_code_out = 27u; /* RGBA8 */
+        return NULL;
+    }
+    if (g_screen_info.log2_bpp == 4u)
+    {
+        *bytes_per_pixel_out = 2u;
+        *format_code_out = 45u; /* RGBA5551 */
+        return NULL;
+    }
+    {
+        static _kernel_oserror err_bad_bpp = {
+            29, "V3DDriver: unsupported screen depth for accelerated copy"
+        };
+        return &err_bad_bpp;
+    }
+}
+
+/*
+ * Fill's own depth gate (2026-09-30, 16bpp support) - cl_fill.c still
+ * hardcodes RGBA8/4-bytes-per-pixel throughout (Phase 4, generalizing
+ * it, is not done yet), so this explicitly keeps fill 32bpp-only even
+ * though ensure_screen_framestore's own geometry check now accepts
+ * 16bpp too (see that function's own comment) - without this, a live
+ * 16bpp desktop would silently corrupt on the first accelerated fill
+ * instead of safely falling back to CPU rendering.
+ */
+static _kernel_oserror *require_32bpp_for_fill(void)
+{
+    if (g_screen_info.log2_bpp != 5u)
+    {
+        static _kernel_oserror err_not_ready = {
+            19, "V3DDriver: fill acceleration only supports 32bpp for now"
+        };
+        return &err_not_ready;
+    }
+    return NULL;
+}
+
+/*
+ * Service_ModeChange (&46) handler (2026-09-30) - see this file's
+ * `service-call-handler` directive in V3DDriver.cmhg. Confirmed
+ * against the real PRM (riscos.com/support/developers/prm/vdu.html,
+ * fetched 2026-09-30), not guessed: fires AFTER a screen mode switch
+ * has already completed (unlike Service_PreModeChange/&4D, fired
+ * before - not used here, nothing to veto), and "you should not claim
+ * this service call" - it's a pure notification, every registered
+ * handler sees it regardless of what others do. Deliberately does
+ * nothing V3D-hardware-side itself: just invalidates the cache
+ * ensure_screen_framestore already knows how to safely rebuild on the
+ * next real accelerated call, using whatever the NEW mode's geometry
+ * turns out to be. cmunge's generated signature is plain `void`, NOT
+ * `void *` - confirmed the hard way against a real trial build
+ * (cmhg/V3DDriver.h) after the secondhand docs said otherwise; "never
+ * claim" for this service call means simply doing nothing to R1, not
+ * returning any particular value - there's no return-value-based
+ * claim/pass-on convention here the way VECTOR_CLAIM/VECTOR_PASSON
+ * works for vector-handlers.
+ */
+void v3d_service_handler(int service_number, _kernel_swi_regs *r, void *pw)
+{
+    (void) r;
+    (void) pw;
+
+    if (service_number == 0x46 /* Service_ModeChange */)
+        g_screen_framestore_verified = 0;
 }
 
 /*
@@ -441,6 +648,10 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
     if (err)
         return err;
 
+    err = require_32bpp_for_fill();
+    if (err)
+        return err;
+
     err = ensure_pmp_fill();
     if (err)
         return err;
@@ -506,6 +717,10 @@ _kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int b
     if (err)
         return err;
 
+    err = require_32bpp_for_fill();
+    if (err)
+        return err;
+
     err = ensure_pmp_fill();
     if (err)
         return err;
@@ -551,6 +766,7 @@ _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_b
     unsigned int clock_rate;
     unsigned int src_y_top_down, dest_y_top_down;
     unsigned int tiles_x, tiles_y;
+    unsigned int bytes_per_pixel, format_code;
     _kernel_oserror *err;
 
     err = v3d_power_on(&clock_rate);
@@ -558,6 +774,10 @@ _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_b
         return err;
 
     err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    err = screen_bpp_params(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
@@ -580,6 +800,7 @@ _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_b
                                  src_left, src_y_top_down, dest_left, dest_y_top_down,
                                  width, height,
                                  g_screen_phys_base, g_screen_info.line_length,
+                                 bytes_per_pixel, format_code,
                                  &tiles_x, &tiles_y);
         if (!err)
             record_call_duration(t_start);
@@ -605,6 +826,7 @@ _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsign
     unsigned int clock_rate;
     unsigned int src_y_top_down, dest_y_top_down;
     unsigned int tiles_x, tiles_y;
+    unsigned int bytes_per_pixel, format_code;
     _kernel_oserror *err;
 
     err = v3d_power_on(&clock_rate);
@@ -612,6 +834,10 @@ _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsign
         return err;
 
     err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    err = screen_bpp_params(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
@@ -632,6 +858,7 @@ _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsign
                                  src_left, src_y_top_down, dest_left, dest_y_top_down,
                                  width, height,
                                  g_screen_phys_base, g_screen_info.line_length,
+                                 bytes_per_pixel, format_code,
                                  &tiles_x, &tiles_y);
         if (!err)
             record_call_duration(t_start);
@@ -896,6 +1123,8 @@ enum
     SWI_V3D_ScreenStripedFillTest = 24,
     SWI_V3D_AccelReentrantCount = 25,
     SWI_V3D_AccelTimingStats = 26,
+    SWI_V3D_16bppFormatTest = 27,
+    SWI_V3D_CopyTest16bpp = 28,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -981,6 +1210,46 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[1] = readback;
             r->r[2] = g_v3d_irq_bin_done_count - bin_irq_before;
             r->r[3] = g_v3d_irq_render_done_count - render_irq_before;
+            return NULL;
+        }
+
+        case SWI_V3D_16bppFormatTest:
+        {
+            /* Phase 2 of 16bpp screen-mode support - see the full
+             * reasoning on v3d_16bpp_format_test itself (cl_clear.c).
+             * R0=format_code (try 4=ABGR1555 and 45=RGBA5551), R1=16-
+             * bit clear colour (RISC-OS-native RGB555: e.g. 0x001F for
+             * pure red, 0x03E0 pure green, 0x7C00 pure blue). Returns
+             * R0=phys addr, R1=raw 16-bit readback - compare against
+             * R1 as sent: an exact match means this format_code
+             * already uses RISC OS's own bit layout directly. */
+            unsigned int phys_addr, readback;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    28, "V3DDriver: V3D_16bppFormatTest called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_16bpp_format_test(&g_pmp, FORMAT16_TEST_BASE_PAGE,
+                                         (unsigned int) r->r[0], (unsigned int) r->r[1],
+                                         &phys_addr, &readback);
+            if (err)
+                return err;
+
+            r->r[0] = phys_addr;
+            r->r[1] = readback;
             return NULL;
         }
 
@@ -1200,6 +1469,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
+            err = require_32bpp_for_fill();
+            if (err)
+                return err;
+
             if (width == 0u || height == 0u ||
                 x + width > g_screen_info.xwind_limit + 1u ||
                 y + height > g_screen_info.ywind_limit + 1u)
@@ -1272,6 +1545,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             }
 
             err = ensure_screen_framestore();
+            if (err)
+                return err;
+
+            err = require_32bpp_for_fill();
             if (err)
                 return err;
 
@@ -1394,6 +1671,50 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             return NULL;
         }
 
+        case SWI_V3D_CopyTest16bpp:
+        {
+            /* 16bpp screen-mode support, Phase 3 isolated diagnostic
+             * (2026-09-30) - see cl_copy.c's v3d_copy_test_16bpp for
+             * the full reasoning (proves the copy path's LOAD side at
+             * 16-bit width before the real framestore is ever touched
+             * at this depth). Same register contract as V3D_CopyTest:
+             * R0=width, R1=height in; source/dest logical addresses
+             * (R0/R1), shared stride in bytes (R2), tiles_x/tiles_y
+             * (R3/R4) out. Requires V3D_PowerOn. */
+            void *src_log, *dest_log;
+            unsigned int stride, tiles_x, tiles_y;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    30, "V3DDriver: V3D_CopyTest16bpp called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_copy_test_16bpp(&g_pmp_fill, COPY_TEST_16BPP_BASE_PAGE,
+                                  (unsigned int) r->r[0], (unsigned int) r->r[1],
+                                  &src_log, &dest_log, &stride, &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = (unsigned int) src_log;
+            r->r[1] = (unsigned int) dest_log;
+            r->r[2] = stride;
+            r->r[3] = tiles_x;
+            r->r[4] = tiles_y;
+            return NULL;
+        }
+
         case SWI_V3D_ScreenCopyTest:
         {
             /* Second step of op 1 (copy) - see README.md and
@@ -1413,6 +1734,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             unsigned int width = (unsigned int) r->r[4];
             unsigned int height = (unsigned int) r->r[5];
             unsigned int tiles_x, tiles_y;
+            unsigned int bytes_per_pixel, format_code;
             _kernel_oserror *err;
 
             if (!g_powered_on)
@@ -1424,6 +1746,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             }
 
             err = ensure_screen_framestore();
+            if (err)
+                return err;
+
+            err = screen_bpp_params(&bytes_per_pixel, &format_code);
             if (err)
                 return err;
 
@@ -1463,6 +1789,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             err = v3d_copy_screen(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
                                     src_x, src_y, dest_x, dest_y, width, height,
                                     g_screen_phys_base, g_screen_info.line_length,
+                                    bytes_per_pixel, format_code,
                                     &tiles_x, &tiles_y);
             if (err)
                 return err;
@@ -1559,6 +1886,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             unsigned int width = (unsigned int) r->r[4];
             unsigned int height = (unsigned int) r->r[5];
             unsigned int tiles_x, tiles_y;
+            unsigned int bytes_per_pixel, format_code;
             _kernel_oserror *err;
 
             if (!g_powered_on)
@@ -1570,6 +1898,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             }
 
             err = ensure_screen_framestore();
+            if (err)
+                return err;
+
+            err = screen_bpp_params(&bytes_per_pixel, &format_code);
             if (err)
                 return err;
 
@@ -1597,6 +1929,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             err = v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
                                     src_x, src_y, dest_x, dest_y, width, height,
                                     g_screen_phys_base, g_screen_info.line_length,
+                                    bytes_per_pixel, format_code,
                                     &tiles_x, &tiles_y);
             if (err)
                 return err;

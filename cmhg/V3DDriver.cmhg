@@ -19,7 +19,7 @@ initialisation-code:      module_init
 finalisation-code:        module_final
 swi-chunk-base-number:    0xC0040
 swi-handler-code:         v3d_swi_handler
-swi-decoding-table:       V3D,PowerOn,ReadIdent,TestBuffer,ClearTest,ClearToSprite,MemSplit,ClockInfo,IRQTest,ScreenInfo,FillTest,ScreenFillTest,AccelStart,AccelStop,AccelStats,AccelFailInfo,CopyTest,ScreenCopyTest,AccelCopyStats,OverlapCopyTest,ScreenCopyOverlapTest,AccelCopyLastError,RegSnapshot,StripedFillTest,AccelStripedStats,ScreenStripedFillTest,AccelReentrantCount,AccelTimingStats
+swi-decoding-table:       V3D,PowerOn,ReadIdent,TestBuffer,ClearTest,ClearToSprite,MemSplit,ClockInfo,IRQTest,ScreenInfo,FillTest,ScreenFillTest,AccelStart,AccelStop,AccelStats,AccelFailInfo,CopyTest,ScreenCopyTest,AccelCopyStats,OverlapCopyTest,ScreenCopyOverlapTest,AccelCopyLastError,RegSnapshot,StripedFillTest,AccelStripedStats,ScreenStripedFillTest,AccelReentrantCount,AccelTimingStats,16bppFormatTest,CopyTest16bpp
 
 ; Dynamic Area ResizePMP handler (reason 6), required by any Physical
 ; Memory Pool area (see phys_buffer.c). The veneer takes care of the
@@ -45,3 +45,19 @@ generic-veneers:          v3d_da_resize_veneer/v3d_da_resize_handler(private-wor
 ; (confirmed the hard way - it refused a second one with a build error),
 ; so both pairs go on one comma-separated line.
 vector-handlers:          v3d_irq_entry/v3d_irq_handler, v3d_gfxv_entry/v3d_gfxv_handler
+
+; Live screen-mode-change safety (2026-09-30, part of 16bpp support -
+; see the v3d_service_handler function in module.c). Filtered to just
+; 0x46 (Service_ModeChange, confirmed against the real PRM - not
+; guessed) so this handler is never bothered with anything else; the
+; rule that this service call must not be claimed is honoured in the C
+; code, not here - this directive only controls which numbers get
+; filtered through to it at all. No comma before the number list -
+; confirmed against the real cmunge binary: a comma here is a Serious
+; Error (Failed to read expected number), unlike vector-handlers and
+; generic-veneers which do use commas elsewhere in this file. Note for
+; future edits to this file: any apostrophe or double quote character
+; anywhere in a semicolon comment, even on an unrelated line, makes
+; cmunge emit spurious missing-terminating-character warnings - avoid
+; both, plain hyphens and colons read fine.
+service-call-handler:    v3d_service_handler 0x46
