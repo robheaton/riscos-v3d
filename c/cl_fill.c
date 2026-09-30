@@ -178,6 +178,25 @@ static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
 #define WORST_CASE_N_TILES (WORST_CASE_TILES_X * WORST_CASE_TILES_Y)
 #define MAX_CACHED_SCRATCH 4u
 
+/*
+ * Real budget for the tiny dedicated v3d_fill_test_16bpp PMP slot
+ * (module.c's FILL_TEST_16BPP_EXTRA_PAGES) - MUST be kept equal to
+ * that constant by hand (no shared header for it, same reasoning as
+ * cl_copy.c's own matching constant). Added 2026-09-30 after an
+ * adversarial code review found v3d_fill_test_16bpp's original bounds
+ * check only compared against the generic PMP_MAX_PAGES_PER_CALL=2048
+ * cap, far bigger than this dedicated slot actually is - a moderately
+ * large test call would have silently overflowed past this slot's real
+ * reservation and aliased the NEXT dedicated PMP slot instead of
+ * failing cleanly. The fixed worst-case fill-scratch cost (1 cl + 6
+ * rcl + 10 tile_alloc + 32 tile_state = 49 pages, via
+ * find_or_create_fill_scratch, ALWAYS claimed regardless of actual
+ * request size) leaves only SLOT_PAGES-SCRATCH_WORST_CASE_PAGES for
+ * the render buffer itself.
+ */
+#define FILL_TEST_16BPP_SLOT_PAGES 100u
+#define FILL_TEST_16BPP_SCRATCH_WORST_CASE_PAGES 49u
+
 typedef struct
 {
     unsigned int base_page; /* 0xFFFFFFFFu = unused slot */
@@ -274,6 +293,7 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int clear_color_rgba,
                                    unsigned int target_phys,
                                    unsigned int target_stride,
+                                   unsigned int format_code,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out)
 {
@@ -472,7 +492,7 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
              * own comment (same reference source) at the equivalent point */
             emit_tile_coordinates(&rcl, col, row);
             emit_end_of_loads(&rcl);
-            emit_store_tile_buffer_rt0(&rcl, 27 /* RGBA8 */, target_stride, target_phys);
+            emit_store_tile_buffer_rt0(&rcl, format_code, target_stride, target_phys);
             emit_end_of_tile_marker(&rcl);
         }
     }
@@ -585,7 +605,60 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
     if (err) return err;
 
     err = run_fill(pmp, base_page + render_pages, width, height, clear_color_rgba,
-                    render_phys, stride, tiles_x_out, tiles_y_out);
+                    render_phys, stride, 27 /* RGBA8 */, tiles_x_out, tiles_y_out);
+    if (err) return err;
+
+    *target_phys_out = render_phys;
+    *target_log_out = render_log;
+    *target_stride_bytes_out = stride;
+    return NULL;
+}
+
+_kernel_oserror *v3d_fill_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
+                                       unsigned int width, unsigned int height,
+                                       unsigned int clear_color_rgba,
+                                       unsigned int *target_phys_out,
+                                       void **target_log_out,
+                                       unsigned int *target_stride_bytes_out,
+                                       unsigned int *tiles_x_out,
+                                       unsigned int *tiles_y_out)
+{
+    unsigned int tiles_x, tiles_y, padded_w, padded_h, stride, render_bytes, render_pages;
+    unsigned int render_phys;
+    void *render_log;
+    _kernel_oserror *err;
+
+    if (width == 0u || height == 0u)
+    {
+        static _kernel_oserror err_bad_size = {
+            10, "V3DDriver: V3D_FillTest16bpp width/height must be non-zero"
+        };
+        return &err_bad_size;
+    }
+
+    tiles_x = div_round_up(width, TILE_SIZE);
+    tiles_y = div_round_up(height, TILE_SIZE);
+    padded_w = tiles_x * TILE_SIZE;
+    padded_h = tiles_y * TILE_SIZE;
+    stride = padded_w * 2u; /* 16bpp: 2 bytes/pixel, not v3d_fill_test's 4 */
+    render_bytes = stride * padded_h;
+    render_pages = bytes_to_pages(render_bytes);
+
+    if (render_pages > PMP_MAX_PAGES_PER_CALL ||
+        render_pages > FILL_TEST_16BPP_SLOT_PAGES - FILL_TEST_16BPP_SCRATCH_WORST_CASE_PAGES)
+    {
+        static _kernel_oserror err_too_big = {
+            14, "V3DDriver: V3D_FillTest16bpp rectangle too large for its "
+                "dedicated test PMP slot - try a smaller width/height."
+        };
+        return &err_too_big;
+    }
+
+    err = pmp_alloc(pmp, base_page, render_pages, &render_phys, &render_log);
+    if (err) return err;
+
+    err = run_fill(pmp, base_page + render_pages, width, height, clear_color_rgba,
+                    render_phys, stride, 45 /* RGBA5551 */, tiles_x_out, tiles_y_out);
     if (err) return err;
 
     *target_phys_out = render_phys;
@@ -600,13 +673,15 @@ _kernel_oserror *v3d_fill_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int clear_color_rgba,
                                    unsigned int screen_phys_base,
                                    unsigned int screen_stride,
+                                   unsigned int bytes_per_pixel,
+                                   unsigned int format_code,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out)
 {
-    unsigned int target_phys = screen_phys_base + y * screen_stride + x * 4u;
+    unsigned int target_phys = screen_phys_base + y * screen_stride + x * bytes_per_pixel;
 
     return run_fill(pmp, base_page, width, height, clear_color_rgba,
-                     target_phys, screen_stride, tiles_x_out, tiles_y_out);
+                     target_phys, screen_stride, format_code, tiles_x_out, tiles_y_out);
 }
 
 _kernel_oserror *v3d_fill_raw(pmp_area_t *pmp, unsigned int base_page,
@@ -614,11 +689,12 @@ _kernel_oserror *v3d_fill_raw(pmp_area_t *pmp, unsigned int base_page,
                                 unsigned int clear_color_rgba,
                                 unsigned int target_phys,
                                 unsigned int target_stride,
+                                unsigned int format_code,
                                 unsigned int *tiles_x_out,
                                 unsigned int *tiles_y_out)
 {
     return run_fill(pmp, base_page, width, height, clear_color_rgba,
-                     target_phys, target_stride, tiles_x_out, tiles_y_out);
+                     target_phys, target_stride, format_code, tiles_x_out, tiles_y_out);
 }
 
 _kernel_oserror *v3d_striped_fill_raw(pmp_area_t *pmp, unsigned int base_page,
@@ -626,7 +702,8 @@ _kernel_oserror *v3d_striped_fill_raw(pmp_area_t *pmp, unsigned int base_page,
                                         const unsigned int colours[8],
                                         unsigned int row_phase,
                                         unsigned int target_phys_row0,
-                                        unsigned int target_stride)
+                                        unsigned int target_stride,
+                                        unsigned int format_code)
 {
     unsigned int c;
 
@@ -657,7 +734,7 @@ _kernel_oserror *v3d_striped_fill_raw(pmp_area_t *pmp, unsigned int base_page,
         dest_stride = target_stride * 8u;
 
         err = run_fill(pmp, base_page, width, num_rows, colours[c],
-                        dest_phys, dest_stride, &tiles_x, &tiles_y);
+                        dest_phys, dest_stride, format_code, &tiles_x, &tiles_y);
         if (err)
             return err;
     }
@@ -713,7 +790,8 @@ _kernel_oserror *v3d_striped_fill_test(pmp_area_t *pmp, unsigned int base_page,
     if (err) return err;
 
     err = v3d_striped_fill_raw(pmp, base_page + render_pages, width, height,
-                                 colours, row_phase, render_phys, stride);
+                                 colours, row_phase, render_phys, stride,
+                                 27 /* RGBA8 */);
     if (err) return err;
 
     *target_phys_out = render_phys;

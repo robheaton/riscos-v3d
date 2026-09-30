@@ -114,6 +114,28 @@ static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
 #define WORST_CASE_N_TILES (WORST_CASE_TILES_X * WORST_CASE_TILES_Y)
 #define MAX_CACHED_SCRATCH 4u
 
+/*
+ * Real budget for the tiny dedicated v3d_copy_test_16bpp PMP slot
+ * (module.c's COPY_TEST_16BPP_EXTRA_PAGES) - MUST be kept equal to
+ * that constant by hand (no shared header between module.c and this
+ * file for it - same "independently diffable" reasoning as
+ * get_super_tiles/wait_for_irq above). Added 2026-09-30 after an
+ * adversarial code review found the ORIGINAL bounds check below only
+ * compared against the generic PMP_MAX_PAGES_PER_CALL=2048 cap, which
+ * is far bigger than this dedicated slot actually is - a moderately
+ * large test call (e.g. 200x200) would have silently overflowed past
+ * this slot's real reservation and aliased V3D_FillTest16bpp's
+ * adjacent slot instead of failing cleanly, corrupting whichever
+ * test's buffer was read back later. The fixed worst-case copy-
+ * scratch cost below (1 cl + 6 rcl + 10 tile_alloc + 32 tile_state =
+ * 49 pages, via find_or_create_copy_scratch, ALWAYS claimed regardless
+ * of actual request size - see that function's own sizing) leaves only
+ * SLOT_PAGES-SCRATCH_WORST_CASE_PAGES for the two (src+dest) render
+ * buffers COMBINED.
+ */
+#define COPY_TEST_16BPP_SLOT_PAGES 100u
+#define COPY_TEST_16BPP_SCRATCH_WORST_CASE_PAGES 49u
+
 typedef struct
 {
     unsigned int base_page;
@@ -531,11 +553,12 @@ _kernel_oserror *v3d_copy_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
     buf_bytes = stride * padded_h;
     buf_pages = bytes_to_pages(buf_bytes);
 
-    if (buf_pages > PMP_MAX_PAGES_PER_CALL)
+    if (buf_pages > PMP_MAX_PAGES_PER_CALL ||
+        2u * buf_pages > COPY_TEST_16BPP_SLOT_PAGES - COPY_TEST_16BPP_SCRATCH_WORST_CASE_PAGES)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_CopyTest16bpp rectangle too large for this "
-                "test harness (pmp_alloc's per-call page cap)"
+            14, "V3DDriver: V3D_CopyTest16bpp rectangle too large for its "
+                "dedicated test PMP slot - try a smaller width/height"
         };
         return &err_too_big;
     }

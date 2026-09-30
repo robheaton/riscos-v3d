@@ -176,6 +176,18 @@ static int g_pmp_fill_created = 0;
  * after the fact, not estimated in advance. 100 gives real margin
  * above that confirmed number. */
 #define COPY_TEST_16BPP_EXTRA_PAGES 100u
+/* Small dedicated slot for V3D_FillTest16bpp (2026-09-30, 16bpp
+ * support Phase 4), same reasoning as COPY_TEST_16BPP_EXTRA_PAGES
+ * above - a tiny isolated synthetic-buffer test, not a full
+ * PMP_FILL_BLOCK_PAGES block. Computed precisely, not estimated: for
+ * a 100x80 test (2x2 tiles of 64, padded to 128x128) the render
+ * buffer is 128*128*2 = 32768 bytes = 8 pages, and cl_fill.c's own
+ * fill-scratch cache (find_or_create_fill_scratch) claims the SAME
+ * worst-case 49 pages as cl_copy.c's copy scratch (identical
+ * WORST_CASE_TILES_X/Y constants in both files) regardless of actual
+ * request size - 8 + 49 = 57 minimum. 100 gives the same real margin
+ * COPY_TEST_16BPP_EXTRA_PAGES already uses above. */
+#define FILL_TEST_16BPP_EXTRA_PAGES 100u
 
 /*
  * Minimal manual decimal formatting for the one diagnostic below that
@@ -222,12 +234,13 @@ static _kernel_oserror *ensure_pmp_fill(void)
     /* PMP logical-window reservation is cheap (no real memory
      * committed until pages are actually claimed via pmp_alloc), so
      * there's no cost to sizing this generously. Total is the six
-     * regular blocks plus the one small COPY_TEST_16BPP_EXTRA_PAGES
-     * slot (see its own comment for why that one isn't a matching
-     * seventh full block). */
+     * regular blocks plus the two small dedicated 16bpp-test slots
+     * (see their own comments for why those aren't matching full
+     * blocks). */
     {
         unsigned int requested_pages = PMP_FILL_BLOCK_COUNT * PMP_FILL_BLOCK_PAGES
-                                        + COPY_TEST_16BPP_EXTRA_PAGES;
+                                        + COPY_TEST_16BPP_EXTRA_PAGES
+                                        + FILL_TEST_16BPP_EXTRA_PAGES;
 
         err = pmp_create("V3DFill", requested_pages * PAGE_SIZE,
                           requested_pages, &g_pmp_fill);
@@ -276,6 +289,7 @@ static _kernel_oserror *ensure_pmp_fill(void)
 #define OVERLAP_COPY_TEST_BASE_PAGE    (4u * PMP_FILL_BLOCK_PAGES) /* V3D_OverlapCopyTest */
 #define SCREEN_COPY_OVERLAP_BASE_PAGE  (5u * PMP_FILL_BLOCK_PAGES) /* V3D_ScreenCopyOverlapTest / accel overlap copy */
 #define COPY_TEST_16BPP_BASE_PAGE      (6u * PMP_FILL_BLOCK_PAGES) /* V3D_CopyTest16bpp */
+#define FILL_TEST_16BPP_BASE_PAGE      (COPY_TEST_16BPP_BASE_PAGE + COPY_TEST_16BPP_EXTRA_PAGES) /* V3D_FillTest16bpp */
 
 /*
  * Step 3 of the planned GraphicsV Render accelerator: caches the
@@ -315,14 +329,9 @@ static _kernel_oserror *ensure_screen_framestore(void)
      * verifies/caches GEOMETRY, which is equally valid to compute for
      * either depth. Whether a given ACCELERATED OPERATION is actually
      * ready for the active depth is a separate question each caller
-     * answers for itself: copy uses screen_bpp_params (below, accepts
-     * both), fill still explicitly requires 32bpp via
-     * require_32bpp_for_fill (below) until its own internals are
-     * generalized (Phase 4, not done yet) - fill's own cl_fill.c still
-     * hardcodes RGBA8/4-bytes-per-pixel throughout, so letting a 16bpp
-     * call reach it here would silently corrupt the screen rather than
-     * safely fail, exactly the "worse than a crash" failure mode
-     * gfxv_accel.h's own top comment already warns about. */
+     * answers for itself: both copy and fill now use screen_bpp_params
+     * (below, accepts both depths - fill's own cl_fill.c was
+     * generalized to take bytes_per_pixel/format_code in Phase 4). */
     if (g_screen_info.log2_bpp != 5u && g_screen_info.log2_bpp != 4u)
     {
         static _kernel_oserror err_bad_bpp = {
@@ -340,16 +349,33 @@ static _kernel_oserror *ensure_screen_framestore(void)
 }
 
 /*
- * Copy's own per-depth parameters (2026-09-30, 16bpp support) - the
- * two values every accelerated copy needs beyond plain geometry:
- * bytes/pixel for address arithmetic (src_x/dest_x are PIXEL
- * coordinates, not byte offsets) and the V3D render-target format
- * code for the Load/Store packets themselves. 45=RGBA5551 is not a
- * guess - confirmed on real hardware (V3D_16bppFormatTest,
- * README/memory) to place its channels at the exact same bit
- * positions RISC OS's own RGB555 16bpp format uses, so colours need
- * no extra conversion at the call site. Only ever called after a
- * successful ensure_screen_framestore(), which already restricts
+ * Copy and fill's shared per-depth parameters (2026-09-30, 16bpp
+ * support) - the two values every accelerated copy or fill needs
+ * beyond plain geometry: bytes/pixel for address arithmetic
+ * (x/y are PIXEL coordinates, not byte offsets) and the V3D
+ * render-target format code for the Load/Store packets themselves.
+ *
+ * CORRECTED (2026-09-30, same day): this hardware's real 16bpp screen
+ * mode is genuine RGB565 (5-6-5, all 16 bits used for colour), NOT the
+ * RGB555 (5-5-5 + 1 reserved bit) originally assumed from the classic
+ * RISC OS PRM sprite-format doc - confirmed directly from the real
+ * Raspberry Pi BCMVideo HAL driver source
+ * (RiscOS/Sources/Video/HWSupport/BCMVideo/s/GraphicsV: "16bpp is
+ * RGB565, i.e. RRRRRGGGGGGBBBBB"), whose firmware framebuffer
+ * (dispmanx) is hardwired to 565 - this is also why "32 thousand
+ * colours" is greyed out/unavailable in the mode chooser on this
+ * hardware, it was never actually offered. Format 7 (BGR565, the only
+ * 565-shaped entry in the V3D render-target format enum) replaces the
+ * original 45 (RGBA5551) here - see gfxv_accel.c's widen_565_to_8bit_
+ * rgba for the matching ECF-decode fix. Still used for COPY as well as
+ * FILL even though copy's correctness never actually depended on which
+ * specific format was declared (a Load+Store round trip through the
+ * SAME format code is bit-exact regardless of the format's real
+ * semantic shape, already hardware-proven with format 45 via
+ * CopyTest16bpp.bas's non-colour test pattern) - kept unified so
+ * "what format is this screen" has one single source of truth, not two
+ * that could silently drift apart. Only ever called after a successful
+ * ensure_screen_framestore(), which already restricts
  * g_screen_info.log2_bpp to 4 or 5 - the error case here is a
  * defensive backstop, not expected to actually trigger.
  */
@@ -365,36 +391,15 @@ static _kernel_oserror *screen_bpp_params(unsigned int *bytes_per_pixel_out,
     if (g_screen_info.log2_bpp == 4u)
     {
         *bytes_per_pixel_out = 2u;
-        *format_code_out = 45u; /* RGBA5551 */
+        *format_code_out = 7u; /* BGR565 - see this function's own comment */
         return NULL;
     }
     {
         static _kernel_oserror err_bad_bpp = {
-            29, "V3DDriver: unsupported screen depth for accelerated copy"
+            29, "V3DDriver: unsupported screen depth for accelerated copy/fill"
         };
         return &err_bad_bpp;
     }
-}
-
-/*
- * Fill's own depth gate (2026-09-30, 16bpp support) - cl_fill.c still
- * hardcodes RGBA8/4-bytes-per-pixel throughout (Phase 4, generalizing
- * it, is not done yet), so this explicitly keeps fill 32bpp-only even
- * though ensure_screen_framestore's own geometry check now accepts
- * 16bpp too (see that function's own comment) - without this, a live
- * 16bpp desktop would silently corrupt on the first accelerated fill
- * instead of safely falling back to CPU rendering.
- */
-static _kernel_oserror *require_32bpp_for_fill(void)
-{
-    if (g_screen_info.log2_bpp != 5u)
-    {
-        static _kernel_oserror err_not_ready = {
-            19, "V3DDriver: fill acceleration only supports 32bpp for now"
-        };
-        return &err_not_ready;
-    }
-    return NULL;
 }
 
 /*
@@ -614,6 +619,29 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
 }
 
 /*
+ * Accessor (2026-09-30, 16bpp fill support) letting gfxv_accel.c learn
+ * the screen's active depth BEFORE it can even decode a GraphicsV
+ * Render fill's ECF block - log2_bpp==4 packs two sub-pixels per
+ * 32-bit OR/EOR word, log2_bpp==5 packs exactly one (see
+ * gfxv_accel.c's ecf_decode_striped). v3d_accel_render_fill/
+ * _striped_fill already handle either depth internally via
+ * screen_bpp_params, but that's only reachable AFTER the ECF has
+ * already been decoded into a colour, so the depth is needed one step
+ * earlier than that. Self-initialises via ensure_screen_framestore
+ * exactly like every other accel entry point - safe to call before
+ * V3D_PowerOn or any other setup.
+ */
+_kernel_oserror *v3d_accel_get_screen_log2_bpp(unsigned int *log2_bpp_out)
+{
+    _kernel_oserror *err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    *log2_bpp_out = g_screen_info.log2_bpp;
+    return NULL;
+}
+
+/*
  * Step 4 of the planned GraphicsV Render accelerator (see README.md
  * and gfxv_accel.c): the one function that knows how to actually
  * perform an accelerated fill using this driver's existing PMP/IRQ/
@@ -638,6 +666,7 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
     unsigned int clock_rate;
     unsigned int width, height, y_top_down;
     unsigned int tiles_x, tiles_y;
+    unsigned int bytes_per_pixel, format_code;
     _kernel_oserror *err;
 
     err = v3d_power_on(&clock_rate);
@@ -648,7 +677,7 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
     if (err)
         return err;
 
-    err = require_32bpp_for_fill();
+    err = screen_bpp_params(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
@@ -669,6 +698,7 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
         err = v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
                                  left, y_top_down, width, height, colour_rgba,
                                  g_screen_phys_base, g_screen_info.line_length,
+                                 bytes_per_pixel, format_code,
                                  &tiles_x, &tiles_y);
         if (!err)
             record_call_duration(t_start);
@@ -707,6 +737,7 @@ _kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int b
     unsigned int clock_rate;
     unsigned int width, height, y_top_down;
     unsigned int target_phys_row0;
+    unsigned int bytes_per_pixel, format_code;
     _kernel_oserror *err;
 
     err = v3d_power_on(&clock_rate);
@@ -717,7 +748,7 @@ _kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int b
     if (err)
         return err;
 
-    err = require_32bpp_for_fill();
+    err = screen_bpp_params(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
@@ -734,13 +765,14 @@ _kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int b
     y_top_down = g_screen_info.ywind_limit - top;
 
     target_phys_row0 = g_screen_phys_base + y_top_down * g_screen_info.line_length
-                        + left * 4u;
+                        + left * bytes_per_pixel;
 
     {
         unsigned int t_start = v3d_read_centiseconds();
         err = v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
                                       width, height, colours, y_top_down % 8u,
-                                      target_phys_row0, g_screen_info.line_length);
+                                      target_phys_row0, g_screen_info.line_length,
+                                      format_code);
         if (!err)
             record_call_duration(t_start);
     }
@@ -1125,6 +1157,7 @@ enum
     SWI_V3D_AccelTimingStats = 26,
     SWI_V3D_16bppFormatTest = 27,
     SWI_V3D_CopyTest16bpp = 28,
+    SWI_V3D_FillTest16bpp = 29,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1217,12 +1250,19 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
         {
             /* Phase 2 of 16bpp screen-mode support - see the full
              * reasoning on v3d_16bpp_format_test itself (cl_clear.c).
-             * R0=format_code (try 4=ABGR1555 and 45=RGBA5551), R1=16-
-             * bit clear colour (RISC-OS-native RGB555: e.g. 0x001F for
-             * pure red, 0x03E0 pure green, 0x7C00 pure blue). Returns
-             * R0=phys addr, R1=raw 16-bit readback - compare against
-             * R1 as sent: an exact match means this format_code
-             * already uses RISC OS's own bit layout directly. */
+             * R0=format_code to test, R1=colour in as 8-bit-per-channel
+             * RGBA (byte0=R/byte1=G/byte2=B - the clear-colour packet
+             * always takes 8bpc input regardless of target depth, see
+             * this same function's own confirmed finding). Returns
+             * R0=phys addr, R1=raw 16-bit readback. This hardware's
+             * real 16bpp mode is genuine RGB565 (confirmed via real
+             * BCMVideo HAL source + test/Format565Test.bas on real
+             * hardware, NOT the classic RGB555 "32 thousand colours"
+             * mode this hardware's HAL driver doesn't even offer) -
+             * format_code 7 (BGR565) is the confirmed-correct one
+             * (R bits11-15, G bits5-10, B bits0-4); format 45
+             * (RGBA5551) was this project's original, now-superseded
+             * guess for a genuine RGB555-mode screen. */
             unsigned int phys_addr, readback;
             _kernel_oserror *err;
 
@@ -1455,6 +1495,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             unsigned int height = (unsigned int) r->r[3];
             unsigned int colour = (unsigned int) r->r[4];
             unsigned int tiles_x, tiles_y;
+            unsigned int bytes_per_pixel, format_code;
             _kernel_oserror *err;
 
             if (!g_powered_on)
@@ -1469,7 +1510,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            err = require_32bpp_for_fill();
+            err = screen_bpp_params(&bytes_per_pixel, &format_code);
             if (err)
                 return err;
 
@@ -1495,6 +1536,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             err = v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
                                     x, y, width, height, colour,
                                     g_screen_phys_base, g_screen_info.line_length,
+                                    bytes_per_pixel, format_code,
                                     &tiles_x, &tiles_y);
             if (err)
                 return err;
@@ -1534,6 +1576,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             unsigned int row_phase = (unsigned int) r->r[4];
             const unsigned int *colours_in = (const unsigned int *) r->r[5];
             unsigned int target_phys_row0;
+            unsigned int bytes_per_pixel, format_code;
             _kernel_oserror *err;
 
             if (!g_powered_on)
@@ -1548,7 +1591,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            err = require_32bpp_for_fill();
+            err = screen_bpp_params(&bytes_per_pixel, &format_code);
             if (err)
                 return err;
 
@@ -1572,11 +1615,12 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 return err;
 
             target_phys_row0 = g_screen_phys_base + y * g_screen_info.line_length
-                                + x * 4u;
+                                + x * bytes_per_pixel;
 
             err = v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
                                          width, height, colours_in, row_phase,
-                                         target_phys_row0, g_screen_info.line_length);
+                                         target_phys_row0, g_screen_info.line_length,
+                                         format_code);
             if (err)
                 return err;
 
@@ -1712,6 +1756,54 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             r->r[2] = stride;
             r->r[3] = tiles_x;
             r->r[4] = tiles_y;
+            return NULL;
+        }
+
+        case SWI_V3D_FillTest16bpp:
+        {
+            /* 16bpp screen-mode support, Phase 4 isolated diagnostic
+             * (2026-09-30) - see cl_fill.c's v3d_fill_test_16bpp for
+             * the full reasoning (proves the fill/store path at
+             * 16-bit width, in isolation, before the real framestore
+             * is ever touched at this depth). Same register contract
+             * as V3D_FillTest: R0=width, R1=height, R2=colour in
+             * (8-bit-per-channel RGBA, same convention as 32bpp - see
+             * v3d_fill_test_16bpp's own comment); physical address
+             * (R0), row stride in bytes (R1), tiles_x (R2), tiles_y
+             * (R3), logical address (R4) out. Requires V3D_PowerOn. */
+            unsigned int target_phys, stride, tiles_x, tiles_y;
+            void *target_log;
+            _kernel_oserror *err;
+
+            if (!g_powered_on)
+            {
+                static _kernel_oserror err_not_on = {
+                    32, "V3DDriver: V3D_FillTest16bpp called before V3D_PowerOn"
+                };
+                return &err_not_on;
+            }
+
+            err = ensure_pmp_fill();
+            if (err)
+                return err;
+
+            err = v3d_irq_ensure_ready();
+            if (err)
+                return err;
+
+            err = v3d_fill_test_16bpp(&g_pmp_fill, FILL_TEST_16BPP_BASE_PAGE,
+                                  (unsigned int) r->r[0], (unsigned int) r->r[1],
+                                  (unsigned int) r->r[2],
+                                  &target_phys, &target_log, &stride,
+                                  &tiles_x, &tiles_y);
+            if (err)
+                return err;
+
+            r->r[0] = target_phys;
+            r->r[1] = stride;
+            r->r[2] = tiles_x;
+            r->r[3] = tiles_y;
+            r->r[4] = (unsigned int) target_log;
             return NULL;
         }
 

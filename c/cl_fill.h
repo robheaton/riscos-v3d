@@ -55,6 +55,28 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
                                  unsigned int *tiles_y_out);
 
 /*
+ * 16bpp twin of v3d_fill_test (2026-09-30, Phase 4 of 16bpp support) -
+ * same isolated synthetic-PMP-buffer approach and same signature, but
+ * a padded 2-bytes-per-pixel render buffer and format 45 (RGBA5551,
+ * confirmed on real hardware - see README/memory) instead of the
+ * 4-bytes-per-pixel/RGBA8 v3d_fill_test always uses.
+ * `clear_color_rgba` still takes the SAME 8-bit-per-channel convention
+ * as the 32bpp path - the V3D clear-colour packet always accepts 8bpc
+ * RGBA input regardless of the render target's real depth and
+ * down-converts each channel itself (see cl_clear.c/README's own
+ * confirmed finding), so no extra conversion is needed here despite
+ * the narrower target format.
+ */
+_kernel_oserror *v3d_fill_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
+                                       unsigned int width, unsigned int height,
+                                       unsigned int clear_color_rgba,
+                                       unsigned int *target_phys_out,
+                                       void **target_log_out,
+                                       unsigned int *target_stride_bytes_out,
+                                       unsigned int *tiles_x_out,
+                                       unsigned int *tiles_y_out);
+
+/*
  * Step 3: same multi-tile fill, but targeting the real screen
  * framestore directly - no PMP allocation for the render target at
  * all (that memory already exists; only the CL/tile_alloc/tile_state
@@ -77,6 +99,11 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
  * v3d_get_framestore_phys) - this function does not check
  * that itself, since re-checking per call would be wasteful once the
  * whole screen has already been verified once.
+ *
+ * `bytes_per_pixel`/`format_code` (added for 16bpp support, 2026-09-30
+ * - see cl_copy.h's own identical contract, and README/memory for the
+ * real-hardware derivation) must match the screen's actual current
+ * mode: 4/27 (RGBA8) for 32bpp, 2/45 (RGBA5551) for 16bpp.
  */
 _kernel_oserror *v3d_fill_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int x, unsigned int y,
@@ -84,6 +111,8 @@ _kernel_oserror *v3d_fill_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int clear_color_rgba,
                                    unsigned int screen_phys_base,
                                    unsigned int screen_stride,
+                                   unsigned int bytes_per_pixel,
+                                   unsigned int format_code,
                                    unsigned int *tiles_x_out,
                                    unsigned int *tiles_y_out);
 
@@ -106,6 +135,7 @@ _kernel_oserror *v3d_fill_raw(pmp_area_t *pmp, unsigned int base_page,
                                 unsigned int clear_color_rgba,
                                 unsigned int target_phys,
                                 unsigned int target_stride,
+                                unsigned int format_code,
                                 unsigned int *tiles_x_out,
                                 unsigned int *tiles_y_out);
 
@@ -134,7 +164,8 @@ _kernel_oserror *v3d_striped_fill_raw(pmp_area_t *pmp, unsigned int base_page,
                                         const unsigned int colours[8],
                                         unsigned int row_phase,
                                         unsigned int target_phys_row0,
-                                        unsigned int target_stride);
+                                        unsigned int target_stride,
+                                        unsigned int format_code);
 
 /*
  * Isolated test harness for v3d_striped_fill_raw, following the same

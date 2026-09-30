@@ -64,6 +64,13 @@ extern _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left,
                                                              unsigned int dest_left, unsigned int dest_bottom,
                                                              unsigned int width, unsigned int height);
 
+/* Screen-depth accessor (2026-09-30, 16bpp fill support) - see
+ * module.c's own comment on v3d_accel_get_screen_log2_bpp. Needed
+ * here, one step before v3d_accel_render_fill/_striped_fill are ever
+ * called, because ecf_decode_striped's own sub-pixel-packing logic
+ * depends on it. */
+extern _kernel_oserror *v3d_accel_get_screen_log2_bpp(unsigned int *log2_bpp_out);
+
 static void *g_gfxv_private_word = NULL;
 static int g_gfxv_claimed = 0;
 
@@ -232,26 +239,91 @@ _kernel_oserror *v3d_gfxv_shutdown(void)
 }
 
 /*
+ * Widens a 16bpp raw pixel value into this driver's own 8-bit-per-
+ * channel colour_rgba convention (R=byte0, G=byte1, B=byte2, A=byte3 -
+ * the same packing v3d_fill_raw/v3d_accel_render_fill already expect
+ * for 32bpp, and which the V3D clear-colour packet itself always
+ * accepts regardless of the render target's real depth - see
+ * cl_clear.c/README's own finding, so no further conversion is needed
+ * once widened here).
+ *
+ * CORRECTED (2026-09-30, same day as first written): this hardware's
+ * real 16bpp screen mode is genuine RGB565 (5-6-5, all 16 bits used
+ * for colour), NOT the RGB555 (5-5-5 + 1 reserved bit) originally
+ * assumed from the classic RISC OS PRM sprite-format doc - that doc
+ * describes the older VIDC-era format this hardware's HAL video driver
+ * doesn't even offer (confirmed: "32 thousand colours" is greyed out
+ * in the mode chooser on this hardware - it was never available; the
+ * Pi's firmware framebuffer is hardwired to 565).
+ *
+ * Bit layout CONFIRMED ON REAL HARDWARE (V3D format code 7/BGR565, via
+ * test/Format565Test.bas - R bits 11-15, G bits 5-10, B bits 0-4) -
+ * NOT the order a first reading of the Raspberry Pi BCMVideo driver's
+ * own source comment ("16bpp is RGB565, i.e. RRRRRGGGGGGBBBBB") would
+ * suggest by analogy with how the V3D enum's OWN format names read
+ * (letters left-to-right = low-bit-to-high-bit, the same convention
+ * that explained format 4/ABGR1555's R/B-swap surprise in Phase 2) -
+ * that analogy was wrong here: BCMVideo's comment turned out to use
+ * the opposite, more conventional MSB-first documentation style,
+ * unrelated to the V3D enum's own naming quirk. The V3D enum name
+ * "BGR565" read low-to-high (B=low, G=mid, R=high) DOES match what was
+ * actually measured - the same Phase 2 naming rule held, once applied
+ * to the right name. Takeaway: two different naming sources (a vendor
+ * driver's comment vs. a GPU vendor's format enum) can use opposite
+ * bit-order conventions - verify each independently, don't assume one
+ * predicts the other even when a plausible-looking analogy exists.
+ *
+ * Uses the standard N-to-8-bit expansion round(v*255/max), not a naive
+ * left-shift (which would leave the low bits always zero, visibly
+ * darkening/banding colours) - green gets its own 6-bit version since
+ * RGB565's green field is wider than red/blue's. Alpha is always fully
+ * opaque (0xFF) - RISC OS's 16bpp mode has no alpha channel of its own.
+ */
+static unsigned int widen_565_to_8bit_rgba(unsigned int raw16)
+{
+    unsigned int b5 = raw16 & 0x1Fu;
+    unsigned int g6 = (raw16 >> 5) & 0x3Fu;
+    unsigned int r5 = (raw16 >> 11) & 0x1Fu;
+    unsigned int r8 = (r5 * 255u + 15u) / 31u;
+    unsigned int g8 = (g6 * 255u + 31u) / 63u;
+    unsigned int b8 = (b5 * 255u + 15u) / 31u;
+
+    return r8 | (g8 << 8) | (b8 << 16) | (0xFFu << 24);
+}
+
+/*
  * Checks the 64-byte ECF block at `ecf` for a pattern this driver can
- * accelerate: at 32bpp each line's OR/EOR mask is a full 32-bit word -
- * exactly one pixel wide - so the pattern can only vary VERTICALLY
- * (per scanline, cycling every 8 rows), never horizontally within a
- * row. That means ANY ECF block with OR=0xFFFFFFFF on every line
- * (forcing every bit to 1 regardless of the existing pixel, same as
- * the original solid-fill derivation - see gfxv_accel.h's top comment)
- * decodes to up to 8 distinct row-colours, `colours_out[line] =
- * ~ecf[line*2+1]` - a real 2D dithered texture (one that also varies
+ * accelerate: at 32bpp (log2_bpp==5) each line's OR/EOR mask is a full
+ * 32-bit word - exactly one pixel wide - so the pattern can only vary
+ * VERTICALLY (per scanline, cycling every 8 rows), never horizontally
+ * within a row. That means ANY ECF block with OR=0xFFFFFFFF on every
+ * line (forcing every bit to 1 regardless of the existing pixel, same
+ * as the original solid-fill derivation - see gfxv_accel.h's top
+ * comment) decodes to up to 8 distinct row-colours, `colours_out[line]
+ * = ~ecf[line*2+1]` - a real 2D dithered texture (one that also varies
  * horizontally) is NOT expressible this way and isn't seen here, since
  * its OR mask couldn't be all-1s on every line.
  *
- * Returns 1 and fills *colours_out[0..7] if the OR=0xFFFFFFFF condition
- * holds for all 8 lines, 0 otherwise (some other pattern this driver
- * doesn't recognise - not ours to accelerate). A genuine solid fill is
+ * At 16bpp (log2_bpp==4, added 2026-09-30) each 32-bit OR/EOR word
+ * instead packs TWO horizontally-adjacent 16-bit sub-pixels - so
+ * OR=0xFFFFFFFF alone isn't sufficient proof of a horizontally-uniform
+ * row: the low and high 16 bits of ~eor_mask must ALSO decode to the
+ * same raw pixel value, or the row is a genuine 2-pixel horizontal
+ * repeat this driver can't express (fill only takes one colour per
+ * row - see cl_fill.h's v3d_striped_fill_raw) and is treated exactly
+ * like any other unrecognised pattern: the whole block fails to
+ * decode, same fail-safe philosophy as everywhere else in this driver
+ * (leave unclaimed, let the CPU render it) rather than guess.
+ *
+ * Returns 1 and fills *colours_out[0..7] (already widened to this
+ * driver's 8-bit-per-channel convention, regardless of log2_bpp) if
+ * every line decodes cleanly, 0 otherwise. A genuine solid fill is
  * simply the case where all 8 decoded colours happen to be equal - the
  * caller (handle_render_fill) checks for that itself to keep using the
  * cheaper single-fill path instead of up to 8 GPU submissions.
  */
-static int ecf_decode_striped(const unsigned int *ecf, unsigned int colours_out[8])
+static int ecf_decode_striped(const unsigned int *ecf, unsigned int log2_bpp,
+                               unsigned int colours_out[8])
 {
     unsigned int line;
 
@@ -263,7 +335,21 @@ static int ecf_decode_striped(const unsigned int *ecf, unsigned int colours_out[
         if (or_mask != 0xFFFFFFFFu)
             return 0;
 
-        colours_out[line] = ~eor_mask;
+        if (log2_bpp == 4u)
+        {
+            unsigned int inv = ~eor_mask;
+            unsigned int lo = inv & 0xFFFFu;
+            unsigned int hi = (inv >> 16) & 0xFFFFu;
+
+            if (lo != hi)
+                return 0;
+
+            colours_out[line] = widen_565_to_8bit_rgba(lo);
+        }
+        else
+        {
+            colours_out[line] = ~eor_mask;
+        }
     }
 
     return 1;
@@ -276,10 +362,21 @@ static void handle_render_fill(_kernel_swi_regs *r)
     const unsigned int *ecf;
     unsigned int colours[8];
     unsigned int line;
+    unsigned int log2_bpp;
     int is_solid;
     _kernel_oserror *err;
 
     g_gfxv_fill_op_count++;
+
+    /* Needed before the ECF block can even be decoded (log2_bpp==4
+     * packs two sub-pixels per 32-bit OR/EOR word - see
+     * ecf_decode_striped) - if the screen depth can't be determined at
+     * all (e.g. a framestore-geometry read failure), there's nothing
+     * safe to decode, so leave unclaimed just like a real content-
+     * dependent blend would. */
+    err = v3d_accel_get_screen_log2_bpp(&log2_bpp);
+    if (err)
+        return;
 
     /* GraphicsV 13 2 parameter block: word0=left, word1=TOP, word2=right,
      * word3=BOTTOM (all inclusive), word4=ECF block pointer - confirmed
@@ -300,7 +397,7 @@ static void handle_render_fill(_kernel_swi_regs *r)
     bottom = params[3];
     ecf = (const unsigned int *) params[4];
 
-    if (!ecf_decode_striped(ecf, colours))
+    if (!ecf_decode_striped(ecf, log2_bpp, colours))
         return; /* a real content-dependent blend - not ours to accelerate */
 
     is_solid = 1;
