@@ -3018,3 +3018,119 @@ accelerated, zero failures across all three paths**, desktop visually
 confirmed correct throughout including scrolling. Real, working,
 GPU-accelerated window scrolling, confirmed clean at every level from
 an isolated unit test up to sustained real desktop load.
+
+## 16bpp screen mode support (2026-09-30, hardware-verified)
+
+Everything above only ever ran at 32bpp - `ensure_screen_framestore`
+hard-rejected any other depth, and the code openly admitted screen
+geometry was cached once and "isn't expected to change without a
+module reload." Extended to real 16bpp acceleration (not the much
+harder indexed/palette depths - the GPU render target can't produce
+palette output directly, that would need a whole unbuilt
+RGBA8-to-palette conversion pass touching the already-unproven
+`emit_load_tile_buffer_rt0` path) across four phases, each
+hardware-verified before the next, following this project's usual
+isolated-buffer -> real-framestore -> live-desktop methodology.
+
+**Phase 1 - live mode-change safety.** Added a `Service_ModeChange`
+(`&46`) handler (`v3d_service_handler`, `module.c`, plus a new
+`service-call-handler:` CMHG directive - no precedent for this
+directive existed in this project before) that clears
+`g_screen_framestore_verified` when the screen mode changes, so the
+next accelerated call re-derives geometry from scratch instead of
+trusting a stale cache. Two real CMHG/cmunge lessons found against the
+actual toolchain, not docs: `service-call-handler:` takes a
+space-separated filter number, not a comma (secondhand docs said
+comma, cmunge disagreed with a Serious Error); the generated handler
+signature is plain `void`, not `void *`. Hardware-confirmed: switching
+resolution while accelerating kept targeting the right geometry
+afterward.
+
+**Phase 2 - screen pixel format, got a real surprise partway through.**
+RISC OS's "16bpp" sprite format is documented (PRM Video chapter) as
+15bpp-in-16-bit (RGB555: R bits0-4/G bits5-9/B bits10-14, bit15
+reserved) - that's what this phase was originally built and confirmed
+against, using an isolated V3D format test (`V3D_16bppFormatTest`)
+that settled a genuine ambiguity in the V3D render-target format enum
+(two 5:5:5:1-shaped candidates, `ABGR1555=4` and `RGBA5551=45` -
+confirmed format 45 matches RGB555's channel positions, format 4 is
+R/B-swapped from what its name suggests).
+
+That result was correct about the V3D hardware and wrong about this
+hardware's actual screen. Discovered when "32 thousand colours" turned
+out to be greyed out and unavailable in the mode chooser - checked the
+real Raspberry Pi RISC OS video driver source directly
+(`RiscOS/Sources/Video/HWSupport/BCMVideo/s/GraphicsV`): `"16bpp is
+RGB565, i.e. RRRRRGGGGGGBBBBB"`, and the firmware's dispmanx
+framebuffer "is limited to 16 bit palette entries (565 format)" - this
+hardware's HAL driver never offers genuine RGB555 at all; the classic
+PRM sprite format describes older VIDC-era hardware this Pi doesn't
+have. Checked the real V3D format enum for a 565-shaped candidate:
+exactly one exists, `BGR565=7`. Built a fresh isolated test
+(`test/Format565Test.bas`, reusing the existing generic
+`V3D_16bppFormatTest` SWI, no rebuild needed) rather than trust either
+a literal reading of `BGR565`'s name or BCMVideo's own comment string -
+**confirmed on real hardware: R sits in the HIGH 5 bits (11-15), G in
+the middle 6 (5-10), B in the LOW 5 bits (0-4)**, the standard textbook
+RGB565 layout. Worth remembering: two different naming sources (a
+vendor driver's own source comment vs. a GPU vendor's format enum) can
+use opposite bit-order conventions - verify each independently, a
+convention that explains one doesn't necessarily predict the other.
+
+**Phase 3 - 16bpp copy acceleration.** `cl_copy.c`'s `run_copy`/
+`v3d_copy_screen`/`v3d_copy_screen_overlapping` gained explicit
+`bytes_per_pixel`/`format_code` parameters instead of hardcoding
+4-bytes/RGBA8, selected via a new `screen_bpp_params()` helper
+(`module.c`). Copy turned out to be entirely unaffected by the later
+RGB565 correction: a V3D Load+Store round trip through the *same*
+declared format code is bit-exact regardless of whether that format's
+bit layout matches the real screen's semantic meaning - already
+hardware-proven with a non-colour test pattern
+(`V3D_CopyTest16bpp`/`test/CopyTest16bpp.bas`, all 7 sample points
+matched exactly). Hardware-confirmed at all three levels: isolated
+buffer, real framestore (`V3D_ScreenCopyTest`), and live desktop -
+**412 direct + 174 overlap = 586 accelerated copies, zero failures**
+(and, in the same live run, 0 accelerated / 361 correctly-rejected
+fills, confirming fill's deliberate 32bpp-only guard worked exactly as
+designed before Phase 4 existed).
+
+**Phase 4 - 16bpp fill acceleration, plus the correction.**
+Mechanically generalized `cl_fill.c`/`module.c` the same way Phase 3
+generalized copy. The genuinely new piece: the live GraphicsV fill
+accelerator's ECF solid-fill detection (`gfxv_accel.c`) is inherently
+32bpp-shaped - each 32-bit OR/EOR mask word is exactly one pixel wide
+at 32bpp, but packs *two* horizontally-adjacent sub-pixels at 16bpp.
+`ecf_decode_striped` gained a `log2_bpp` parameter: at 16bpp it
+requires both packed sub-pixels to decode identically or the whole ECF
+block is rejected (a real 2-pixel horizontal repeat this driver's
+single-colour-per-row fill can't express - same fail-safe "leave
+unclaimed" philosophy as everywhere else in this driver). A new
+`widen_565_to_8bit_rgba` helper (`round(v*255/31)` for the 5-bit R/B
+fields, `round(v*255/63)` for the 6-bit G field) converts the decoded
+raw pixel back to this driver's 8-bit-per-channel convention before
+handing it to the unchanged `v3d_accel_render_fill`/`_striped_fill`.
+
+An adversarial code-review pass (three independent reviewers - bit-math,
+control-flow, integration lenses - each finding adversarially
+re-verified by three more) came back clean on the new decode logic
+itself, but caught a real bug: the two small dedicated PMP slots added
+for isolated 16bpp testing were only bounds-checked against the
+generic per-call page cap, not their own actual ~100-page reservation,
+so a moderately large manual test call could have silently overflowed
+into the neighbouring slot and corrupted it. Fixed with a real
+bounds check against each slot's own real budget before it ever shipped.
+
+**Hardware-confirmed at all three levels with the corrected RGB565
+format**: isolated synthetic buffer (`V3D_FillTest16bpp`/
+`test/FillTest16bpp.bas`, 7/7 sample points exact); real framestore
+(`V3D_ScreenFillTest`, a clean vivid purple rectangle, no colour
+distortion); live desktop (`AccelTest.bas`) - **1107/1107 (100%) solid
+fills and 818/818 (100%) copies accelerated (488 direct + 330
+overlap), zero failures**, comparable throughput to this project's best
+historical 32bpp runs, desktop visually confirmed correct throughout.
+
+**All four phases are now complete.** 16bpp direct-colour screen modes
+work end to end - live mode switching, and both fill and copy
+acceleration - on this hardware's real RGB565 format. Indexed/palette
+depths (8bpp/4bpp/1bpp) remain out of scope, for the reason given at
+the top of this section.
