@@ -86,6 +86,8 @@
 #define V3D_IRQ_H
 
 #include "kernel.h"
+#include "io_map.h"
+#include "v3d_regs.h"
 
 #define V3D_IRQ_DEVICE_NUMBER 10u /* iDev_GPU_VC3D - see comment above */
 
@@ -168,5 +170,43 @@ _kernel_oserror *v3d_irq_ensure_ready(void);
  * v3d_irq_ensure_ready() was never called.
  */
 _kernel_oserror *v3d_irq_shutdown(void);
+
+/*
+ * The module's PERMANENT mapping of the whole V3D register megabyte
+ * (OS_Memory 13, created once by v3d_irq_resolve_clear), or NULL if it
+ * doesn't exist yet.
+ *
+ * Added 2026-10-04: the per-call hot paths (cl_fill.c/cl_copy.c) used to
+ * map this same megabyte again with a TEMPORARY mapping (OS_Memory 14) and
+ * unmap it (OS_Memory 15) twice per accelerated operation - four kernel
+ * SWIs of pure overhead on top of the GPU work, and exactly the shared,
+ * system-wide, steal-able window io_map.h warns about. These helpers use
+ * the permanent mapping when it exists and fall back to the temporary one
+ * when it doesn't (e.g. before the interrupt code has been set up), so
+ * behaviour is otherwise identical. The caller's io_mapping_t works with
+ * IO_WORD exactly as before.
+ */
+const io_mapping_t *v3d_irq_permanent_mapping(void);
+
+static inline _kernel_oserror *v3d_regs_map(io_mapping_t *m)
+{
+    const io_mapping_t *perm = v3d_irq_permanent_mapping();
+
+    if (perm)
+    {
+        *m = *perm;
+        return NULL;
+    }
+    return io_map(V3D_MB_BASE, m);
+}
+
+static inline void v3d_regs_unmap(const io_mapping_t *m)
+{
+    const io_mapping_t *perm = v3d_irq_permanent_mapping();
+
+    if (perm && m->base == perm->base)
+        return; /* permanent - nothing to release */
+    io_unmap(m);
+}
 
 #endif

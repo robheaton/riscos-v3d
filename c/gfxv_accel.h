@@ -92,6 +92,17 @@ extern volatile unsigned int g_gfxv_copy_last_fail_errnum;
 extern volatile unsigned int g_gfxv_copy_overlap_claimed_count;
 extern volatile unsigned int g_gfxv_copy_overlap_error_count;
 
+/* Size limits below which a fill/copy is left unclaimed for the CPU to do,
+ * and the counts of calls declined for that reason - see gfxv_accel.c's
+ * SIZE LIMITS comment. Exposed (read and write) via V3D_AccelLimits. */
+extern volatile unsigned int g_gfxv_min_fill_bytes;
+extern volatile unsigned int g_gfxv_min_fill_rows;
+extern volatile unsigned int g_gfxv_min_copy_bytes;
+extern volatile unsigned int g_gfxv_min_copy_rows;
+extern volatile unsigned int g_gfxv_min_overlap_bytes;
+extern volatile unsigned int g_gfxv_fill_skipped_count;
+extern volatile unsigned int g_gfxv_copy_skipped_count;
+
 /* Real OS error message text for the last copy failure (either path),
  * not just its number - see gfxv_accel.c's own comment on why a bare
  * number wasn't enough. Exposed for V3D_AccelCopyLastError. */

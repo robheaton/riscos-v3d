@@ -167,6 +167,81 @@ volatile unsigned int g_gfxv_copy_overlap_claimed_count = 0;
 volatile unsigned int g_gfxv_copy_overlap_error_count = 0;
 
 /*
+ * SIZE LIMITS (2026-10-04). Every accelerated call pays a fixed GPU round
+ * trip (build the control lists, submit, wait for the bin and render
+ * interrupts) regardless of rectangle size, while the CPU fills or copies
+ * a small rectangle in microseconds. Measured on real hardware with
+ * test/FillCopyBench.bas (32bpp, CPU vs GPU in one session, every GPU
+ * call confirmed accelerated): the fixed cost is about 119us per call
+ * (8x8 and 32x32 both take 119us on the GPU, against 2us and 7us for a
+ * CPU fill), so claiming everything made small operations up to ~60x
+ * SLOWER and only large ones faster.
+ *   fill: at 32bpp the GPU breaks even at about 192x192 (36,864 pixels)
+ *         and wins by only 1.2-1.3x even at 512x512; at 16bpp (solid
+ *         colour; first measured 2026-10-04 after fixing the benchmark's
+ *         accidental dither flag) it is worse: 256x256 1.05x, 384x384
+ *         1.09x, 512x512 1.02x, because the CPU writes half as many
+ *         bytes. Wide/short rectangles (1024x16, 512x32) lose badly
+ *         (0.17x-0.27x), because the GPU pays per 64x64 tile touched while
+ *         the CPU pays per pixel. So GPU fills are only a marginal win
+ *         anywhere, and the default limit is set high enough to admit
+ *         only rectangles where it is a worthwhile 1.2x+ at 32bpp.
+ *   copy: GPU wins from about 64x64 (1.16x) up to 2-3.5x at 128-512
+ *         squares at 32bpp, and from about 96x96 (1.32x) up to 3.08x at
+ *         256x256 at 16bpp; wide/short copies (1024x16, 512x32) still
+ *         lose (0.62x, 0.84x). The byte-based copy limit sits correctly
+ *         at both depths (64x64 at 16bpp is declined, 96x96 accepted).
+ * An operation below its limit is simply left UNCLAIMED, so the kernel's
+ * own CPU code does it - exactly the fail-safe path every error already
+ * takes, so this can never produce a wrong picture. Limits are in BYTES
+ * of pixel data (width*height*bytes-per-pixel) so they scale with screen
+ * depth, plus a minimum height, since short rectangles waste most of each
+ * 64-row tile. The overlapping-copy default is an extrapolation (it runs
+ * two GPU passes, so roughly twice the fixed cost) pending measurement.
+ * All are tunable at run time with V3D_AccelLimits; setting every limit
+ * to 0 accelerates everything, which is how the benchmark measures the
+ * GPU's raw capability.
+ */
+#define GFXV_DEFAULT_MIN_FILL_BYTES      600000u /* ~150,000 px at 32bpp */
+#define GFXV_DEFAULT_MIN_FILL_ROWS       64u
+#define GFXV_DEFAULT_MIN_COPY_BYTES      16384u  /* 4,096 px at 32bpp */
+#define GFXV_DEFAULT_MIN_COPY_ROWS       48u
+#define GFXV_DEFAULT_MIN_OVERLAP_BYTES   65536u  /* 16,384 px at 32bpp */
+
+volatile unsigned int g_gfxv_min_fill_bytes = GFXV_DEFAULT_MIN_FILL_BYTES;
+volatile unsigned int g_gfxv_min_fill_rows = GFXV_DEFAULT_MIN_FILL_ROWS;
+volatile unsigned int g_gfxv_min_copy_bytes = GFXV_DEFAULT_MIN_COPY_BYTES;
+volatile unsigned int g_gfxv_min_copy_rows = GFXV_DEFAULT_MIN_COPY_ROWS;
+volatile unsigned int g_gfxv_min_overlap_bytes = GFXV_DEFAULT_MIN_OVERLAP_BYTES;
+
+/* Calls left unclaimed purely because they were below a limit above
+ * (genuine, otherwise-acceleratable fills/copies - not errors). */
+volatile unsigned int g_gfxv_fill_skipped_count = 0;
+volatile unsigned int g_gfxv_copy_skipped_count = 0;
+
+/*
+ * Returns non-zero if a width x height rectangle is big enough to be worth
+ * a GPU round trip. `log2_bpp` is the screen's (4 or 5 here - the caller
+ * has already confirmed the depth is supported). Absurd dimensions (far
+ * beyond any real screen) return 1 so the existing downstream validation
+ * rejects them and the call stays unclaimed anyway, rather than this check
+ * having to reason about arithmetic overflow.
+ */
+static int accel_worthwhile(unsigned int width, unsigned int height,
+                             unsigned int log2_bpp,
+                             unsigned int min_bytes, unsigned int min_rows)
+{
+    unsigned int shift = log2_bpp - 3u;
+    unsigned int min_pixels = (min_bytes + (1u << shift) - 1u) >> shift;
+
+    if (width > 0xFFFFu || height > 0xFFFFu)
+        return 1;
+    if (height < min_rows)
+        return 0;
+    return width * height >= min_pixels;
+}
+
+/*
  * ADDED (2026-09-26, hardware-diagnosed): all 376 overlap-copy attempts
  * in a live-desktop run failed with error number 465 - not the "too
  * big" check's own number (14), so genuinely new territory, and a
@@ -284,9 +359,15 @@ static unsigned int widen_565_to_8bit_rgba(unsigned int raw16)
     unsigned int b5 = raw16 & 0x1Fu;
     unsigned int g6 = (raw16 >> 5) & 0x3Fu;
     unsigned int r5 = (raw16 >> 11) & 0x1Fu;
-    unsigned int r8 = (r5 * 255u + 15u) / 31u;
-    unsigned int g8 = (g6 * 255u + 31u) / 63u;
-    unsigned int b8 = (b5 * 255u + 15u) / 31u;
+    /* round(v*255/31) and round(v*255/63) as multiply-shift: (v*527+23)>>6
+     * and (v*259+33)>>6. Brute-force checked (2026-10-04) to equal the
+     * divisions (v*255+15)/31 and (v*255+31)/63 for EVERY 5-bit (0-31) and
+     * 6-bit (0-63) input, endpoints 0->0 and max->255. The divisions were
+     * software calls on this toolchain, 3 per ECF line x 8 lines on every
+     * 16bpp fill. */
+    unsigned int r8 = (r5 * 527u + 23u) >> 6;
+    unsigned int g8 = (g6 * 259u + 33u) >> 6;
+    unsigned int b8 = (b5 * 527u + 23u) >> 6;
 
     return r8 | (g8 << 8) | (b8 << 16) | (0xFFu << 24);
 }
@@ -397,6 +478,21 @@ static void handle_render_fill(_kernel_swi_regs *r)
     bottom = params[3];
     ecf = (const unsigned int *) params[4];
 
+    /* Reject small rectangles BEFORE touching the ECF block (see the SIZE
+     * LIMITS comment above). Measured 2026-10-04: with the check after the
+     * decode, a declined 8x8 fill at 16bpp cost ~1.3us more than the CPU
+     * fill itself (3.8us vs 2.5us, i.e. 0.67x) because every call widened
+     * all 8 ECF lines first; declined copies, which do no decoding, cost
+     * only ~0.15us. Doing the cheap size test first makes the common case
+     * - a tiny fill the CPU will do - almost free. The stricter limit for
+     * dithered fills is applied further down, once we know there is one. */
+    if (!accel_worthwhile(right - left + 1u, top - bottom + 1u, log2_bpp,
+                           g_gfxv_min_fill_bytes, g_gfxv_min_fill_rows))
+    {
+        g_gfxv_fill_skipped_count++;
+        return;
+    }
+
     if (!ecf_decode_striped(ecf, log2_bpp, colours))
         return; /* a real content-dependent blend - not ours to accelerate */
 
@@ -444,6 +540,21 @@ static void handle_render_fill(_kernel_swi_regs *r)
 
     g_gfxv_striped_count++;
 
+    /* A dithered fill is up to 8 separate GPU submissions (one per distinct
+     * row colour), so it needs a rectangle ~8x bigger to be worth it. */
+    {
+        unsigned int min_bytes = g_gfxv_min_fill_bytes;
+
+        if (min_bytes > 0x1FFFFFFFu)
+            min_bytes = 0x1FFFFFFFu;
+        if (!accel_worthwhile(right - left + 1u, top - bottom + 1u, log2_bpp,
+                               min_bytes * 8u, g_gfxv_min_fill_rows))
+        {
+            g_gfxv_fill_skipped_count++;
+            return;
+        }
+    }
+
     err = v3d_accel_render_striped_fill(left, bottom, right, top, colours);
     if (err)
     {
@@ -461,6 +572,7 @@ static void handle_render_copy(_kernel_swi_regs *r)
 {
     const unsigned int *params;
     unsigned int src_left, src_bottom, dest_left, dest_bottom, width, height;
+    unsigned int log2_bpp;
     _kernel_oserror *err;
 
     g_gfxv_copy_op_count++;
@@ -477,6 +589,13 @@ static void handle_render_copy(_kernel_swi_regs *r)
     dest_bottom = params[3];
     width = params[4] + 1u;
     height = params[5] + 1u;
+
+    /* Needed for the size limit's byte count (see the SIZE LIMITS comment
+     * above). If the depth can't be determined there is nothing safe to
+     * do, so leave the call unclaimed. */
+    err = v3d_accel_get_screen_log2_bpp(&log2_bpp);
+    if (err)
+        return;
 
     /* AABB overlap test: NOT (one rect is entirely to one side of the
      * other on either axis). Checked here, at the protocol layer,
@@ -495,6 +614,15 @@ static void handle_render_copy(_kernel_swi_regs *r)
     {
         g_gfxv_copy_overlap_count++;
 
+        /* Overlapping copies run two GPU passes, so they have their own,
+         * larger byte limit. */
+        if (!accel_worthwhile(width, height, log2_bpp,
+                               g_gfxv_min_overlap_bytes, g_gfxv_min_copy_rows))
+        {
+            g_gfxv_copy_skipped_count++;
+            return;
+        }
+
         err = v3d_accel_render_copy_overlapping(src_left, src_bottom,
                                                   dest_left, dest_bottom,
                                                   width, height);
@@ -510,6 +638,13 @@ static void handle_render_copy(_kernel_swi_regs *r)
 
         g_gfxv_copy_overlap_claimed_count++;
         r->r[4] = 0; /* claimed */
+        return;
+    }
+
+    if (!accel_worthwhile(width, height, log2_bpp,
+                           g_gfxv_min_copy_bytes, g_gfxv_min_copy_rows))
+    {
+        g_gfxv_copy_skipped_count++;
         return;
     }
 

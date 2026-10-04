@@ -1158,6 +1158,7 @@ enum
     SWI_V3D_16bppFormatTest = 27,
     SWI_V3D_CopyTest16bpp = 28,
     SWI_V3D_FillTest16bpp = 29,
+    SWI_V3D_AccelLimits = 30,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1888,6 +1889,39 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 
             r->r[0] = tiles_x;
             r->r[1] = tiles_y;
+            return NULL;
+        }
+
+        case SWI_V3D_AccelLimits:
+        {
+            /* Size limits below which a GraphicsV fill/copy is left
+             * unclaimed so the CPU does it (see gfxv_accel.c's SIZE LIMITS
+             * comment). In, each -1 = leave unchanged (so all -1 just
+             * reads): R0 = min fill bytes, R1 = min fill rows, R2 = min
+             * direct-copy bytes, R3 = min copy rows, R4 = min overlapping-
+             * copy bytes (bytes = width*height*bytes-per-pixel). Setting
+             * all five to 0 accelerates everything. Out: R0-R4 = the
+             * values BEFORE this call, R5 = fills declined as too small,
+             * R6 = copies declined as too small. */
+            volatile unsigned int *limits[5];
+            unsigned int i;
+
+            limits[0] = &g_gfxv_min_fill_bytes;
+            limits[1] = &g_gfxv_min_fill_rows;
+            limits[2] = &g_gfxv_min_copy_bytes;
+            limits[3] = &g_gfxv_min_copy_rows;
+            limits[4] = &g_gfxv_min_overlap_bytes;
+
+            for (i = 0; i < 5u; i++)
+            {
+                unsigned int previous = *limits[i];
+
+                if (r->r[i] != -1)
+                    *limits[i] = ((unsigned int) r->r[i]) & 0x7FFFFFFFu;
+                r->r[i] = (int) previous;
+            }
+            r->r[5] = (int) g_gfxv_fill_skipped_count;
+            r->r[6] = (int) g_gfxv_copy_skipped_count;
             return NULL;
         }
 

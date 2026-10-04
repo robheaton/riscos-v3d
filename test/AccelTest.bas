@@ -57,7 +57,7 @@ PRINT
 PRINT "GraphicsV handler invocations:     "; calls%
 PRINT "  of which reason 13 (Render):     "; renders%
 PRINT "  of which op 2 (fill):            "; fills%
-PRINT "  of which a genuine solid ECF:    "; solids%
+PRINT "  of which a solid ECF, above the size limit: "; solids%
 PRINT "  actually accelerated by the GPU: "; claimed%
 PRINT "  attempted but failed:            "; errors%
 PRINT
@@ -103,6 +103,16 @@ REM scratch state (see gfxv_accel.c's reentrancy guard). Should always
 REM read 0 in normal use.
 SYS "V3D_AccelReentrantCount" TO reentrant%
 PRINT "GraphicsV calls skipped as reentrant (diagnostic): "; reentrant%
+PRINT
+
+REM V3D_AccelLimits (all -1 = read only): the size limits below which a
+REM fill or copy is deliberately left to the CPU, because a GPU round trip
+REM costs ~119us whatever the size (see gfxv_accel.c's SIZE LIMITS note
+REM and test/FillCopyBench.bas). Such calls are NOT failures - they show
+REM up here instead of in the "accelerated" or "failed" counts above.
+SYS "V3D_AccelLimits", -1, -1, -1, -1, -1 TO lim_fb%, lim_fr%, lim_cb%, lim_cr%, lim_ob%, skip_fills%, skip_copies%
+PRINT "Size limits - fill: "; lim_fb%; " bytes, "; lim_fr%; " rows; copy: "; lim_cb%; " bytes, "; lim_cr%; " rows; overlap copy: "; lim_ob%; " bytes"
+PRINT "Left to the CPU as too small to benefit: "; skip_fills%; " fills, "; skip_copies%; " copies"
 PRINT
 
 REM V3D_AccelTimingStats: R0=worst single accelerated call's duration

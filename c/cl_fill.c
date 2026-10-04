@@ -103,10 +103,15 @@ static void get_super_tiles(unsigned int tiles_x, unsigned int tiles_y,
  * raw spin-count - a tight loop's real-world duration depends on
  * system load, and a stalled GPU/interrupt pipeline doesn't make the
  * loop itself run any slower, so counting iterations alone doesn't
- * bound real elapsed time. Checked only every 4096 fast inner
- * iterations, not every single one, since a SWI call is far more
+ * bound real elapsed time. Checked only every 65,536 fast inner
+ * iterations (the first check is at the first such boundary, not at
+ * iteration 0), not every single one, since a SWI call is far more
  * expensive than a plain memory read and doing it every iteration
- * would itself throttle the poll rate. Giving up here is always safe:
+ * would itself throttle the poll rate. (2026-10-04: this was every 4096
+ * starting at iteration 0, i.e. a pointless clock SWI at the very start
+ * of every wait plus several more during a ~50us GPU job - part of the
+ * fixed per-call cost measured by test/FillCopyBench.bas. A 300ms
+ * timeout does not need microsecond-granularity.) Giving up here is always safe:
  * the caller's own existing fail-safe handling (see gfxv_accel.c)
  * leaves the GraphicsV call unclaimed on any error, falling back to
  * normal CPU rendering.
@@ -127,7 +132,7 @@ static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
         if (*counter != initial)
             return NULL;
 
-        if ((spin & 0xFFFu) == 0u)
+        if ((spin & 0xFFFFu) == 0xFFFFu)
         {
             unsigned int now_cs = v3d_read_centiseconds();
             if (!have_start)
@@ -501,7 +506,7 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
     rcl_end = cl_paddr(&rcl);
 
     /* --- kick off binning --- */
-    err = io_map(V3D_MB_BASE, &v3d);
+    err = v3d_regs_map(&v3d);
     if (err) return err;
 
     IO_WORD(v3d, V3D_PTB_BPOS) = 0;
@@ -514,7 +519,7 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
     IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end;
 
-    io_unmap(&v3d);
+    v3d_regs_unmap(&v3d);
 
     {
         static _kernel_oserror err_bin_timeout = {
@@ -525,7 +530,7 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
     }
 
     /* --- kick off rendering --- */
-    err = io_map(V3D_MB_BASE, &v3d);
+    err = v3d_regs_map(&v3d);
     if (err) return err;
 
     v3d_flush_caches(&v3d);
@@ -534,7 +539,7 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end;
 
-    io_unmap(&v3d);
+    v3d_regs_unmap(&v3d);
 
     {
         static _kernel_oserror err_render_timeout = {

@@ -299,6 +299,11 @@ _kernel_oserror *v3d_irq_test_live_cycle(unsigned int *out_claimed,
     return err;
 }
 
+const io_mapping_t *v3d_irq_permanent_mapping(void)
+{
+    return g_v3d_permanent_mapped ? &g_v3d_permanent_mapping : NULL;
+}
+
 _kernel_oserror *v3d_irq_ensure_ready(void)
 {
     _kernel_oserror *err;

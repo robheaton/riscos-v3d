@@ -84,7 +84,7 @@ static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
         if (*counter != initial)
             return NULL;
 
-        if ((spin & 0xFFFu) == 0u)
+        if ((spin & 0xFFFFu) == 0xFFFFu)
         {
             unsigned int now_cs = v3d_read_centiseconds();
             if (!have_start)
@@ -391,7 +391,7 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
     emit_end_of_rendering(&rcl);
     rcl_end = cl_paddr(&rcl);
 
-    err = io_map(V3D_MB_BASE, &v3d);
+    err = v3d_regs_map(&v3d);
     if (err) return err;
 
     IO_WORD(v3d, V3D_PTB_BPOS) = 0;
@@ -404,7 +404,7 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
     IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end;
 
-    io_unmap(&v3d);
+    v3d_regs_unmap(&v3d);
 
     {
         static _kernel_oserror err_bin_timeout = {
@@ -414,7 +414,7 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
         if (err) return err;
     }
 
-    err = io_map(V3D_MB_BASE, &v3d);
+    err = v3d_regs_map(&v3d);
     if (err) return err;
 
     v3d_flush_caches(&v3d);
@@ -423,7 +423,7 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end;
 
-    io_unmap(&v3d);
+    v3d_regs_unmap(&v3d);
 
     {
         static _kernel_oserror err_render_timeout = {
