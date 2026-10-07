@@ -144,7 +144,8 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
  * than silently trusting stale/zeroed R0-R1.
  */
 _kernel_oserror *v3d_get_framestore_phys(const v3d_screen_info_t *info,
-                                          unsigned int *phys_base_out)
+                                          unsigned int *phys_base_out,
+                                          unsigned int *size_out)
 {
     _kernel_swi_regs regs;
     _kernel_oserror *err;
@@ -173,6 +174,7 @@ _kernel_oserror *v3d_get_framestore_phys(const v3d_screen_info_t *info,
 
     *phys_base_out = (unsigned int) regs.r[0];
     fs_size = (unsigned int) regs.r[1];
+    *size_out = fs_size;
 
     if (fs_size < info->total_screen_size)
     {

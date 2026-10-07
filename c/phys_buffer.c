@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include "kernel.h"
 #include "phys_buffer.h"
+#include "cl_common.h" /* v3d_scratch_note_release - see pmp_release */
 #include "V3DDriver.h" /* for v3d_da_resize_veneer's address */
 
 #define SWI_OS_DynamicArea 0x66
@@ -13,6 +14,7 @@
 enum
 {
     DA_Create      = 0,
+    DA_Remove      = 1,
     DA_Info        = 2,
     DA_Enumerate   = 3,
     DA_ClaimPages  = 21,
@@ -51,6 +53,10 @@ enum
  * buffers).
  */
 #define PAGE_FLAG_NONCACHEABLE    ((1u << 4) | (1u << 5))
+
+/* Bit 5 alone: non-cacheable but still bufferable (Normal, non-cacheable
+ * memory in VMSA terms). Added v0.07 for V3D_AccelTune's scratch_attr. */
+#define PAGE_FLAG_NONCACHEABLE_BUFFERABLE (1u << 5)
 
 static inline unsigned int round_up_pages(unsigned int bytes)
 {
@@ -160,6 +166,12 @@ _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
     _kernel_oserror *err;
     unsigned int done = 0;
 
+    /* Whatever the scratch cache holds in this range is about to stop being
+     * ours. Told BEFORE the release, so a cache entry can never outlive the
+     * pages behind it whichever way they go (re-allocation by a test SWI,
+     * module_final, V3D_AccelTune 5...). */
+    v3d_scratch_note_release(area, page_index, num_pages);
+
     while (done < num_pages)
     {
         unsigned int chunk = num_pages - done;
@@ -201,6 +213,31 @@ _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
     }
 
     return NULL;
+}
+
+/*
+ * Removes the area entirely (OS_DynamicArea 1), releasing every page in it.
+ *
+ * v0.06 and earlier NEVER removed an area, on the grounds that removal
+ * "shrinks the area to zero via OS_ChangeDynamicArea first, which invokes
+ * the registered resize handler" and this module's handler refuses every
+ * resize. Checked against the kernel source (s/ChangeDyn, DynArea_Remove)
+ * on 2026-10-04: that is true for ordinary areas, but a PMP area takes the
+ * DAR_PMP path, which unmaps and releases its pages itself and goes
+ * straight to DAR_delink - the handler is never called. The consequence of
+ * the old policy was that every module reload left two zombie areas
+ * (V3DBuf, V3DFill) holding a resize-handler pointer into freed RMA, plus
+ * ~111KB of system heap and ~114MB of logical address space each time.
+ */
+_kernel_oserror *pmp_destroy(pmp_area_t *area)
+{
+    _kernel_swi_regs regs;
+
+    v3d_scratch_note_release(area, 0, area->max_pages);
+
+    regs.r[0] = DA_Remove;
+    regs.r[1] = (int) area->area_num;
+    return _kernel_swi(SWI_OS_DynamicArea, &regs, &regs);
 }
 
 static int names_equal(const char *a, const char *b)
@@ -278,7 +315,11 @@ _kernel_oserror *pmp_cleanup_stale(const char *name)
                 stale.area_num     = (unsigned int) area_num;
                 stale.logical_base = (unsigned char *) info.r[3];
                 stale.max_pages    = (unsigned int) info.r[5] / PAGE_SIZE;
-                (void) pmp_release(&stale, 0, stale.max_pages);
+                /* Remove the whole area: see pmp_destroy for why that is
+                 * safe for a PMP. If removal fails for any reason, at
+                 * least give the pages back. */
+                if (pmp_destroy(&stale))
+                    (void) pmp_release(&stale, 0, stale.max_pages);
             }
         }
 
@@ -296,6 +337,16 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
                             unsigned int num_pages,
                             unsigned int *phys_addr_out,
                             void **logical_ptr_out)
+{
+    return pmp_alloc_policy(area, page_index, num_pages,
+                             PMP_ATTR_STRONGLY_ORDERED,
+                             phys_addr_out, logical_ptr_out);
+}
+
+_kernel_oserror *pmp_alloc_policy(pmp_area_t *area, unsigned int page_index,
+                                   unsigned int num_pages, unsigned int attr,
+                                   unsigned int *phys_addr_out,
+                                   void **logical_ptr_out)
 {
     /* Static, not stack - see MAX_PAGES_PER_CALL's own comment. Still
      * a fixed cap (a single call can't exceed MAX_PAGES_PER_CALL - see
@@ -348,8 +399,13 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
     {
         map_list[i][0] = page_index + i;     /* DA page number (logical) */
         map_list[i][1] = page_index + i;     /* PMP page index to map in */
-        map_list[i][2] = PAGE_FLAG_LOCK | PAGE_FLAG_NONCACHEABLE;
-        /* access=0 (full RW), locked, Strongly-Ordered (see above) */
+        map_list[i][2] = PAGE_FLAG_LOCK |
+            (attr == PMP_ATTR_NC_BUFFERABLE ? PAGE_FLAG_NONCACHEABLE_BUFFERABLE
+                                            : PAGE_FLAG_NONCACHEABLE);
+        /* access=0 (full RW), locked. Strongly-Ordered by default (see
+         * above); PMP_ATTR_NC_BUFFERABLE is the v0.07 experiment (Normal
+         * memory, not cached, but with the write buffer - so word stores
+         * can merge into bursts; the job runner's DSB drains it). */
     }
     regs.r[0] = DA_MapPages;
     regs.r[1] = (int) area->area_num;

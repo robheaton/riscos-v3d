@@ -35,153 +35,26 @@
 
 #include <stddef.h>
 #include "cl_fill.h"
+#include "cl_common.h"
 #include "cl_builder.h"
 #include "cl_packets.h"
 #include "v3d_regs.h"
 #include "io_map.h"
 #include "v3d_irq.h"
 
-#define TILE_SIZE 64u
+/* TILE_SIZE, the scratch cache, the completion wait, the barriers, the
+ * control-list upload and the job kick sequence all live in cl_common.c
+ * now (v0.07) - see its header for why they were pulled out of here. */
 
-static unsigned int div_round_up(unsigned int a, unsigned int b)
+static inline unsigned int div_round_up(unsigned int a, unsigned int b)
 {
-    return (a + b - 1u) / b;
+    return v3d_div_round_up(a, b);
 }
 
-static unsigned int bytes_to_pages(unsigned int bytes)
+static inline unsigned int bytes_to_pages(unsigned int bytes)
 {
-    return div_round_up(bytes, PAGE_SIZE);
+    return v3d_bytes_to_pages(bytes);
 }
-
-/*
- * Picks the smallest supertile_w/supertile_h (starting at 1x1, growing
- * whichever dimension is currently smaller) that keeps the resulting
- * supertile-grid cell count under 256 - transcribed from the reference's
- * getSuperTiles(), gl_rainbow_triangle.cpp lines ~49-69, not derived
- * independently (the "grow whichever is smaller" tie-break and the
- * exact <256 threshold are both real choices from that source, not
- * obvious ones - e.g. a >= vs > off-by-one here would silently under-
- * or over-allocate the supertile grid).
- */
-static void get_super_tiles(unsigned int tiles_x, unsigned int tiles_y,
-                             unsigned int *supertile_w, unsigned int *supertile_h,
-                             unsigned int *frame_w_supertile,
-                             unsigned int *frame_h_supertile)
-{
-    unsigned int sw = 1u, sh = 1u, fw, fh;
-
-    for (;;)
-    {
-        fw = div_round_up(tiles_x, sw);
-        fh = div_round_up(tiles_y, sh);
-        if (fw * fh < 256u)
-            break;
-        if (sw < sh)
-            sw++;
-        else
-            sh++;
-    }
-
-    *supertile_w = sw;
-    *supertile_h = sh;
-    *frame_w_supertile = fw;
-    *frame_h_supertile = fh;
-}
-
-/*
- * Waits for a CLE IRQ-driven completion counter to advance, exactly
- * like cl_clear.c's v3d_poll_counter, but without its rich
- * diagnose_timeout() diagnostics - deliberately NOT sharing that code
- * (duplicating this one small loop instead) to avoid touching the
- * hardware-proven M2/M3 path while this multi-tile generalisation is
- * still unproven. If a real hardware timeout ever shows up here, port
- * the diagnostics over then, with real failure data to shape them
- * around instead of guessing what's worth logging in advance.
- *
- * CIRCUIT BREAKER: bounded by real wall-clock time
- * (v3d_read_centiseconds, an OS_ReadMonotonicTime wrapper), not just a
- * raw spin-count - a tight loop's real-world duration depends on
- * system load, and a stalled GPU/interrupt pipeline doesn't make the
- * loop itself run any slower, so counting iterations alone doesn't
- * bound real elapsed time. Checked only every 65,536 fast inner
- * iterations (the first check is at the first such boundary, not at
- * iteration 0), not every single one, since a SWI call is far more
- * expensive than a plain memory read and doing it every iteration
- * would itself throttle the poll rate. (2026-10-04: this was every 4096
- * starting at iteration 0, i.e. a pointless clock SWI at the very start
- * of every wait plus several more during a ~50us GPU job - part of the
- * fixed per-call cost measured by test/FillCopyBench.bas. A 300ms
- * timeout does not need microsecond-granularity.) Giving up here is always safe:
- * the caller's own existing fail-safe handling (see gfxv_accel.c)
- * leaves the GraphicsV call unclaimed on any error, falling back to
- * normal CPU rendering.
- */
-extern unsigned int v3d_read_centiseconds(void);
-#define CIRCUIT_BREAKER_TIMEOUT_CS 30u /* 300ms real time */
-
-static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
-                                      unsigned int initial,
-                                      _kernel_oserror *timeout_err)
-{
-    unsigned int spin;
-    unsigned int start_cs = 0;
-    int have_start = 0;
-
-    for (spin = 0; spin < 5000000u; spin++)
-    {
-        if (*counter != initial)
-            return NULL;
-
-        if ((spin & 0xFFFFu) == 0xFFFFu)
-        {
-            unsigned int now_cs = v3d_read_centiseconds();
-            if (!have_start)
-            {
-                start_cs = now_cs;
-                have_start = 1;
-            }
-            else if (now_cs - start_cs >= CIRCUIT_BREAKER_TIMEOUT_CS)
-                return timeout_err;
-        }
-    }
-    return timeout_err; /* absolute safety net if the clock itself is
-                          * ever unavailable - see v3d_read_centiseconds's
-                          * own defensive 0-on-error return */
-}
-
-/*
- * CACHED SCRATCH ALLOCATION - claims scratch pages ONCE per distinct
- * `base_page` (generously, for a worst-case full-screen-sized
- * operation), then reuses the same already-claimed pages on every
- * subsequent call at that base_page, rather than calling `pmp_alloc`
- * fresh every time. This matters beyond just avoiding SWI overhead:
- * `pmp_alloc`'s page-claim step (OS_DynamicArea reason 21)
- * unconditionally broadcasts `Service_MemoryMoved`, a genuinely
- * synchronous service call reaching directly into every registered
- * handler - including the Wimp module's own, which does real SVC-mode
- * bookkeeping. Every accelerated fill used to call `pmp_alloc` four
- * separate times (cl/rcl/tile_alloc/tile_state), each broadcasting
- * this from INSIDE a GraphicsV call the Wimp itself had just
- * dispatched to us - the Wimp's own reentrant bookkeeping running
- * nested inside a redraw it was still mid-dispatch of. This was the
- * real root cause of a hard machine freeze under specific live desktop
- * conditions (Task Manager's own Dynamic Areas display watching this
- * driver's own memory churn) - see README's "Task Manager freeze"
- * section for the full investigation.
- *
- * Safe by construction: the CL/RCL are always rebuilt from scratch
- * below, and tile_alloc/tile_state are always explicitly zeroed before
- * use, regardless of whether the underlying pages were freshly claimed
- * or are being reused - only the SOURCE of the physical/logical
- * addresses changes, none of the control-list-building or GPU-
- * submission logic does. A request exceeding the worst-case cached
- * size (an unusually large screen) falls back to the original uncached
- * behaviour for that one call rather than trying to grow the cache.
- */
-#define WORST_CASE_TILES_X 30u  /* covers up to 1920px wide (30*64) */
-#define WORST_CASE_TILES_Y 17u  /* covers up to 1088px tall (17*64) */
-#define WORST_CASE_N_TILES (WORST_CASE_TILES_X * WORST_CASE_TILES_Y)
-#define MAX_CACHED_SCRATCH 4u
 
 /*
  * Real budget for the tiny dedicated v3d_fill_test_16bpp PMP slot
@@ -193,97 +66,13 @@ static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
  * cap, far bigger than this dedicated slot actually is - a moderately
  * large test call would have silently overflowed past this slot's real
  * reservation and aliased the NEXT dedicated PMP slot instead of
- * failing cleanly. The fixed worst-case fill-scratch cost (1 cl + 6
- * rcl + 10 tile_alloc + 32 tile_state = 49 pages, via
- * find_or_create_fill_scratch, ALWAYS claimed regardless of actual
- * request size) leaves only SLOT_PAGES-SCRATCH_WORST_CASE_PAGES for
- * the render buffer itself.
+ * failing cleanly. The fixed worst-case scratch cost
+ * (V3D_SLOT_PAGES = 49: 1 cl + 6 rcl + 10 tile_alloc + 32 tile_state,
+ * ALWAYS claimed regardless of actual request size) leaves only
+ * SLOT_PAGES-V3D_SLOT_PAGES for the render buffer itself.
  */
 #define FILL_TEST_16BPP_SLOT_PAGES 100u
-#define FILL_TEST_16BPP_SCRATCH_WORST_CASE_PAGES 49u
-
-typedef struct
-{
-    unsigned int base_page; /* 0xFFFFFFFFu = unused slot */
-    unsigned int cl_phys;         void *cl_log;
-    unsigned int rcl_phys;        void *rcl_log;        unsigned int rcl_pages;
-    unsigned int tile_alloc_phys; void *tile_alloc_log;  unsigned int tile_alloc_pages;
-    unsigned int tile_state_phys; void *tile_state_log;  unsigned int tile_state_pages;
-} fill_scratch_cache_t;
-
-static fill_scratch_cache_t g_fill_scratch_cache[MAX_CACHED_SCRATCH];
-static unsigned int g_fill_scratch_cache_count = 0;
-
-/*
- * Finds the cache slot for `base_page`, claiming one (at generous
- * worst-case sizing) if this is the first time it's been seen. Returns
- * NULL (with *err_out left NULL) if the actual request exceeds the
- * worst-case cached size or the cache table is full - the caller falls
- * back to its own original uncached pmp_alloc sequence in that case.
- * Returns NULL with *err_out SET if the one-time claim itself fails.
- */
-static fill_scratch_cache_t *find_or_create_fill_scratch(pmp_area_t *pmp, unsigned int base_page,
-                                                            unsigned int tile_alloc_pages_needed,
-                                                            unsigned int tile_state_pages_needed,
-                                                            unsigned int rcl_pages_needed,
-                                                            _kernel_oserror **err_out)
-{
-    unsigned int i;
-    fill_scratch_cache_t *slot;
-    unsigned int worst_tile_alloc_bytes, worst_tile_state_bytes, worst_rcl_bytes;
-    unsigned int worst_tile_alloc_pages, worst_tile_state_pages, worst_rcl_pages;
-    unsigned int page;
-
-    *err_out = NULL;
-
-    for (i = 0; i < g_fill_scratch_cache_count; i++)
-        if (g_fill_scratch_cache[i].base_page == base_page)
-            return &g_fill_scratch_cache[i];
-
-    if (g_fill_scratch_cache_count >= MAX_CACHED_SCRATCH)
-        return NULL;
-
-    worst_tile_alloc_bytes = WORST_CASE_N_TILES * TILE_SIZE;
-    worst_tile_alloc_bytes = (worst_tile_alloc_bytes + 4095u) & ~4095u;
-    worst_tile_alloc_bytes += TILE_SIZE * TILE_SIZE * 2u;
-    worst_tile_alloc_pages = bytes_to_pages(worst_tile_alloc_bytes);
-
-    worst_tile_state_bytes = WORST_CASE_N_TILES * 256u;
-    worst_tile_state_pages = bytes_to_pages(worst_tile_state_bytes);
-
-    worst_rcl_bytes = 64u + WORST_CASE_N_TILES * 40u + 64u;
-    worst_rcl_pages = bytes_to_pages(worst_rcl_bytes);
-
-    if (tile_alloc_pages_needed > worst_tile_alloc_pages ||
-        tile_state_pages_needed > worst_tile_state_pages ||
-        rcl_pages_needed > worst_rcl_pages)
-        return NULL; /* bigger than our worst case - caller falls back */
-
-    slot = &g_fill_scratch_cache[g_fill_scratch_cache_count];
-    page = base_page;
-
-    *err_out = pmp_alloc(pmp, page, 1u, &slot->cl_phys, &slot->cl_log);
-    if (*err_out) return NULL;
-    page += 1u;
-
-    slot->rcl_pages = worst_rcl_pages;
-    *err_out = pmp_alloc(pmp, page, worst_rcl_pages, &slot->rcl_phys, &slot->rcl_log);
-    if (*err_out) return NULL;
-    page += worst_rcl_pages;
-
-    slot->tile_alloc_pages = worst_tile_alloc_pages;
-    *err_out = pmp_alloc(pmp, page, worst_tile_alloc_pages, &slot->tile_alloc_phys, &slot->tile_alloc_log);
-    if (*err_out) return NULL;
-    page += worst_tile_alloc_pages;
-
-    slot->tile_state_pages = worst_tile_state_pages;
-    *err_out = pmp_alloc(pmp, page, worst_tile_state_pages, &slot->tile_state_phys, &slot->tile_state_log);
-    if (*err_out) return NULL;
-
-    slot->base_page = base_page;
-    g_fill_scratch_cache_count++;
-    return slot;
-}
+#define FILL_TEST_16BPP_SCRATCH_WORST_CASE_PAGES V3D_SLOT_PAGES
 
 /*
  * Shared core: builds and submits a multi-tile clear+store control
@@ -292,6 +81,10 @@ static fill_scratch_cache_t *find_or_create_fill_scratch(pmp_area_t *pmp, unsign
  * using PMP pages starting at `base_page` for the CL/tile_alloc/
  * tile_state scratch buffers only - never for the render target
  * itself. Returns *tiles_x_out / *tiles_y_out (diagnostic) on success.
+ *
+ * Generalises cl_clear.c's fixed-single-64x64-tile clear+store: one
+ * explicit clear+store pair per tile, no primitives (see this file's
+ * top comment).
  */
 static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int width, unsigned int height,
@@ -303,166 +96,44 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int *tiles_y_out)
 {
     unsigned int tiles_x, tiles_y, n_tiles;
-    unsigned int tile_alloc_bytes, tile_state_bytes, rcl_bytes;
-    unsigned int tile_alloc_pages, tile_state_pages, rcl_pages;
-    unsigned int supertile_w, supertile_h, frame_w_supertile, frame_h_supertile;
-    unsigned int cl_phys, tile_alloc_phys, tile_state_phys, rcl_phys;
-    void *cl_log, *tile_alloc_log, *tile_state_log, *rcl_log_ptr;
-    _kernel_oserror *err;
-    cl_buf_t bcl, rcl;
-    unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
-    io_mapping_t v3d;
-    unsigned int last_bin_irq, last_render_irq;
-    unsigned int page = base_page;
     unsigned int col, row;
+    unsigned int t_start;
+    v3d_scratch_t *s;
+    cl_buf_t bcl, rcl;
+    v3d_job_t job;
+    _kernel_oserror *err;
 
-    if (width == 0u || height == 0u)
-    {
-        static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: fill width/height must be non-zero"
-        };
-        return &err_bad_size;
-    }
+    t_start = v3d_time_us();
+
+    err = v3d_gpu_check();
+    if (err)
+        return err;
+
+    err = v3d_check_dims(width, height);
+    if (err)
+        return err;
 
     tiles_x = div_round_up(width, TILE_SIZE);
     tiles_y = div_round_up(height, TILE_SIZE);
     n_tiles = tiles_x * tiles_y;
 
-    /* tile_alloc: align(N*64,4096) + 64*64*2 - transcribed verbatim
-     * from gl_rainbow_triangle.cpp (see cl_fill.h's top comment); the
-     * "+ 64*64*2" term is a literal constant (8192 bytes), not scaled
-     * by tile count - confirmed by reading that source directly, not
-     * inferred from cl_clear.c's single-tile case where the two would
-     * have been indistinguishable (N=1 there too). */
-    tile_alloc_bytes = n_tiles * TILE_SIZE;
-    tile_alloc_bytes = (tile_alloc_bytes + 4095u) & ~4095u;
-    tile_alloc_bytes += TILE_SIZE * TILE_SIZE * 2u;
-    tile_alloc_pages = bytes_to_pages(tile_alloc_bytes);
+    err = v3d_scratch_get(pmp, base_page, n_tiles, &s);
+    if (err)
+        return err;
 
-    /* tile_state: 256 bytes/tile (V3D>=40 - this hardware is 4.2),
-     * matching cl_clear.c's existing single-tile constant scaled up. */
-    tile_state_bytes = n_tiles * 256u;
-    tile_state_pages = bytes_to_pages(tile_state_bytes);
+    v3d_scratch_zero(s, n_tiles);
 
-    /* RCL: fixed ~52-byte header + ~40 bytes/tile (two TileCoordinates
-     * blocks per tile - clear, then store, matching cl_clear.c's
-     * existing per-tile pattern) + 1 byte EndOfRendering, plus a page
-     * of slack. BCL is unaffected by tile count (no primitives are
-     * ever emitted regardless of how many tiles there are - see this
-     * file's top comment) so it keeps cl_clear.c's fixed small size. */
-    rcl_bytes = 64u + n_tiles * 40u + 64u;
-    rcl_pages = bytes_to_pages(rcl_bytes);
-
-    /* pmp_alloc caps a single call at PMP_MAX_PAGES_PER_CALL pages (see
-     * phys_buffer.c - a fixed-size stack array, not a real hardware
-     * limit). tile_alloc/tile_state/rcl stay comfortably under that
-     * even at full 1920x1080 (32/3/5 pages respectively) - this only
-     * ever bites the CALLER if it also PMP-allocates a huge render
-     * buffer (v3d_fill_test's synthetic-buffer case), not here. */
-    if (tile_alloc_pages > PMP_MAX_PAGES_PER_CALL || tile_state_pages > PMP_MAX_PAGES_PER_CALL || rcl_pages > PMP_MAX_PAGES_PER_CALL)
-    {
-        static _kernel_oserror err_too_big = {
-            14, "V3DDriver: fill rectangle too large - tile_alloc/"
-                "tile_state/RCL scratch buffers exceed pmp_alloc's "
-                "pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL)"
-        };
-        return &err_too_big;
-    }
-
-    {
-        fill_scratch_cache_t *cache = find_or_create_fill_scratch(
-            pmp, base_page, tile_alloc_pages, tile_state_pages, rcl_pages, &err);
-        if (err) return err;
-
-        if (cache)
-        {
-            cl_phys = cache->cl_phys; cl_log = cache->cl_log;
-            rcl_phys = cache->rcl_phys; rcl_log_ptr = cache->rcl_log;
-            tile_alloc_phys = cache->tile_alloc_phys; tile_alloc_log = cache->tile_alloc_log;
-            tile_state_phys = cache->tile_state_phys; tile_state_log = cache->tile_state_log;
-        }
-        else
-        {
-            /* Bigger than our cached worst-case (or the cache table is
-             * full) - fall back to the original uncached sequence for
-             * just this one call. */
-            err = pmp_alloc(pmp, page, 1u, &cl_phys, &cl_log);
-            if (err) return err;
-            page += 1u;
-
-            err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
-            if (err) return err;
-            page += rcl_pages;
-
-            err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
-            if (err) return err;
-            page += tile_alloc_pages;
-
-            err = pmp_alloc(pmp, page, tile_state_pages, &tile_state_phys, &tile_state_log);
-            if (err) return err;
-        }
-    }
-
-    /* Zero tile-alloc/tile-state scratch - see cl_clear.c's own comment
-     * on why (recycled RISC OS pages, not guaranteed-zero fresh memory). */
-    {
-        unsigned int i;
-        volatile unsigned int *p;
-
-        p = (volatile unsigned int *) tile_alloc_log;
-        for (i = 0; i < (tile_alloc_pages * PAGE_SIZE) / 4u; i++)
-            p[i] = 0;
-
-        p = (volatile unsigned int *) tile_state_log;
-        for (i = 0; i < (tile_state_pages * PAGE_SIZE) / 4u; i++)
-            p[i] = 0;
-    }
-
-    get_super_tiles(tiles_x, tiles_y, &supertile_w, &supertile_h,
-                     &frame_w_supertile, &frame_h_supertile);
-
-    /* --- BCL: identical shape to cl_clear.c's, just parameterised on
-     * real width/height instead of the fixed 64x64 test constants. No
-     * primitives, so nothing here scales with tile count. --- */
-    cl_init(&bcl, cl_log, cl_phys, PAGE_SIZE);
-    bcl_start = cl_paddr(&bcl);
-    emit_tile_binning_mode_cfg(&bcl, width, height);
-    emit_flush_vcd_cache(&bcl);
-    emit_occlusion_query_counter(&bcl, 0);
-    emit_start_tile_binning(&bcl);
-
-    emit_clip_window(&bcl, 0, 0, width, height);
-    emit_cfg_bits(&bcl, 1, 1, 1, 0, 0, 0, 0, 7, 0, 0, 1, 0, 0, 0, 0);
-    emit_point_size(&bcl, 1.0f);
-    emit_line_width(&bcl, 1.0f);
-    emit_clipper_xy_scaling(&bcl, (width / 2.0f) * 256.0f, (height / 2.0f) * -256.0f);
-    emit_clipper_z_scale_and_offset(&bcl, 0.5f, 0.5f);
-    emit_clipper_z_min_max(&bcl, 0.0f, 1.0f);
-    emit_viewport_offset(&bcl, width / 2, height / 2, 0, 0);
-    emit_color_write_masks(&bcl, 0);
-    emit_blend_constant_color(&bcl, 0, 0, 0, 0);
-    emit_zero_all_flat_shade_flags(&bcl);
-    emit_zero_all_non_perspective_flags(&bcl);
-    emit_zero_all_centroid_flags(&bcl);
-    emit_transform_feedback_specs(&bcl, 0, 0);
-    emit_occlusion_query_counter(&bcl, 0);
-    emit_sample_state(&bcl, 0xF, 1.0f);
-    emit_vcm_cache_size(&bcl, 4, 4);
-    emit_flush(&bcl);
-    bcl_end = cl_paddr(&bcl);
+    /* --- BCL: no primitives, so nothing here scales with tile count. --- */
+    cl_init(&bcl, s->cl_log, s->cl_phys, PAGE_SIZE);
+    job.bcl_start = cl_paddr(&bcl);
+    v3d_build_bcl(&bcl, width, height);
+    job.bcl_end = cl_paddr(&bcl);
 
     /* --- RCL: real multi-tile grid, one clear+store pair per tile --- */
-    cl_init(&rcl, rcl_log_ptr, rcl_phys, rcl_pages * PAGE_SIZE);
-    rcl_start = cl_paddr(&rcl);
-    emit_tile_rendering_mode_cfg_common(&rcl, width, height, 2);
-    emit_tile_rendering_mode_cfg_clear_colors(&rcl, 0, clear_color_rgba, 0);
-    emit_tile_rendering_mode_cfg_color_rt0(&rcl, 0, 2, 0);
-    emit_tile_rendering_mode_cfg_zs_clear(&rcl, 0, 1.0f);
-    emit_tile_list_initial_block_size(&rcl, 0, 1);
-    emit_multicore_tile_list_set_base(&rcl, tile_alloc_phys);
-    emit_multicore_supertile_cfg(&rcl, supertile_w, supertile_h,
-                                   frame_w_supertile, frame_h_supertile,
-                                   tiles_x, tiles_y, 1, 0, 0);
+    cl_init(&rcl, s->rcl_log, s->rcl_phys, s->rcl_pages * PAGE_SIZE);
+    job.rcl_start = cl_paddr(&rcl);
+    v3d_build_rcl_header(&rcl, width, height, clear_color_rgba,
+                          s->tile_alloc_phys, tiles_x, tiles_y);
 
     for (row = 0; row < tiles_y; row++)
     {
@@ -503,51 +174,18 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
     }
 
     emit_end_of_rendering(&rcl);
-    rcl_end = cl_paddr(&rcl);
+    job.rcl_end = cl_paddr(&rcl);
 
-    /* --- kick off binning --- */
-    err = v3d_regs_map(&v3d);
-    if (err) return err;
+    job.kind = V3D_JOB_FILL;
+    job.t_start_us = t_start;
+    job.tile_alloc_phys = s->tile_alloc_phys;
+    job.tile_alloc_bytes = v3d_tile_alloc_bytes(n_tiles);
+    job.tile_state_phys = s->tile_state_phys;
+    job.overflow = (bcl.overflow || rcl.overflow) ? 1 : 0;
 
-    IO_WORD(v3d, V3D_PTB_BPOS) = 0;
-    v3d_flush_caches(&v3d);
-    last_bin_irq = g_v3d_irq_bin_done_count;
-
-    IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
-    IO_WORD(v3d, V3D_CLE_CT0QMS) = tile_alloc_pages * PAGE_SIZE;
-    IO_WORD(v3d, V3D_CLE_CT0QTS) = tile_state_phys | V3D_CLE_CT0QTS_ENABLE;
-    IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
-    IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end;
-
-    v3d_regs_unmap(&v3d);
-
-    {
-        static _kernel_oserror err_bin_timeout = {
-            11, "V3DDriver: fill timed out waiting for binning"
-        };
-        err = wait_for_irq(&g_v3d_irq_bin_done_count, last_bin_irq, &err_bin_timeout);
-        if (err) return err;
-    }
-
-    /* --- kick off rendering --- */
-    err = v3d_regs_map(&v3d);
-    if (err) return err;
-
-    v3d_flush_caches(&v3d);
-    last_render_irq = g_v3d_irq_render_done_count;
-
-    IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
-    IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end;
-
-    v3d_regs_unmap(&v3d);
-
-    {
-        static _kernel_oserror err_render_timeout = {
-            12, "V3DDriver: fill timed out waiting for rendering"
-        };
-        err = wait_for_irq(&g_v3d_irq_render_done_count, last_render_irq, &err_render_timeout);
-        if (err) return err;
-    }
+    err = v3d_job_run(&job);
+    if (err)
+        return err;
 
     *tiles_x_out = tiles_x;
     *tiles_y_out = tiles_y;

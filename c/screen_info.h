@@ -22,12 +22,17 @@ typedef struct v3d_screen_info
     unsigned int line_length;    /* os_VDUVAR_LINE_LENGTH - bytes per scan line */
     unsigned int xwind_limit;    /* os_VDUVAR_XWIND_LIMIT - rightmost pixel index */
     unsigned int ywind_limit;    /* os_VDUVAR_YWIND_LIMIT - topmost pixel index */
-    unsigned int screen_start;   /* os_VDUVAR_SCREEN_START - logical address
-                                   * of the screen bank currently displayed */
-    unsigned int display_start;  /* os_VDUVAR_DISPLAY_START - logical address
-                                   * of the screen bank currently being
-                                   * written to (may differ from screen_start
-                                   * under hardware scrolling/double-buffering) */
+    unsigned int screen_start;   /* os_VDUVAR_SCREEN_START (&94) - logical
+                                   * address of the screen bank the VDU is
+                                   * currently WRITING to (kernel: copied
+                                   * from DriverBankAddr by the CLS, and
+                                   * changed by OS_Byte 112) */
+    unsigned int display_start;  /* os_VDUVAR_DISPLAY_START (&95) - logical
+                                   * address of the bank currently being
+                                   * DISPLAYED (OS_Byte 113). Differs from
+                                   * screen_start while a program is
+                                   * double-buffering. (These two comments
+                                   * were the wrong way round until v0.07.) */
     unsigned int total_screen_size; /* os_VDUVAR_TOTAL_SCREEN_SIZE - the
                                    * OS's own authoritative size of the
                                    * genuinely allocated screen memory,
@@ -100,10 +105,12 @@ _kernel_oserror *v3d_logical_to_physical(void *log_addr, unsigned int *phys_addr
  * separate contiguity check to make once GraphicsV 9 has answered.
  *
  * On success, *phys_base_out is the framestore's physical base
- * address, sanity-checked against info->total_screen_size (fails if
- * the reported size is smaller than expected).
+ * address and *size_out its size in bytes, sanity-checked against
+ * info->total_screen_size (fails if the reported size is smaller than
+ * expected).
  */
 _kernel_oserror *v3d_get_framestore_phys(const v3d_screen_info_t *info,
-                                          unsigned int *phys_base_out);
+                                          unsigned int *phys_base_out,
+                                          unsigned int *size_out);
 
 #endif /* SCREEN_INFO_H */

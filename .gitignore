@@ -2,3 +2,6 @@ V3DDriver,ffa
 c/*.o
 cmhg/*.o
 cmhg/*.h
+test/host/scratch_test
+test/host/fpcheck
+test/host/overlap_order_test

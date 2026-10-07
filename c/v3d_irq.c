@@ -10,6 +10,7 @@
                          * cmunge's own vector-handlers documentation). */
 #include "io_map.h"
 #include "v3d_regs.h"
+#include "cl_common.h" /* g_v3d_wedged - the fail-stop latch */
 #include <stddef.h>
 
 #define SWI_OS_ClaimDeviceVector   0x4Bu
@@ -33,7 +34,14 @@ static unsigned int g_hal_irqclear_sb = 0;
 static io_mapping_t g_v3d_permanent_mapping;
 static int g_v3d_permanent_mapped = 0;
 static int g_v3d_irq_ready = 0;
+static int g_v3d_irq_vec_claimed = 0; /* device vector claimed, ready or not */
+static unsigned int g_v3d_irq_empty_run = 0; /* consecutive empty interrupts */
 static void *g_module_private_word = NULL;
+
+int v3d_irq_is_ready(void)
+{
+    return g_v3d_irq_ready;
+}
 
 void v3d_irq_set_private_word(void *pw)
 {
@@ -83,58 +91,80 @@ static void v3d_irq_call_clear(void)
                           V3D_IRQ_DEVICE_NUMBER);
 }
 
+/*
+ * This handler holds the device vector UNSHARED (OS_ClaimDeviceVector with
+ * R0 bit 31 clear), so it is the only thing that will ever run for this
+ * interrupt. That changes what "pass on" means: with no later handler the
+ * kernel falls to its default, NOIRQ, which calls HAL_IRQDisable and
+ * switches device 10 off for good - after which every accelerated job
+ * waits for an interrupt that cannot come. v0.06 passed on whenever it
+ * found no FLDONE/FRDONE/hub bit set, so one empty interrupt (a spurious
+ * assertion, a late one, one that raced the acknowledgement) was enough to
+ * cripple the accelerator until reboot.
+ *
+ * So: always claim, always acknowledge at the interrupt controller. The
+ * level-triggered line is only dropped by clearing the SOURCE, so every
+ * status bit seen is cleared. A genuinely stuck source would now retrigger
+ * forever instead of being disabled, so a run of empty interrupts trips a
+ * breaker that masks everything and switches acceleration off.
+ */
+#define IRQ_EMPTY_RUN_LIMIT 64u
+
 int v3d_irq_handler(_kernel_swi_regs *r, void *pw)
 {
     unsigned int sts, hub_sts;
-    int handled = 0;
 
     (void) r;
     (void) pw;
 
     if (!g_v3d_permanent_mapped)
     {
-        /* Shouldn't happen - v3d_irq_resolve_clear() always runs
-         * before the vector is claimed - but never touch V3D
-         * registers through a pointer we never actually mapped. */
+        /* Cannot happen: v3d_irq_resolve_clear() maps the registers before
+         * the vector is ever claimed. If it somehow did, there is nothing
+         * safe to do with the hardware, so leave it to the kernel. */
         g_v3d_irq_spurious_count++;
         return 1; /* VECTOR_PASSON */
     }
 
     sts = IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_STS);
-
-    if (sts & (V3D_INT_FLDONE | V3D_INT_FRDONE))
+    if (sts)
     {
         /* Acknowledge exactly the bits found - standard write-1-to-
          * clear, matches the real Linux v3d driver's own IRQ handler. */
         IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_CLR) = sts;
         if (sts & V3D_INT_FLDONE) g_v3d_irq_bin_done_count++;
         if (sts & V3D_INT_FRDONE) g_v3d_irq_render_done_count++;
-        handled = 1;
     }
 
-    /* Hub and core share one GIC line on this hardware (V3D 4.2) - see
-     * the long comment on V3D_HUB_INT_STS in v3d_regs.h. Hub sources
-     * are masked off entirely (v3d_irq_unmask), but read+acknowledge
-     * unconditionally anyway, belt and braces: this is a level-
-     * triggered line, and anything left set and unacknowledged here
-     * would make the GIC re-assert forever the instant HAL_IRQClear
-     * runs - exactly what froze the machine before this was added. */
+    /* Hub and core share one GIC line on this hardware (V3D 4.2) - see the
+     * long comment on V3D_HUB_INT_STS in v3d_regs.h. Hub sources are
+     * masked off entirely (v3d_irq_unmask), but read+acknowledge
+     * unconditionally anyway: this is a level-triggered line, and anything
+     * left set here would make the GIC re-assert forever the instant
+     * HAL_IRQClear runs - exactly what froze the machine before this was
+     * added. */
     hub_sts = IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_STS);
     if (hub_sts)
-    {
         IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_CLR) = hub_sts;
-        handled = 1;
-    }
 
-    if (handled)
+    if (sts & (V3D_INT_FLDONE | V3D_INT_FRDONE))
     {
-        v3d_irq_call_clear();
         g_v3d_irq_claimed_count++;
-        return 0; /* VECTOR_CLAIM */
+        g_v3d_irq_empty_run = 0;
+    }
+    else
+    {
+        g_v3d_irq_spurious_count++;
+        if (++g_v3d_irq_empty_run >= IRQ_EMPTY_RUN_LIMIT)
+        {
+            IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_MSK_SET) = 0xFFFFFFFFu;
+            IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
+            g_v3d_wedged = 1;
+        }
     }
 
-    g_v3d_irq_spurious_count++;
-    return 1; /* VECTOR_PASSON - not ours, or nothing to service */
+    v3d_irq_call_clear();
+    return 0; /* VECTOR_CLAIM */
 }
 
 _kernel_oserror *v3d_irq_claim(void)
@@ -251,6 +281,14 @@ static _kernel_oserror *v3d_irq_unmask(void)
 
     IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_MSK_SET) = 0xFFFFFFFFu;
     IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
+
+    /* Drop anything already pending before enabling, as Linux's
+     * v3d_irq_enable does: a stale FLDONE/FRDONE left by an earlier
+     * instance would otherwise fire the instant it is unmasked and be
+     * counted as the first job's completion. */
+    IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_CLR) = 0xFFFFFFFFu;
+    IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_CLR) = 0xFFFFFFFFu;
+
     IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_CLR) =
         (V3D_INT_FLDONE | V3D_INT_FRDONE);
     return NULL;
@@ -314,19 +352,29 @@ _kernel_oserror *v3d_irq_ensure_ready(void)
     err = v3d_irq_claim();
     if (err)
         return err;
+    g_v3d_irq_vec_claimed = 1;
 
     err = v3d_irq_resolve_clear();
-    if (err)
-        return err;
+    if (!err)
+        err = v3d_irq_unmask();
+    if (!err)
+        err = v3d_irq_hal_enable();
 
-    err = v3d_irq_unmask();
     if (err)
+    {
+        /* Undo what was done: a half-built state used to leave the vector
+         * claimed with shutdown believing there was nothing to release. */
+        if (g_v3d_permanent_mapped)
+        {
+            IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
+            IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_MSK_SET) = 0xFFFFFFFFu;
+        }
+        (void) v3d_irq_release();
+        g_v3d_irq_vec_claimed = 0;
         return err;
+    }
 
-    err = v3d_irq_hal_enable();
-    if (err)
-        return err;
-
+    g_v3d_irq_empty_run = 0;
     g_v3d_irq_ready = 1;
     return NULL;
 }
@@ -355,13 +403,22 @@ _kernel_oserror *v3d_irq_shutdown(void)
 {
     _kernel_oserror *err = NULL;
 
-    if (!g_v3d_irq_ready)
+    if (!g_v3d_irq_ready && !g_v3d_irq_vec_claimed)
         return NULL;
 
     if (g_v3d_permanent_mapped)
+    {
+        /* Mask, THEN clear - Linux's v3d_irq_disable order. Leaving a
+         * status bit set behind us would hand the next instance a stale
+         * "job done". */
         IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_MSK_SET) = 0xFFFFFFFFu;
+        IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_MSK_SET) = 0xFFFFFFFFu;
+        IO_WORD(g_v3d_permanent_mapping, V3D_CTL_INT_CLR) = 0xFFFFFFFFu;
+        IO_WORD(g_v3d_permanent_mapping, V3D_HUB_INT_CLR) = 0xFFFFFFFFu;
+    }
 
-    err = v3d_irq_hal_disable();
+    if (g_v3d_irq_ready)
+        err = v3d_irq_hal_disable();
 
     {
         _kernel_oserror *release_err = v3d_irq_release();
@@ -369,6 +426,7 @@ _kernel_oserror *v3d_irq_shutdown(void)
             err = release_err;
     }
 
+    g_v3d_irq_vec_claimed = 0;
     g_v3d_irq_ready = 0;
     return err;
 }

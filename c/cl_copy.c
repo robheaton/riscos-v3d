@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include "cl_copy.h"
+#include "cl_common.h"
 #include "cl_builder.h"
 #include "cl_packets.h"
 #include "v3d_regs.h"
@@ -18,198 +19,38 @@
 #include "v3d_irq.h"
 
 
-#define TILE_SIZE 64u
+/* TILE_SIZE, the scratch cache, the completion wait, the barriers, the
+ * control-list upload and the job kick sequence all live in cl_common.c
+ * now (v0.07) - see its header for why they were pulled out of here. */
 
-static unsigned int div_round_up(unsigned int a, unsigned int b)
+static inline unsigned int div_round_up(unsigned int a, unsigned int b)
 {
-    return (a + b - 1u) / b;
+    return v3d_div_round_up(a, b);
 }
 
-static unsigned int bytes_to_pages(unsigned int bytes)
+static inline unsigned int bytes_to_pages(unsigned int bytes)
 {
-    return div_round_up(bytes, PAGE_SIZE);
+    return v3d_bytes_to_pages(bytes);
 }
-
-/* Identical to cl_fill.c's own get_super_tiles - see its comment for
- * the derivation. Not shared via a header to keep cl_fill.c and
- * cl_copy.c independently diffable while this is new/unproven. */
-static void get_super_tiles(unsigned int tiles_x, unsigned int tiles_y,
-                             unsigned int *supertile_w, unsigned int *supertile_h,
-                             unsigned int *frame_w_supertile,
-                             unsigned int *frame_h_supertile)
-{
-    unsigned int sw = 1u, sh = 1u, fw, fh;
-
-    for (;;)
-    {
-        fw = div_round_up(tiles_x, sw);
-        fh = div_round_up(tiles_y, sh);
-        if (fw * fh < 256u)
-            break;
-        if (sw < sh)
-            sw++;
-        else
-            sh++;
-    }
-
-    *supertile_w = sw;
-    *supertile_h = sh;
-    *frame_w_supertile = fw;
-    *frame_h_supertile = fh;
-}
-
-/*
- * CIRCUIT BREAKER - see cl_fill.c's own wait_for_irq for the full
- * writeup. Bounded by real wall-clock time (v3d_read_centiseconds),
- * not just a spin count, since a backlogged GPU/interrupt pipeline
- * doesn't make the loop itself run any slower. Checked every 4096
- * iterations to avoid throttling the poll rate with a SWI call every
- * single spin. Giving up here is always safe - the caller's existing
- * fail-safe handling (gfxv_accel.c) leaves the call unclaimed on any
- * error, falling back to normal CPU rendering.
- */
-extern unsigned int v3d_read_centiseconds(void);
-#define CIRCUIT_BREAKER_TIMEOUT_CS 30u /* 300ms real time */
-
-static _kernel_oserror *wait_for_irq(volatile unsigned int *counter,
-                                      unsigned int initial,
-                                      _kernel_oserror *timeout_err)
-{
-    unsigned int spin;
-    unsigned int start_cs = 0;
-    int have_start = 0;
-
-    for (spin = 0; spin < 5000000u; spin++)
-    {
-        if (*counter != initial)
-            return NULL;
-
-        if ((spin & 0xFFFFu) == 0xFFFFu)
-        {
-            unsigned int now_cs = v3d_read_centiseconds();
-            if (!have_start)
-            {
-                start_cs = now_cs;
-                have_start = 1;
-            }
-            else if (now_cs - start_cs >= CIRCUIT_BREAKER_TIMEOUT_CS)
-                return timeout_err;
-        }
-    }
-    return timeout_err;
-}
-
-/*
- * CACHED SCRATCH ALLOCATION - see cl_fill.c's own identical mechanism
- * (find_or_create_fill_scratch) for the full writeup (README's "Task
- * Manager freeze" section) - not shared via a header, same "keep
- * cl_fill.c and cl_copy.c independently diffable" reasoning as
- * get_super_tiles/wait_for_irq above. Claims scratch pages ONCE per
- * distinct base_page (generously, worst-case full-screen sized), then
- * reuses them on every subsequent call, skipping pmp_alloc (and the
- * Service_MemoryMoved broadcast it triggers) entirely after the first.
- */
-#define WORST_CASE_TILES_X 30u
-#define WORST_CASE_TILES_Y 17u
-#define WORST_CASE_N_TILES (WORST_CASE_TILES_X * WORST_CASE_TILES_Y)
-#define MAX_CACHED_SCRATCH 4u
 
 /*
  * Real budget for the tiny dedicated v3d_copy_test_16bpp PMP slot
  * (module.c's COPY_TEST_16BPP_EXTRA_PAGES) - MUST be kept equal to
  * that constant by hand (no shared header between module.c and this
- * file for it - same "independently diffable" reasoning as
- * get_super_tiles/wait_for_irq above). Added 2026-09-30 after an
- * adversarial code review found the ORIGINAL bounds check below only
- * compared against the generic PMP_MAX_PAGES_PER_CALL=2048 cap, which
- * is far bigger than this dedicated slot actually is - a moderately
- * large test call (e.g. 200x200) would have silently overflowed past
- * this slot's real reservation and aliased V3D_FillTest16bpp's
- * adjacent slot instead of failing cleanly, corrupting whichever
- * test's buffer was read back later. The fixed worst-case copy-
- * scratch cost below (1 cl + 6 rcl + 10 tile_alloc + 32 tile_state =
- * 49 pages, via find_or_create_copy_scratch, ALWAYS claimed regardless
- * of actual request size - see that function's own sizing) leaves only
- * SLOT_PAGES-SCRATCH_WORST_CASE_PAGES for the two (src+dest) render
- * buffers COMBINED.
+ * file for it). Added 2026-09-30 after an adversarial code review found
+ * the ORIGINAL bounds check only compared against the generic
+ * PMP_MAX_PAGES_PER_CALL=2048 cap, which is far bigger than this
+ * dedicated slot actually is - a moderately large test call (e.g.
+ * 200x200) would have silently overflowed past this slot's real
+ * reservation and aliased V3D_FillTest16bpp's adjacent slot instead of
+ * failing cleanly. The fixed worst-case scratch cost (V3D_SLOT_PAGES =
+ * 49: 1 cl + 6 rcl + 10 tile_alloc + 32 tile_state, ALWAYS claimed
+ * regardless of actual request size) leaves only
+ * SLOT_PAGES-V3D_SLOT_PAGES for the two (src+dest) render buffers
+ * COMBINED.
  */
 #define COPY_TEST_16BPP_SLOT_PAGES 100u
-#define COPY_TEST_16BPP_SCRATCH_WORST_CASE_PAGES 49u
-
-typedef struct
-{
-    unsigned int base_page;
-    unsigned int cl_phys;         void *cl_log;
-    unsigned int rcl_phys;        void *rcl_log;        unsigned int rcl_pages;
-    unsigned int tile_alloc_phys; void *tile_alloc_log;  unsigned int tile_alloc_pages;
-    unsigned int tile_state_phys; void *tile_state_log;  unsigned int tile_state_pages;
-} copy_scratch_cache_t;
-
-static copy_scratch_cache_t g_copy_scratch_cache[MAX_CACHED_SCRATCH];
-static unsigned int g_copy_scratch_cache_count = 0;
-
-static copy_scratch_cache_t *find_or_create_copy_scratch(pmp_area_t *pmp, unsigned int base_page,
-                                                            unsigned int tile_alloc_pages_needed,
-                                                            unsigned int tile_state_pages_needed,
-                                                            unsigned int rcl_pages_needed,
-                                                            _kernel_oserror **err_out)
-{
-    unsigned int i;
-    copy_scratch_cache_t *slot;
-    unsigned int worst_tile_alloc_bytes, worst_tile_state_bytes, worst_rcl_bytes;
-    unsigned int worst_tile_alloc_pages, worst_tile_state_pages, worst_rcl_pages;
-    unsigned int page;
-
-    *err_out = NULL;
-
-    for (i = 0; i < g_copy_scratch_cache_count; i++)
-        if (g_copy_scratch_cache[i].base_page == base_page)
-            return &g_copy_scratch_cache[i];
-
-    if (g_copy_scratch_cache_count >= MAX_CACHED_SCRATCH)
-        return NULL;
-
-    worst_tile_alloc_bytes = WORST_CASE_N_TILES * TILE_SIZE;
-    worst_tile_alloc_bytes = (worst_tile_alloc_bytes + 4095u) & ~4095u;
-    worst_tile_alloc_bytes += TILE_SIZE * TILE_SIZE * 2u;
-    worst_tile_alloc_pages = bytes_to_pages(worst_tile_alloc_bytes);
-
-    worst_tile_state_bytes = WORST_CASE_N_TILES * 256u;
-    worst_tile_state_pages = bytes_to_pages(worst_tile_state_bytes);
-
-    worst_rcl_bytes = 64u + WORST_CASE_N_TILES * 40u + 64u;
-    worst_rcl_pages = bytes_to_pages(worst_rcl_bytes);
-
-    if (tile_alloc_pages_needed > worst_tile_alloc_pages ||
-        tile_state_pages_needed > worst_tile_state_pages ||
-        rcl_pages_needed > worst_rcl_pages)
-        return NULL;
-
-    slot = &g_copy_scratch_cache[g_copy_scratch_cache_count];
-    page = base_page;
-
-    *err_out = pmp_alloc(pmp, page, 1u, &slot->cl_phys, &slot->cl_log);
-    if (*err_out) return NULL;
-    page += 1u;
-
-    slot->rcl_pages = worst_rcl_pages;
-    *err_out = pmp_alloc(pmp, page, worst_rcl_pages, &slot->rcl_phys, &slot->rcl_log);
-    if (*err_out) return NULL;
-    page += worst_rcl_pages;
-
-    slot->tile_alloc_pages = worst_tile_alloc_pages;
-    *err_out = pmp_alloc(pmp, page, worst_tile_alloc_pages, &slot->tile_alloc_phys, &slot->tile_alloc_log);
-    if (*err_out) return NULL;
-    page += worst_tile_alloc_pages;
-
-    slot->tile_state_pages = worst_tile_state_pages;
-    *err_out = pmp_alloc(pmp, page, worst_tile_state_pages, &slot->tile_state_phys, &slot->tile_state_log);
-    if (*err_out) return NULL;
-
-    slot->base_page = base_page;
-    g_copy_scratch_cache_count++;
-    return slot;
-}
+#define COPY_TEST_16BPP_SCRATCH_WORST_CASE_PAGES V3D_SLOT_PAGES
 
 /*
  * Shared core: builds and submits a multi-tile Load+Store control list
@@ -220,166 +61,75 @@ static copy_scratch_cache_t *find_or_create_copy_scratch(pmp_area_t *pmp, unsign
  * same framestore, so its two calls always pass the same stride
  * twice). No ClearTileBuffers at all - every tile is populated from
  * `src_phys` via LoadTileBufferGeneral, not cleared.
+ *
+ * Structurally mirrors cl_fill.c's run_fill: the only real difference is
+ * the per-tile RCL body, Load(source)+EndOfLoads+Store(dest) instead of
+ * Store-none+Clear+Store.
  */
+/* Tile visiting order for run_copy (see v3d_copy_screen_overlapping). */
+#define COPY_COLS_DESCENDING 1u
+#define COPY_ROWS_DESCENDING 2u
+
 static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int width, unsigned int height,
                                    unsigned int src_phys, unsigned int dest_phys,
                                    unsigned int src_stride, unsigned int dest_stride,
                                    unsigned int format_code,
                                    unsigned int *tiles_x_out,
-                                   unsigned int *tiles_y_out)
+                                   unsigned int *tiles_y_out,
+                                   unsigned int order)
 {
     unsigned int tiles_x, tiles_y, n_tiles;
-    unsigned int tile_alloc_bytes, tile_state_bytes, rcl_bytes;
-    unsigned int tile_alloc_pages, tile_state_pages, rcl_pages;
-    unsigned int supertile_w, supertile_h, frame_w_supertile, frame_h_supertile;
-    unsigned int cl_phys, tile_alloc_phys, tile_state_phys, rcl_phys;
-    void *cl_log, *tile_alloc_log, *tile_state_log, *rcl_log_ptr;
-    _kernel_oserror *err;
+    unsigned int col, row, ci, ri;
+    unsigned int t_start;
+    v3d_scratch_t *s;
     cl_buf_t bcl, rcl;
-    unsigned int bcl_start, bcl_end, rcl_start, rcl_end;
-    io_mapping_t v3d;
-    unsigned int last_bin_irq, last_render_irq;
-    unsigned int page = base_page;
-    unsigned int col, row;
+    v3d_job_t job;
+    _kernel_oserror *err;
 
-    if (width == 0u || height == 0u)
-    {
-        static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: copy width/height must be non-zero"
-        };
-        return &err_bad_size;
-    }
+    t_start = v3d_time_us();
+
+    err = v3d_gpu_check();
+    if (err)
+        return err;
+
+    err = v3d_check_dims(width, height);
+    if (err)
+        return err;
 
     tiles_x = div_round_up(width, TILE_SIZE);
     tiles_y = div_round_up(height, TILE_SIZE);
     n_tiles = tiles_x * tiles_y;
 
-    /* Same sizing formulas as cl_fill.c's run_fill - see its comments
-     * for the reference-source derivation. */
-    tile_alloc_bytes = n_tiles * TILE_SIZE;
-    tile_alloc_bytes = (tile_alloc_bytes + 4095u) & ~4095u;
-    tile_alloc_bytes += TILE_SIZE * TILE_SIZE * 2u;
-    tile_alloc_pages = bytes_to_pages(tile_alloc_bytes);
+    err = v3d_scratch_get(pmp, base_page, n_tiles, &s);
+    if (err)
+        return err;
 
-    tile_state_bytes = n_tiles * 256u;
-    tile_state_pages = bytes_to_pages(tile_state_bytes);
+    v3d_scratch_zero(s, n_tiles);
 
-    /* RCL: ~52-byte header + ~24 bytes/tile (one TileCoordinates block
-     * per tile - Load+EndOfLoads+Store+EndOfTileMarker, no dummy-store
-     * workaround and no Clear, both fill-specific) + slack. */
-    rcl_bytes = 64u + n_tiles * 40u + 64u;
-    rcl_pages = bytes_to_pages(rcl_bytes);
-
-    if (tile_alloc_pages > PMP_MAX_PAGES_PER_CALL || tile_state_pages > PMP_MAX_PAGES_PER_CALL || rcl_pages > PMP_MAX_PAGES_PER_CALL)
-    {
-        static _kernel_oserror err_too_big = {
-            14, "V3DDriver: copy rectangle too large - tile_alloc/"
-                "tile_state/RCL scratch buffers exceed pmp_alloc's "
-                "pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL)"
-        };
-        return &err_too_big;
-    }
-
-    {
-        copy_scratch_cache_t *cache = find_or_create_copy_scratch(
-            pmp, base_page, tile_alloc_pages, tile_state_pages, rcl_pages, &err);
-        if (err) return err;
-
-        if (cache)
-        {
-            cl_phys = cache->cl_phys; cl_log = cache->cl_log;
-            rcl_phys = cache->rcl_phys; rcl_log_ptr = cache->rcl_log;
-            tile_alloc_phys = cache->tile_alloc_phys; tile_alloc_log = cache->tile_alloc_log;
-            tile_state_phys = cache->tile_state_phys; tile_state_log = cache->tile_state_log;
-        }
-        else
-        {
-            err = pmp_alloc(pmp, page, 1u, &cl_phys, &cl_log);
-            if (err) return err;
-            page += 1u;
-
-            err = pmp_alloc(pmp, page, rcl_pages, &rcl_phys, &rcl_log_ptr);
-            if (err) return err;
-            page += rcl_pages;
-
-            err = pmp_alloc(pmp, page, tile_alloc_pages, &tile_alloc_phys, &tile_alloc_log);
-            if (err) return err;
-            page += tile_alloc_pages;
-
-            err = pmp_alloc(pmp, page, tile_state_pages, &tile_state_phys, &tile_state_log);
-            if (err) return err;
-        }
-    }
-
-    {
-        unsigned int i;
-        volatile unsigned int *p;
-
-        p = (volatile unsigned int *) tile_alloc_log;
-        for (i = 0; i < (tile_alloc_pages * PAGE_SIZE) / 4u; i++)
-            p[i] = 0;
-
-        p = (volatile unsigned int *) tile_state_log;
-        for (i = 0; i < (tile_state_pages * PAGE_SIZE) / 4u; i++)
-            p[i] = 0;
-    }
-
-    get_super_tiles(tiles_x, tiles_y, &supertile_w, &supertile_h,
-                     &frame_w_supertile, &frame_h_supertile);
-
-    /* --- BCL: identical shape to cl_fill.c's - no primitives, so
-     * nothing here differs between a fill and a copy. --- */
-    cl_init(&bcl, cl_log, cl_phys, PAGE_SIZE);
-    bcl_start = cl_paddr(&bcl);
-    emit_tile_binning_mode_cfg(&bcl, width, height);
-    emit_flush_vcd_cache(&bcl);
-    emit_occlusion_query_counter(&bcl, 0);
-    emit_start_tile_binning(&bcl);
-
-    emit_clip_window(&bcl, 0, 0, width, height);
-    emit_cfg_bits(&bcl, 1, 1, 1, 0, 0, 0, 0, 7, 0, 0, 1, 0, 0, 0, 0);
-    emit_point_size(&bcl, 1.0f);
-    emit_line_width(&bcl, 1.0f);
-    emit_clipper_xy_scaling(&bcl, (width / 2.0f) * 256.0f, (height / 2.0f) * -256.0f);
-    emit_clipper_z_scale_and_offset(&bcl, 0.5f, 0.5f);
-    emit_clipper_z_min_max(&bcl, 0.0f, 1.0f);
-    emit_viewport_offset(&bcl, width / 2, height / 2, 0, 0);
-    emit_color_write_masks(&bcl, 0);
-    emit_blend_constant_color(&bcl, 0, 0, 0, 0);
-    emit_zero_all_flat_shade_flags(&bcl);
-    emit_zero_all_non_perspective_flags(&bcl);
-    emit_zero_all_centroid_flags(&bcl);
-    emit_transform_feedback_specs(&bcl, 0, 0);
-    emit_occlusion_query_counter(&bcl, 0);
-    emit_sample_state(&bcl, 0xF, 1.0f);
-    emit_vcm_cache_size(&bcl, 4, 4);
-    emit_flush(&bcl);
-    bcl_end = cl_paddr(&bcl);
+    /* --- BCL: identical to a fill's - no primitives. --- */
+    cl_init(&bcl, s->cl_log, s->cl_phys, PAGE_SIZE);
+    job.bcl_start = cl_paddr(&bcl);
+    v3d_build_bcl(&bcl, width, height);
+    job.bcl_end = cl_paddr(&bcl);
 
     /* --- RCL: one Load(source)+Store(dest) pair per tile, no Clear. --- */
-    cl_init(&rcl, rcl_log_ptr, rcl_phys, rcl_pages * PAGE_SIZE);
-    rcl_start = cl_paddr(&rcl);
-    emit_tile_rendering_mode_cfg_common(&rcl, width, height, 2);
-    emit_tile_rendering_mode_cfg_clear_colors(&rcl, 0, 0, 0);
-    emit_tile_rendering_mode_cfg_color_rt0(&rcl, 0, 2, 0);
-    emit_tile_rendering_mode_cfg_zs_clear(&rcl, 0, 1.0f);
-    emit_tile_list_initial_block_size(&rcl, 0, 1);
-    emit_multicore_tile_list_set_base(&rcl, tile_alloc_phys);
-    emit_multicore_supertile_cfg(&rcl, supertile_w, supertile_h,
-                                   frame_w_supertile, frame_h_supertile,
-                                   tiles_x, tiles_y, 1, 0, 0);
+    cl_init(&rcl, s->rcl_log, s->rcl_phys, s->rcl_pages * PAGE_SIZE);
+    job.rcl_start = cl_paddr(&rcl);
+    v3d_build_rcl_header(&rcl, width, height, 0, s->tile_alloc_phys,
+                          tiles_x, tiles_y);
 
-    for (row = 0; row < tiles_y; row++)
+    for (ri = 0; ri < tiles_y; ri++)
     {
-        for (col = 0; col < tiles_x; col++)
+        row = (order & COPY_ROWS_DESCENDING) ? tiles_y - 1u - ri : ri;
+        for (ci = 0; ci < tiles_x; ci++)
         {
+            col = (order & COPY_COLS_DESCENDING) ? tiles_x - 1u - ci : ci;
+
             /* Same base-address-only addressing as cl_fill.c's store -
              * the CLE derives each tile's offset itself from the
-             * preceding TileCoordinates, for BOTH Load and Store (an
-             * inference from the fill fix, not yet independently
-             * hardware-confirmed for Load specifically - that's
-             * exactly what this file's own test exists to check). */
+             * preceding TileCoordinates, for BOTH Load and Store
+             * (hardware-confirmed for Load by this file's own tests). */
             emit_tile_coordinates(&rcl, col, row);
             emit_load_tile_buffer_rt0(&rcl, format_code, src_stride, src_phys);
             emit_end_of_loads(&rcl);
@@ -389,49 +139,18 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
     }
 
     emit_end_of_rendering(&rcl);
-    rcl_end = cl_paddr(&rcl);
+    job.rcl_end = cl_paddr(&rcl);
 
-    err = v3d_regs_map(&v3d);
-    if (err) return err;
+    job.kind = V3D_JOB_COPY;
+    job.t_start_us = t_start;
+    job.tile_alloc_phys = s->tile_alloc_phys;
+    job.tile_alloc_bytes = v3d_tile_alloc_bytes(n_tiles);
+    job.tile_state_phys = s->tile_state_phys;
+    job.overflow = (bcl.overflow || rcl.overflow) ? 1 : 0;
 
-    IO_WORD(v3d, V3D_PTB_BPOS) = 0;
-    v3d_flush_caches(&v3d);
-    last_bin_irq = g_v3d_irq_bin_done_count;
-
-    IO_WORD(v3d, V3D_CLE_CT0QMA) = tile_alloc_phys;
-    IO_WORD(v3d, V3D_CLE_CT0QMS) = tile_alloc_pages * PAGE_SIZE;
-    IO_WORD(v3d, V3D_CLE_CT0QTS) = tile_state_phys | V3D_CLE_CT0QTS_ENABLE;
-    IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
-    IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end;
-
-    v3d_regs_unmap(&v3d);
-
-    {
-        static _kernel_oserror err_bin_timeout = {
-            11, "V3DDriver: copy timed out waiting for binning"
-        };
-        err = wait_for_irq(&g_v3d_irq_bin_done_count, last_bin_irq, &err_bin_timeout);
-        if (err) return err;
-    }
-
-    err = v3d_regs_map(&v3d);
-    if (err) return err;
-
-    v3d_flush_caches(&v3d);
-    last_render_irq = g_v3d_irq_render_done_count;
-
-    IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
-    IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end;
-
-    v3d_regs_unmap(&v3d);
-
-    {
-        static _kernel_oserror err_render_timeout = {
-            12, "V3DDriver: copy timed out waiting for rendering"
-        };
-        err = wait_for_irq(&g_v3d_irq_render_done_count, last_render_irq, &err_render_timeout);
-        if (err) return err;
-    }
+    err = v3d_job_run(&job);
+    if (err)
+        return err;
 
     *tiles_x_out = tiles_x;
     *tiles_y_out = tiles_y;
@@ -498,7 +217,7 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
 
     err = run_copy(pmp, base_page + 2u * buf_pages, width, height,
                     src_phys, dest_phys, stride, stride, 27 /* RGBA8 */,
-                    tiles_x_out, tiles_y_out);
+                    tiles_x_out, tiles_y_out, 0u);
     if (err) return err;
 
     *src_log_out = src_log;
@@ -579,7 +298,7 @@ _kernel_oserror *v3d_copy_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
 
     err = run_copy(pmp, base_page + 2u * buf_pages, width, height,
                     src_phys, dest_phys, stride, stride, 45 /* RGBA5551 */,
-                    tiles_x_out, tiles_y_out);
+                    tiles_x_out, tiles_y_out, 0u);
     if (err) return err;
 
     *src_log_out = src_log;
@@ -603,7 +322,7 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
     unsigned int dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * bytes_per_pixel;
 
     return run_copy(pmp, base_page, width, height, src_phys, dest_phys,
-                     screen_stride, screen_stride, format_code, tiles_x_out, tiles_y_out);
+                     screen_stride, screen_stride, format_code, tiles_x_out, tiles_y_out, 0u);
 }
 
 /*
@@ -611,19 +330,34 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * instead of a single direct Load(source)+Store(dest) pass, so it's
  * safe for ANY overlap, not just shifts of at least a full tile.
  *
- * WHY a direct pass isn't safe for overlapping rectangles even with
- * careful per-tile ordering: a tile's Load and Store both read/write a
- * fixed 64x64-pixel block, but source and destination are usually
- * shifted by something OTHER than a whole number of tiles (a scroll by
- * 20 pixels, say). A single tile's Store can then overwrite pixels
- * that belong to a DIFFERENT, not-yet-processed tile's Load region -
- * no ordering of the SAME tile grid avoids this once the shift is
- * smaller than one tile in either dimension. Routing through scratch
- * sidesteps the question entirely: source->scratch and scratch->dest
- * are each individually a fresh-buffer copy, which is always non-
- * overlapping by construction (scratch is memory nothing else is
- * using), so both passes reuse run_copy's already-proven, unmodified
- * core with zero new tile-ordering logic to get wrong.
+ * TWO WAYS TO DO IT (V3D_AccelTune 7, overlap_mode):
+ *
+ * overlap_mode 0 (v0.06/0.07/0.08's behaviour, kept as a fallback): two
+ * passes through a scratch buffer - source->scratch then scratch->dest. Each
+ * pass is non-overlapping by construction, so it reuses run_copy unchanged.
+ * Simple, but it costs two GPU jobs and an 8MB bounce buffer.
+ *
+ * overlap_mode 1 (the default from v0.09, hardware-verified): ONE pass, tiles
+ * visited in a chosen order. The earlier
+ * analysis in this file (and the README) rejected this on the grounds that a
+ * tile's Store can overwrite the source of a not-yet-processed tile once the
+ * shift is under 64 pixels. That is true for a FIXED forward order, and it is
+ * the only thing the counterexample showed. It is not true if the order follows
+ * the shift: a store at tile T lands on T's own source plus the source tiles
+ * AHEAD of it in the direction of the shift, and nowhere else (a shift of any
+ * size moves a tile's footprint only in that direction). So visit the tiles
+ * ahead first - columns last-to-first when the destination is to the right of
+ * the source, first-to-last otherwise; rows likewise by whether the destination
+ * is lower in memory - and every source tile has been loaded before anything is
+ * stored over it. Loads of later tiles can never see an earlier tile's store,
+ * since an earlier tile's footprint is further along the shift than any later
+ * tile's source. This reduces to memmove's choice of copy direction, per axis.
+ * test/host/overlap_order_test.c simulates exactly that (full unclipped 64x64
+ * loads, clipped stores) over 148,059 random rectangles and shifts, 74,210 of
+ * them overlapping: 0 failures in sign order, 45,151 in forward order. What it
+ * assumes of the hardware - tiles run strictly one after another in the order
+ * emitted, which a single-core CLE walking an explicit TileCoordinates list
+ * does - is what test/VerifySuite.bas checks on the real machine.
  *
  * Bounded to pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL) for the scratch buffer
  * itself (same cap already governing every synthetic-buffer test in
@@ -634,10 +368,10 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * only partially tested.
  */
 /*
- * Cached scratch PIXEL buffer for the overlap-safe path - same
- * reasoning and mechanism as find_or_create_copy_scratch above, but
- * for the actual scratch pixel data (not the CL/tile_alloc/tile_state
- * machinery run_copy claims for itself). Claimed once at
+ * Cached scratch PIXEL buffer for the overlap-safe path
+ * (v3d_overlap_buffer_get in cl_common.c) - the actual scratch pixel
+ * data, not the CL/tile_alloc/tile_state machinery run_copy claims for
+ * itself. Claimed once at
  * PMP_MAX_PAGES_PER_CALL (the largest size this path ever allows
  * anyway - see the size check this replaces), keyed by base_page, and
  * reused thereafter regardless of the ACTUAL width/height being
@@ -650,42 +384,6 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * hit - it now always passes `base_page + PMP_MAX_PAGES_PER_CALL`, a
  * fixed constant, instead.
  */
-#define MAX_CACHED_OVERLAP_SCRATCH 2u
-
-typedef struct
-{
-    unsigned int base_page;
-    unsigned int scratch_phys; void *scratch_log;
-} overlap_scratch_cache_t;
-
-static overlap_scratch_cache_t g_overlap_scratch_cache[MAX_CACHED_OVERLAP_SCRATCH];
-static unsigned int g_overlap_scratch_cache_count = 0;
-
-static overlap_scratch_cache_t *find_or_create_overlap_scratch(pmp_area_t *pmp, unsigned int base_page,
-                                                                  _kernel_oserror **err_out)
-{
-    unsigned int i;
-    overlap_scratch_cache_t *slot;
-
-    *err_out = NULL;
-
-    for (i = 0; i < g_overlap_scratch_cache_count; i++)
-        if (g_overlap_scratch_cache[i].base_page == base_page)
-            return &g_overlap_scratch_cache[i];
-
-    if (g_overlap_scratch_cache_count >= MAX_CACHED_OVERLAP_SCRATCH)
-        return NULL;
-
-    slot = &g_overlap_scratch_cache[g_overlap_scratch_cache_count];
-
-    *err_out = pmp_alloc(pmp, base_page, PMP_MAX_PAGES_PER_CALL, &slot->scratch_phys, &slot->scratch_log);
-    if (*err_out) return NULL;
-
-    slot->base_page = base_page;
-    g_overlap_scratch_cache_count++;
-    return slot;
-}
-
 _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_page,
                                                unsigned int src_x, unsigned int src_y,
                                                unsigned int dest_x, unsigned int dest_y,
@@ -711,6 +409,20 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
         return &err_bad_size;
     }
 
+    if (g_v3d_tune.overlap_mode == 1u)
+    {
+        /* One pass, tiles ahead of the shift first (see the comment above).
+         * Coordinates here are top-down, so a larger y is lower in memory. */
+        unsigned int order = (dest_x > src_x ? COPY_COLS_DESCENDING : 0u) |
+                              (dest_y > src_y ? COPY_ROWS_DESCENDING : 0u);
+
+        src_phys = screen_phys_base + src_y * screen_stride + src_x * bytes_per_pixel;
+        dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * bytes_per_pixel;
+        return run_copy(pmp, base_page + PMP_MAX_PAGES_PER_CALL, width, height,
+                         src_phys, dest_phys, screen_stride, screen_stride,
+                         format_code, tiles_x_out, tiles_y_out, order);
+    }
+
     tiles_x = div_round_up(width, TILE_SIZE);
     tiles_y = div_round_up(height, TILE_SIZE);
     padded_w = tiles_x * TILE_SIZE;
@@ -728,21 +440,12 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
         return &err_too_big;
     }
 
-    {
-        overlap_scratch_cache_t *cache = find_or_create_overlap_scratch(pmp, base_page, &err);
-        if (err) return err;
-
-        if (cache)
-        {
-            scratch_phys = cache->scratch_phys;
-            scratch_log = cache->scratch_log;
-        }
-        else
-        {
-            err = pmp_alloc(pmp, base_page, scratch_pages, &scratch_phys, &scratch_log);
-            if (err) return err;
-        }
-    }
+    /* One large pixel buffer, claimed once and reused (see
+     * v3d_overlap_buffer_get). If it cannot be had the call is simply
+     * declined - never claimed per call from inside a GraphicsV Render. */
+    err = v3d_overlap_buffer_get(pmp, base_page, scratch_pages,
+                                  &scratch_phys, &scratch_log);
+    if (err) return err;
 
     src_phys = screen_phys_base + src_y * screen_stride + src_x * bytes_per_pixel;
     dest_phys = screen_phys_base + dest_y * screen_stride + dest_x * bytes_per_pixel;
@@ -754,13 +457,13 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
      * sized calls - see this function's own top comment. */
     err = run_copy(pmp, base_page + PMP_MAX_PAGES_PER_CALL, width, height,
                     src_phys, scratch_phys, screen_stride, scratch_stride,
-                    format_code, &tiles_x, &tiles_y);
+                    format_code, &tiles_x, &tiles_y, 0u);
     if (err) return err;
 
     /* Pass 2: scratch -> real destination (same reasoning). */
     err = run_copy(pmp, base_page + PMP_MAX_PAGES_PER_CALL, width, height,
                     scratch_phys, dest_phys, scratch_stride, screen_stride,
-                    format_code, &tiles_x, &tiles_y);
+                    format_code, &tiles_x, &tiles_y, 0u);
     if (err) return err;
 
     *tiles_x_out = tiles_x;

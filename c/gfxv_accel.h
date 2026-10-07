@@ -103,6 +103,36 @@ extern volatile unsigned int g_gfxv_min_overlap_bytes;
 extern volatile unsigned int g_gfxv_fill_skipped_count;
 extern volatile unsigned int g_gfxv_copy_skipped_count;
 
+/* 0.11: an optional event trace, for finding out what the driver does around a
+ * mode change. Off by default (zero cost beyond one test per event). Writing
+ * V3D_AccelProfile 9 with R1 = -1 clears the log and arms it; the next
+ * GFXV_TRACE_MAX events are kept (SetMode, SetDMAAddress and every fill/copy
+ * Render, with what became of each), then recording stops until re-armed.
+ * Outcome codes for kind 3 (fill) and 4 (copy): */
+#define GFXV_TRACE_MAX 32u
+#define TRACE_CLAIMED         0u  /* the GPU did it */
+#define TRACE_SKIP_SMALL      1u  /* below the size limits - left to the CPU */
+#define TRACE_SKIP_DENSITY    2u  /* the fill density rule */
+#define TRACE_NOT_SOLID       3u  /* an ECF this driver does not accelerate */
+#define TRACE_NO_SCREEN       4u  /* the screen could not be used: errnum says why */
+#define TRACE_GPU_ERROR       5u  /* the GPU path failed: errnum says why */
+#define TRACE_SKIP_STRIPED    6u  /* dithered fill below its (8x) limit */
+#define TRACE_STRIPED_ERROR   7u
+#define TRACE_REENTERED       8u  /* a nested call was left alone */
+#define TRACE_NONE          255u  /* handler returned without saying */
+typedef struct {
+    unsigned int kind;     /* 1 SetMode, 2 SetDMAAddress, 3 fill, 4 copy */
+    unsigned int outcome;
+    unsigned int errnum;
+    unsigned int a, b, c, d, e;
+    unsigned int seq;
+} gfxv_trace_t;
+extern volatile unsigned int g_gfxv_screen_decline_count;       /* screen unusable */
+extern volatile unsigned int g_gfxv_screen_decline_last_errnum;
+void v3d_gfxv_trace_arm(void);
+const gfxv_trace_t *v3d_gfxv_trace_get(unsigned int idx, unsigned int *stored_out,
+                                         unsigned int *armed_out);
+
 /* Real OS error message text for the last copy failure (either path),
  * not just its number - see gfxv_accel.c's own comment on why a bare
  * number wasn't enough. Exposed for V3D_AccelCopyLastError. */

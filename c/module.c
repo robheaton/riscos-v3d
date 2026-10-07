@@ -30,7 +30,9 @@
 #include "screen_info.h"
 #include "cl_fill.h"
 #include "cl_copy.h"
+#include "cl_common.h"
 #include "gfxv_accel.h"
+#include "accel_api.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -224,12 +226,23 @@ static unsigned int append_uint_decimal(char *dst, unsigned int pos, unsigned in
     return pos;
 }
 
+/* Set once creating the V3DFill area has failed, so a failing create is
+ * not repeated (each attempt used to leave another Dynamic Area behind and
+ * broadcast Service_MemoryMoved) from inside every later GraphicsV call. */
+static int g_pmp_fill_failed = 0;
+
 static _kernel_oserror *ensure_pmp_fill(void)
 {
+    static _kernel_oserror err_failed_earlier = {
+        32, "V3DDriver: creating the V3DFill Dynamic Area failed earlier - "
+            "acceleration unavailable until the module is reloaded"
+    };
     _kernel_oserror *err;
 
     if (g_pmp_fill_created)
         return NULL;
+    if (g_pmp_fill_failed)
+        return &err_failed_earlier;
 
     /* PMP logical-window reservation is cheap (no real memory
      * committed until pages are actually claimed via pmp_alloc), so
@@ -245,7 +258,10 @@ static _kernel_oserror *ensure_pmp_fill(void)
         err = pmp_create("V3DFill", requested_pages * PAGE_SIZE,
                           requested_pages, &g_pmp_fill);
         if (err)
+        {
+            g_pmp_fill_failed = 1;
             return err;
+        }
 
         /* CHECKED, not assumed (2026-09-30) - this project's own history
          * already flagged this exact gap: OS_DynamicArea 0 can silently
@@ -274,6 +290,11 @@ static _kernel_oserror *ensure_pmp_fill(void)
             pos = append_str_bounded(err_clamped.errmess, pos, " pages, requested ");
             pos = append_uint_decimal(err_clamped.errmess, pos, requested_pages);
             err_clamped.errmess[pos] = '\0';
+
+            /* Do not leave the half-sized area behind (v0.06 did, and
+             * created another on every later call). */
+            (void) pmp_destroy(&g_pmp_fill);
+            g_pmp_fill_failed = 1;
             return &err_clamped;
         }
     }
@@ -309,41 +330,141 @@ static _kernel_oserror *ensure_pmp_fill(void)
  * trusting a stale cache - this flag is no longer "verify once for the
  * module's whole lifetime", just "verify once per mode".
  */
+/*
+ * v0.07: the cache is now also (a) invalidated from the GraphicsV vector
+ * itself, (b) negative-caching for errors that cannot change without a
+ * mode change, and (c) aware of which bank the VDU is WRITING to.
+ *
+ * (a) The kernel clears the screen for a new mode (ModeChangeSub's
+ * "BL FF") BEFORE it issues Service_ModeChange, so invalidating on that
+ * service alone is too late: the new mode's CLS arrived at the
+ * accelerator with the OLD mode's stride, height and base. 1280x720 to
+ * 1920x1080 wrapped the Y flip and aimed an 8MB fill at an address ~1.8MB
+ * below the framebuffer. What DOES precede the CLS is GraphicsV 6
+ * (SetDMAAddress) with R0=3 - the kernel tells the driver where VDU output
+ * now goes - so gfxv_accel.c reports that here (v3d_accel_note_vrender),
+ * and the cache is rebuilt from the already-updated VDU variables on the
+ * next Render. Service_PreModeChange (&4D) invalidates as well, so nothing
+ * between the two can be served from the old mode.
+ *
+ * (b) A mode this driver cannot handle (8bpp, say) used to cost an
+ * OS_ReadVduVariables SWI on every single Render, forever. The error is
+ * now remembered until the next invalidation.
+ *
+ * (c) Rendering was always aimed at the framestore base GraphicsV 9
+ * reports. BCMVideo's own Render uses the address from GraphicsV 6 R0=3
+ * instead - the physical address of the bank the VDU writes to - which
+ * differs whenever a program double-buffers with OS_Byte 112/113.
+ * Observing that call gives the real target. Until one has been seen, a
+ * screen whose write bank and display bank differ is declined rather than
+ * guessed at.
+ */
 static int g_screen_framestore_verified = 0;
+static _kernel_oserror *g_screen_cached_err = NULL; /* static blocks only */
 static v3d_screen_info_t g_screen_info;
 static unsigned int g_screen_phys_base = 0;
+static unsigned int g_screen_fs_base = 0;
+static unsigned int g_screen_fs_size = 0;
+static unsigned int g_vrender_valid = 0;
+static unsigned int g_vrender_phys = 0;
+
+/* Wrap-safe: is [start, start+len) inside 0..limit inclusive, len >= 1? */
+static inline int span_ok(unsigned int start, unsigned int len, unsigned int limit)
+{
+    return len != 0u && start <= limit && len - 1u <= limit - start;
+}
+
+void v3d_accel_screen_invalidate(void)
+{
+    g_screen_framestore_verified = 0;
+    g_screen_cached_err = NULL;
+}
+
+void v3d_accel_note_vrender(unsigned int phys)
+{
+    g_vrender_valid = 1;
+    g_vrender_phys = phys;
+    v3d_accel_screen_invalidate();
+}
 
 static _kernel_oserror *ensure_screen_framestore(void)
 {
+    static _kernel_oserror err_bad_bpp = {
+        16, "V3DDriver: only 32bpp and 16bpp screen modes are supported"
+    };
+    static _kernel_oserror err_bad_geom = {
+        33, "V3DDriver: the screen mode's geometry is inconsistent "
+            "(line length / height exceed the framestore) - declined"
+    };
+    static _kernel_oserror err_bank = {
+        34, "V3DDriver: the VDU write bank differs from the display bank "
+            "and its address has not been seen yet - declined"
+    };
+    static _kernel_oserror err_vrender = {
+        35, "V3DDriver: the VDU write address lies outside the "
+            "framestore - declined"
+    };
     _kernel_oserror *err;
+    unsigned int fs_base, fs_size, base;
+    unsigned long long vis_bytes;
 
     if (g_screen_framestore_verified)
-        return NULL;
+        return g_screen_cached_err;
 
     err = v3d_read_screen_info(&g_screen_info);
     if (err)
-        return err;
+        return err; /* an OS error, possibly transient - not remembered */
 
-    /* Widened from 32bpp-only to also accept 16bpp (2026-09-30, real
-     * 16bpp screen support - see README/memory) - this function only
-     * verifies/caches GEOMETRY, which is equally valid to compute for
-     * either depth. Whether a given ACCELERATED OPERATION is actually
-     * ready for the active depth is a separate question each caller
-     * answers for itself: both copy and fill now use screen_bpp_params
-     * (below, accepts both depths - fill's own cl_fill.c was
-     * generalized to take bytes_per_pixel/format_code in Phase 4). */
+    /* This function only verifies/caches GEOMETRY, which is equally valid
+     * to compute for either depth. Whether a given operation is ready for
+     * the active depth is for its caller to say (screen_bpp_params). */
     if (g_screen_info.log2_bpp != 5u && g_screen_info.log2_bpp != 4u)
     {
-        static _kernel_oserror err_bad_bpp = {
-            16, "V3DDriver: only 32bpp and 16bpp screen modes are supported"
-        };
-        return &err_bad_bpp;
+        g_screen_cached_err = &err_bad_bpp;
+        g_screen_framestore_verified = 1;
+        return g_screen_cached_err;
     }
 
-    err = v3d_get_framestore_phys(&g_screen_info, &g_screen_phys_base);
+    err = v3d_get_framestore_phys(&g_screen_info, &fs_base, &fs_size);
     if (err)
         return err;
 
+    /* The rectangle checks in v3d_accel_render_* trust xwind_limit and
+     * ywind_limit, so make sure those describe memory that exists. */
+    vis_bytes = (unsigned long long) (g_screen_info.ywind_limit + 1u) *
+                 (unsigned long long) g_screen_info.line_length;
+    g_screen_fs_size = fs_size;
+    if (((unsigned long long) (g_screen_info.xwind_limit + 1u) <<
+          (g_screen_info.log2_bpp - 3u)) > g_screen_info.line_length ||
+        vis_bytes > fs_size)
+    {
+        g_screen_cached_err = &err_bad_geom;
+        g_screen_framestore_verified = 1;
+        return g_screen_cached_err;
+    }
+
+    base = fs_base;
+    if (g_vrender_valid)
+    {
+        if (g_vrender_phys < fs_base ||
+            (unsigned long long) (g_vrender_phys - fs_base) + vis_bytes > fs_size)
+        {
+            g_screen_cached_err = &err_vrender;
+            g_screen_framestore_verified = 1;
+            return g_screen_cached_err;
+        }
+        base = g_vrender_phys;
+    }
+    else if (g_screen_info.screen_start != g_screen_info.display_start)
+    {
+        g_screen_cached_err = &err_bank;
+        g_screen_framestore_verified = 1;
+        return g_screen_cached_err;
+    }
+
+    g_screen_fs_base = fs_base;
+    g_screen_phys_base = base;
+    g_screen_cached_err = NULL;
     g_screen_framestore_verified = 1;
     return NULL;
 }
@@ -427,8 +548,12 @@ void v3d_service_handler(int service_number, _kernel_swi_regs *r, void *pw)
     (void) r;
     (void) pw;
 
-    if (service_number == 0x46 /* Service_ModeChange */)
-        g_screen_framestore_verified = 0;
+    /* &46 Service_ModeChange (after the switch) and &4D
+     * Service_PreModeChange (before it) - see the screen cache comment
+     * above for why the vector hook, not these, is what protects the
+     * mode-change CLS. */
+    if (service_number == 0x46 || service_number == 0x4D)
+        v3d_accel_screen_invalidate();
 }
 
 /*
@@ -445,33 +570,37 @@ unsigned int v3d_read_centiseconds(void)
     return (unsigned int) regs.r[0];
 }
 
-static volatile unsigned int g_max_call_duration_cs = 0;
+static volatile unsigned int g_max_call_duration_us = 0;
 
 /*
  * Real accelerated-call timing, readable via V3D_AccelTimingStats.
- * `g_calls_this_window`/`g_window_start_cs` track a simple 1-second
+ * `g_calls_this_window`/`g_window_start_us` track a simple 1-second
  * sliding window of accelerated-call counts; `g_peak_calls_per_second`
  * remembers the worst burst rate seen all session.
+ *
+ * v0.07: times come from v3d_time_us() - one register read of the 1MHz
+ * system timer - instead of two OS_ReadMonotonicTime SWIs per call at
+ * 10ms resolution (so "worst call" could never read below 10ms).
  */
-static unsigned int g_window_start_cs = 0;
+static unsigned int g_window_start_us = 0;
 static unsigned int g_calls_this_window = 0;
 volatile unsigned int g_peak_calls_per_second = 0;
 
 static void record_call_duration(unsigned int t_start)
 {
-    unsigned int t_end = v3d_read_centiseconds();
+    unsigned int t_end = v3d_time_us();
     unsigned int elapsed = t_end - t_start; /* unsigned wraparound is
                                               * harmless here - worst
                                               * case one spuriously huge
                                               * reading on the rare
                                               * wrap, self-corrects next
                                               * call */
-    if (elapsed > g_max_call_duration_cs)
-        g_max_call_duration_cs = elapsed;
+    if (elapsed > g_max_call_duration_us)
+        g_max_call_duration_us = elapsed;
 
-    if (t_end - g_window_start_cs >= 100u) /* new 1-second window */
+    if (t_end - g_window_start_us >= 1000000u) /* new 1-second window */
     {
-        g_window_start_cs = t_end;
+        g_window_start_us = t_end;
         g_calls_this_window = 0;
     }
     g_calls_this_window++;
@@ -551,10 +680,34 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
 
     if (clock_already_on)
     {
-        /* Real hardware evidence this core was already through a
-         * complete, correct power-on before - whether by this
-         * instance or an earlier one. Re-pulsing reset now would be
-         * exactly the confirmed hang/freeze cause described above. */
+        /* The firmware's "clock on" flag is only a REQUEST state, not proof
+         * that reset has been released and the bus gates are open (Linux's
+         * clk-raspberrypi notes it "doesn't actually power off the clock",
+         * and a PowerOn that failed part-way leaves the clock on with the
+         * gates still shut). Trusting it blindly meant the next call would
+         * drive the CLE through closed gates. So look at the gates
+         * themselves: after a complete power-on both ASB controls read
+         * REQ_STOP=0 and ACK=0 (that is exactly what the sequence below
+         * waits for). If they do not, refuse - re-running the reset pulse
+         * on a core in an unknown state is the thing that froze machines
+         * before, so a clear error and a reboot is the safe answer. */
+        io_mapping_t chk;
+        unsigned int asb_m, asb_s;
+        static _kernel_oserror err_asb_closed = {
+            45, "V3DDriver: the V3D clock is on but its bus gates are not "
+                "open (a previous power-on did not complete) - reboot"
+        };
+
+        err = io_map(V3D_MB_BASE, &chk);
+        if (err)
+            return err;
+        asb_m = IO_WORD(chk, ASB_V3D_M_CTRL);
+        asb_s = IO_WORD(chk, ASB_V3D_S_CTRL);
+        io_unmap(&chk);
+
+        if ((asb_m | asb_s) & (ASB_REQ_STOP | ASB_ACK))
+            return &err_asb_closed;
+
         g_powered_on = 1;
         g_v3d_clock_rate = clock_rate;
         *clock_rate_out = clock_rate;
@@ -642,6 +795,44 @@ _kernel_oserror *v3d_accel_get_screen_log2_bpp(unsigned int *log2_bpp_out)
 }
 
 /*
+ * Everything an accelerated operation needs in place before it can build a
+ * job, in the order it is needed. Shared by all four entry points below
+ * (they used to carry five copy-pasted calls each).
+ */
+static _kernel_oserror *accel_prepare(unsigned int *bytes_per_pixel,
+                                       unsigned int *format_code)
+{
+    unsigned int clock_rate;
+    _kernel_oserror *err;
+
+    err = v3d_gpu_check();
+    if (err)
+        return err;
+
+    err = v3d_power_on(&clock_rate);
+    if (err)
+        return err;
+
+    err = ensure_screen_framestore();
+    if (err)
+        return err;
+
+    err = screen_bpp_params(bytes_per_pixel, format_code);
+    if (err)
+        return err;
+
+    err = ensure_pmp_fill();
+    if (err)
+        return err;
+
+    return v3d_irq_ensure_ready();
+}
+
+static _kernel_oserror err_rect_range = {
+    43, "V3DDriver: rectangle lies outside the screen - declined"
+};
+
+/*
  * Step 4 of the planned GraphicsV Render accelerator (see README.md
  * and gfxv_accel.c): the one function that knows how to actually
  * perform an accelerated fill using this driver's existing PMP/IRQ/
@@ -663,46 +854,39 @@ _kernel_oserror *v3d_accel_render_fill(unsigned int left, unsigned int bottom,
                                          unsigned int right, unsigned int top,
                                          unsigned int colour_rgba)
 {
-    unsigned int clock_rate;
     unsigned int width, height, y_top_down;
     unsigned int tiles_x, tiles_y;
     unsigned int bytes_per_pixel, format_code;
+    unsigned int t_start;
     _kernel_oserror *err;
 
-    err = v3d_power_on(&clock_rate);
+    err = accel_prepare(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
-    err = ensure_screen_framestore();
-    if (err)
-        return err;
-
-    err = screen_bpp_params(&bytes_per_pixel, &format_code);
-    if (err)
-        return err;
-
-    err = ensure_pmp_fill();
-    if (err)
-        return err;
-
-    err = v3d_irq_ensure_ready();
-    if (err)
-        return err;
-
+    /* Validated here, against the geometry this module itself verified -
+     * not left to the kernel's own clipping. v0.06 trusted its caller
+     * completely, and the mode-change CLS showed that a rectangle which
+     * does not belong to the cached mode turns into an arbitrary-address
+     * write (the Y flip below wraps). */
+    if (right < left || top < bottom)
+        return &err_rect_range;
     width = right - left + 1u;
     height = top - bottom + 1u;
+    if (!span_ok(left, width, g_screen_info.xwind_limit) ||
+        !span_ok(bottom, height, g_screen_info.ywind_limit))
+        return &err_rect_range;
+
     y_top_down = g_screen_info.ywind_limit - top;
 
-    {
-        unsigned int t_start = v3d_read_centiseconds();
-        err = v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
-                                 left, y_top_down, width, height, colour_rgba,
-                                 g_screen_phys_base, g_screen_info.line_length,
-                                 bytes_per_pixel, format_code,
-                                 &tiles_x, &tiles_y);
-        if (!err)
-            record_call_duration(t_start);
-    }
+    t_start = v3d_time_us();
+    err = v3d_fill_screen(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                             left, y_top_down, width, height, colour_rgba,
+                             g_screen_phys_base, g_screen_info.line_length,
+                             bytes_per_pixel, format_code,
+                             &tiles_x, &tiles_y);
+    if (!err)
+        record_call_duration(t_start);
     return err;
 }
 
@@ -734,48 +918,36 @@ _kernel_oserror *v3d_accel_render_striped_fill(unsigned int left, unsigned int b
                                                  unsigned int right, unsigned int top,
                                                  const unsigned int colours[8])
 {
-    unsigned int clock_rate;
     unsigned int width, height, y_top_down;
     unsigned int target_phys_row0;
     unsigned int bytes_per_pixel, format_code;
+    unsigned int t_start;
     _kernel_oserror *err;
 
-    err = v3d_power_on(&clock_rate);
+    err = accel_prepare(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
-    err = ensure_screen_framestore();
-    if (err)
-        return err;
-
-    err = screen_bpp_params(&bytes_per_pixel, &format_code);
-    if (err)
-        return err;
-
-    err = ensure_pmp_fill();
-    if (err)
-        return err;
-
-    err = v3d_irq_ensure_ready();
-    if (err)
-        return err;
-
+    if (right < left || top < bottom)
+        return &err_rect_range;
     width = right - left + 1u;
     height = top - bottom + 1u;
+    if (!span_ok(left, width, g_screen_info.xwind_limit) ||
+        !span_ok(bottom, height, g_screen_info.ywind_limit))
+        return &err_rect_range;
+
     y_top_down = g_screen_info.ywind_limit - top;
 
     target_phys_row0 = g_screen_phys_base + y_top_down * g_screen_info.line_length
                         + left * bytes_per_pixel;
 
-    {
-        unsigned int t_start = v3d_read_centiseconds();
-        err = v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
-                                      width, height, colours, y_top_down % 8u,
-                                      target_phys_row0, g_screen_info.line_length,
-                                      format_code);
-        if (!err)
-            record_call_duration(t_start);
-    }
+    t_start = v3d_time_us();
+    err = v3d_striped_fill_raw(&g_pmp_fill, SCREEN_FILL_BASE_PAGE,
+                                  width, height, colours, y_top_down % 8u,
+                                  target_phys_row0, g_screen_info.line_length,
+                                  format_code);
+    if (!err)
+        record_call_duration(t_start);
     return err;
 }
 
@@ -795,48 +967,36 @@ _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned int src_b
                                          unsigned int dest_left, unsigned int dest_bottom,
                                          unsigned int width, unsigned int height)
 {
-    unsigned int clock_rate;
     unsigned int src_y_top_down, dest_y_top_down;
     unsigned int tiles_x, tiles_y;
     unsigned int bytes_per_pixel, format_code;
+    unsigned int t_start;
     _kernel_oserror *err;
 
-    err = v3d_power_on(&clock_rate);
+    err = accel_prepare(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
-    err = ensure_screen_framestore();
-    if (err)
-        return err;
-
-    err = screen_bpp_params(&bytes_per_pixel, &format_code);
-    if (err)
-        return err;
-
-    err = ensure_pmp_fill();
-    if (err)
-        return err;
-
-    err = v3d_irq_ensure_ready();
-    if (err)
-        return err;
+    if (!span_ok(src_left, width, g_screen_info.xwind_limit) ||
+        !span_ok(dest_left, width, g_screen_info.xwind_limit) ||
+        !span_ok(src_bottom, height, g_screen_info.ywind_limit) ||
+        !span_ok(dest_bottom, height, g_screen_info.ywind_limit))
+        return &err_rect_range;
 
     /* Each rectangle's own top edge, flipped independently - see this
      * function's own top comment. */
     src_y_top_down = g_screen_info.ywind_limit - (src_bottom + height - 1u);
     dest_y_top_down = g_screen_info.ywind_limit - (dest_bottom + height - 1u);
 
-    {
-        unsigned int t_start = v3d_read_centiseconds();
-        err = v3d_copy_screen(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
-                                 src_left, src_y_top_down, dest_left, dest_y_top_down,
-                                 width, height,
-                                 g_screen_phys_base, g_screen_info.line_length,
-                                 bytes_per_pixel, format_code,
-                                 &tiles_x, &tiles_y);
-        if (!err)
-            record_call_duration(t_start);
-    }
+    t_start = v3d_time_us();
+    err = v3d_copy_screen(&g_pmp_fill, SCREEN_COPY_BASE_PAGE,
+                             src_left, src_y_top_down, dest_left, dest_y_top_down,
+                             width, height,
+                             g_screen_phys_base, g_screen_info.line_length,
+                             bytes_per_pixel, format_code,
+                             &tiles_x, &tiles_y);
+    if (!err)
+        record_call_duration(t_start);
     return err;
 }
 
@@ -855,46 +1015,34 @@ _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsign
                                                      unsigned int dest_left, unsigned int dest_bottom,
                                                      unsigned int width, unsigned int height)
 {
-    unsigned int clock_rate;
     unsigned int src_y_top_down, dest_y_top_down;
     unsigned int tiles_x, tiles_y;
     unsigned int bytes_per_pixel, format_code;
+    unsigned int t_start;
     _kernel_oserror *err;
 
-    err = v3d_power_on(&clock_rate);
+    err = accel_prepare(&bytes_per_pixel, &format_code);
     if (err)
         return err;
 
-    err = ensure_screen_framestore();
-    if (err)
-        return err;
-
-    err = screen_bpp_params(&bytes_per_pixel, &format_code);
-    if (err)
-        return err;
-
-    err = ensure_pmp_fill();
-    if (err)
-        return err;
-
-    err = v3d_irq_ensure_ready();
-    if (err)
-        return err;
+    if (!span_ok(src_left, width, g_screen_info.xwind_limit) ||
+        !span_ok(dest_left, width, g_screen_info.xwind_limit) ||
+        !span_ok(src_bottom, height, g_screen_info.ywind_limit) ||
+        !span_ok(dest_bottom, height, g_screen_info.ywind_limit))
+        return &err_rect_range;
 
     src_y_top_down = g_screen_info.ywind_limit - (src_bottom + height - 1u);
     dest_y_top_down = g_screen_info.ywind_limit - (dest_bottom + height - 1u);
 
-    {
-        unsigned int t_start = v3d_read_centiseconds();
-        err = v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
-                                 src_left, src_y_top_down, dest_left, dest_y_top_down,
-                                 width, height,
-                                 g_screen_phys_base, g_screen_info.line_length,
-                                 bytes_per_pixel, format_code,
-                                 &tiles_x, &tiles_y);
-        if (!err)
-            record_call_duration(t_start);
-    }
+    t_start = v3d_time_us();
+    err = v3d_copy_screen_overlapping(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
+                             src_left, src_y_top_down, dest_left, dest_y_top_down,
+                             width, height,
+                             g_screen_phys_base, g_screen_info.line_length,
+                             bytes_per_pixel, format_code,
+                             &tiles_x, &tiles_y);
+    if (!err)
+        record_call_duration(t_start);
     return err;
 }
 
@@ -1078,48 +1226,240 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
     return NULL;
 }
 
+/*
+ * Is the GPU safe to unload under? Idle means both CLE threads stopped.
+ * Waits briefly for a job that is still draining. Never touches the
+ * hardware if this instance never powered it on.
+ */
+static int gpu_is_idle(void)
+{
+    io_mapping_t v3d;
+    unsigned int t0, cs0, cs1;
+    int idle = 0;
+
+    if (!g_powered_on)
+        return 1;
+    if (g_v3d_wedged)
+        return 0; /* a job timed out and may still be running */
+    if (v3d_regs_map(&v3d))
+        return 0;
+
+    t0 = v3d_time_us();
+    do
+    {
+        cs0 = IO_WORD(v3d, V3D_CLE_CT0CS);
+        cs1 = IO_WORD(v3d, V3D_CLE_CT1CS);
+        if (!((cs0 | cs1) & V3D_CT_CS_CTRUN))
+        {
+            idle = 1;
+            break;
+        }
+    } while (v3d_time_us() - t0 < 100000u); /* 100ms */
+
+    v3d_regs_unmap(&v3d);
+    return idle;
+}
+
+/*
+ * Order matters, and v0.06 had it backwards (IRQ off, THEN release the
+ * vector that feeds the IRQ-dependent accelerator, then free the pages):
+ *
+ *   1. Make sure the GPU is idle BEFORE tearing anything down. A job that
+ *      is still running owns our scratch pages; freeing them under it
+ *      lets the GPU write into memory that now belongs to someone else.
+ *      If it is not idle, refuse to unload (the module stays fully
+ *      working) - unless `fatal`, when the machine is going down anyway.
+ *   2. Release GraphicsV, so no new Render can arrive.
+ *   3. Shut the interrupt down (masks, clears pending, releases).
+ *   4. Remove the Dynamic Areas outright (pmp_destroy) - v0.06 only
+ *      released their pages and left two zombie areas per load, with a
+ *      resize-handler pointer into the RMA being freed. If the GPU might
+ *      still be running (fatal unload with a busy GPU) the pages are LEFT
+ *      ALLOCATED instead: a leak is harmless, the GPU writing into freed
+ *      memory is not.
+ *
+ * Always returns NULL once it has started tearing down: returning an error
+ * from a finalisation that has already released things leaves the module
+ * loaded but half dismantled, which is worse than either outcome.
+ */
 _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
 {
-    _kernel_oserror *irq_err, *gfxv_err, *pmp_err = NULL;
+    static _kernel_oserror err_gpu_busy = {
+        48, "V3DDriver: the GPU is still running a job (or timed out and "
+            "may still be) - not unloading. Reboot to clear it"
+    };
+    int idle;
 
-    (void) fatal;
     (void) podule_base;
     (void) pw;
 
     (void) set_ran_marker("V3DDriver$FinalRan");
 
-    /* Must run unconditionally, even if IRQ handling was never used
-     * this session - see v3d_irq_shutdown's own comment for why a
-     * reloaded module leaving its interrupt vector claimed is a real
-     * hazard, not just untidy. */
-    irq_err = v3d_irq_shutdown();
+    idle = gpu_is_idle();
+    if (!idle && !fatal)
+        return &err_gpu_busy;
 
-    /* Same reasoning, a second system vector: see the README's
-     * "GraphicsV Render accelerator" section for why this compounds
-     * the existing, unresolved reload-without-reboot freeze risk - a
-     * safe no-op if V3D_AccelStart was never called this session. */
-    gfxv_err = v3d_gfxv_shutdown();
+    (void) v3d_gfxv_shutdown();
+    (void) v3d_irq_shutdown();
 
-    /* Same reasoning, different resource: the PMP Dynamic Area is
-     * system-wide OS state that outlives this module unless its
-     * claimed physical pages are explicitly released first - see
-     * pmp_release's own comment in phys_buffer.c. Release the whole
-     * area's page range unconditionally (safe even for pages never
-     * actually used - see pmp_release's own comment), not just
-     * whichever sub-ranges this particular session happened to touch. */
-    if (g_pmp_created)
-        pmp_err = pmp_release(&g_pmp, 0, g_pmp.max_pages);
-
-    if (g_pmp_fill_created)
+    if (idle)
     {
-        _kernel_oserror *fill_err = pmp_release(&g_pmp_fill, 0, g_pmp_fill.max_pages);
-        if (!pmp_err)
-            pmp_err = fill_err;
+        if (g_pmp_created)
+            (void) pmp_destroy(&g_pmp);
+        if (g_pmp_fill_created)
+            (void) pmp_destroy(&g_pmp_fill);
     }
 
-    if (irq_err) return irq_err;
-    if (gfxv_err) return gfxv_err;
-    return pmp_err;
+    g_pmp_created = 0;
+    g_pmp_fill_created = 0;
+    g_powered_on = 0;
+    return NULL;
+}
+
+/*
+ * V3D_AccelTune (R0 = setting, R1 = new value or -1 to just read) - the
+ * run-time switches (see cl_common.h for what they do). Returns the setting's
+ * value from before the call in R0. Settings:
+ *   0 zero_mode (0-1)       4 scratch_attr (0-1, applies after a reset)
+ *   7 overlap_mode (0-1)
+ *   5 reset scratch: releases the cached scratch pages, then claims the
+ *     three production slots again right here in foreground code (never
+ *     lazily inside a GraphicsV call). Returns 0 on success.
+ *   6 re-arm after a GPU timeout. Returns the previous latch state.
+ *   8 V3D clock in MHz: sets it (R1 = MHz, clamped to the firmware's maximum)
+ *     or reads it (R1 = -1). Returns R0 = the rate now in force in MHz, R1 =
+ *     the firmware's maximum in MHz. Foreground only, never during a job.
+ * Defaults (v0.10): zero_mode 1, scratch_attr 1, overlap_mode 1, clock left as the
+ * firmware has it. Setting 0, 4 and 7 to 0 and resetting (key 5) restores the
+ * v0.06 behaviour exactly. Settings 1-3 (cl_mode, flush_mode, render_only), which
+ * existed in v0.07-v0.09, were removed in v0.10: they saved nothing.
+ */
+static _kernel_oserror *tune_reset_scratch(void)
+{
+    static _kernel_oserror err_wedged_reset = {
+        46, "V3DDriver: the GPU is switched off after a timeout - re-arm "
+            "(V3D_AccelTune 6) only if you are sure it is idle"
+    };
+    unsigned int clock_rate, phys;
+    void *log;
+    v3d_scratch_t *slot;
+    _kernel_oserror *err;
+
+    if (g_v3d_wedged)
+        return &err_wedged_reset;
+
+    v3d_scratch_reset_all();
+
+    err = v3d_power_on(&clock_rate);
+    if (err)
+        return err;
+    err = ensure_pmp_fill();
+    if (err)
+        return err;
+    err = v3d_irq_ensure_ready();
+    if (err)
+        return err;
+
+    err = v3d_scratch_get(&g_pmp_fill, SCREEN_FILL_BASE_PAGE, 1u, &slot);
+    if (err)
+        return err;
+    err = v3d_scratch_get(&g_pmp_fill, SCREEN_COPY_BASE_PAGE, 1u, &slot);
+    if (err)
+        return err;
+    err = v3d_scratch_get(&g_pmp_fill,
+                           SCREEN_COPY_OVERLAP_BASE_PAGE + PMP_MAX_PAGES_PER_CALL,
+                           1u, &slot);
+    if (err)
+        return err;
+
+    /* The 8MB bounce buffer is only for two-pass scrolls (overlap_mode 0); one-pass
+     * scrolls (the default) never touch it, so do not tie up 8MB for nothing. It is
+     * allowed to fail (fragmented memory) - the two-pass path then simply declines. */
+    if (g_v3d_tune.overlap_mode == 0u)
+        (void) v3d_overlap_buffer_get(&g_pmp_fill, SCREEN_COPY_OVERLAP_BASE_PAGE,
+                                       1u, &phys, &log);
+    return NULL;
+}
+
+static _kernel_oserror *accel_tune(_kernel_swi_regs *r)
+{
+    static _kernel_oserror err_bad_setting = {
+        47, "V3DDriver: V3D_AccelTune: unknown setting, or value out of range"
+    };
+    unsigned int key = (unsigned int) r->r[0];
+    unsigned int val = (unsigned int) r->r[1];
+    unsigned int *target = NULL;
+
+    switch (key)
+    {
+        case 0: target = &g_v3d_tune.zero_mode;    break;
+        case 4: target = &g_v3d_tune.scratch_attr; break;
+        case 7: target = &g_v3d_tune.overlap_mode; break;
+
+        case 5:
+        {
+            _kernel_oserror *err = tune_reset_scratch();
+            if (err)
+                return err;
+            r->r[0] = 0;
+            return NULL;
+        }
+
+        case 6:
+            r->r[0] = g_v3d_wedged ? 1u : 0u;
+            v3d_gpu_rearm();
+            return NULL;
+
+        case 8:
+        {
+            unsigned int state, rate, max_rate, clock_rate;
+            _kernel_oserror *err;
+
+            err = v3d_gpu_check();
+            if (err)
+                return err;
+            err = v3d_power_on(&clock_rate); /* makes sure the clock is on at all */
+            if (err)
+                return err;
+
+            if (val != 0xFFFFFFFFu)
+            {
+                static _kernel_oserror err_not_idle = {
+                    51, "V3DDriver: the V3D clock is only changed with the GPU idle"
+                };
+
+                /* 200 MHz and up: this is for raising the clock from the 250 MHz
+                 * the firmware leaves, never for asking for a rate it does not run. */
+                if (val < 200u || val > 1000u)
+                    return &err_bad_setting;
+                if (!gpu_is_idle())
+                    return &err_not_idle;
+                err = v3d_set_clock_rate(val * 1000000u, &rate, &max_rate);
+                if (err)
+                    return err;
+                g_v3d_clock_rate = rate;
+            }
+
+            err = v3d_query_clock(&state, &rate, &max_rate);
+            if (err)
+                return err;
+            r->r[0] = rate / 1000000u;
+            r->r[1] = max_rate / 1000000u;
+            return NULL;
+        }
+
+        default:
+            return &err_bad_setting;
+    }
+
+    r->r[0] = *target;
+    if (val != 0xFFFFFFFFu)
+    {
+        if (val > 1u)
+            return &err_bad_setting;
+        *target = val;
+    }
+    return NULL;
 }
 
 /* ---------------------------------------------------------------- */
@@ -1159,6 +1499,8 @@ enum
     SWI_V3D_CopyTest16bpp = 28,
     SWI_V3D_FillTest16bpp = 29,
     SWI_V3D_AccelLimits = 30,
+    SWI_V3D_AccelProfile = 31,
+    SWI_V3D_AccelTune = 32,
 };
 
 _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
@@ -1384,6 +1726,14 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
              * specifically* - both should be 0. */
             _kernel_oserror *err, *cleanup_err;
             unsigned int live_claimed = 0, live_spurious = 0;
+            static _kernel_oserror err_irq_in_use = {
+                44, "V3DDriver: V3D_IRQTest cannot run once the accelerator "
+                    "has set up interrupts - it would switch them off for "
+                    "good. Reboot first, or load with NoAutoStart"
+            };
+
+            if (v3d_irq_is_ready())
+                return &err_irq_in_use;
 
             g_v3d_irq_claimed_count = 0;
             g_v3d_irq_spurious_count = 0;
@@ -1515,9 +1865,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            if (width == 0u || height == 0u ||
-                x + width > g_screen_info.xwind_limit + 1u ||
-                y + height > g_screen_info.ywind_limit + 1u)
+            if (!span_ok(x, width, g_screen_info.xwind_limit) ||
+                !span_ok(y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
                     18, "V3DDriver: V3D_ScreenFillTest rectangle is outside "
@@ -1596,9 +1945,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            if (width == 0u || height == 0u ||
-                x + width > g_screen_info.xwind_limit + 1u ||
-                y + height > g_screen_info.ywind_limit + 1u)
+            if (!span_ok(x, width, g_screen_info.xwind_limit) ||
+                !span_ok(y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
                     18, "V3DDriver: V3D_ScreenStripedFillTest rectangle is "
@@ -1846,11 +2194,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            if (width == 0u || height == 0u ||
-                src_x + width > g_screen_info.xwind_limit + 1u ||
-                src_y + height > g_screen_info.ywind_limit + 1u ||
-                dest_x + width > g_screen_info.xwind_limit + 1u ||
-                dest_y + height > g_screen_info.ywind_limit + 1u)
+            if (!span_ok(src_x, width, g_screen_info.xwind_limit) ||
+                !span_ok(dest_x, width, g_screen_info.xwind_limit) ||
+                !span_ok(src_y, height, g_screen_info.ywind_limit) ||
+                !span_ok(dest_y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
                     24, "V3DDriver: V3D_ScreenCopyTest rectangle is outside "
@@ -2031,11 +2378,10 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (err)
                 return err;
 
-            if (width == 0u || height == 0u ||
-                src_x + width > g_screen_info.xwind_limit + 1u ||
-                src_y + height > g_screen_info.ywind_limit + 1u ||
-                dest_x + width > g_screen_info.xwind_limit + 1u ||
-                dest_y + height > g_screen_info.ywind_limit + 1u)
+            if (!span_ok(src_x, width, g_screen_info.xwind_limit) ||
+                !span_ok(dest_x, width, g_screen_info.xwind_limit) ||
+                !span_ok(src_y, height, g_screen_info.ywind_limit) ||
+                !span_ok(dest_y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
                     24, "V3DDriver: V3D_ScreenCopyOverlapTest rectangle is "
@@ -2223,9 +2569,198 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
              * the worst single call's duration ever seen, in
              * centiseconds (R0), and the highest accelerated-call rate
              * seen in any 1-second window all session (R1). */
-            r->r[0] = g_max_call_duration_cs;
+            r->r[0] = g_max_call_duration_us / 10000u; /* cs, as before */
             r->r[1] = g_peak_calls_per_second;
+            r->r[2] = g_max_call_duration_us;      /* new in v0.07: us */
+            r->r[3] = v3d_time_is_fine();          /* 1 = real us timer */
             return NULL;
+
+        case SWI_V3D_AccelProfile:
+        {
+            /* v0.07: where the time of an accelerated job actually goes,
+             * and the health of the GPU path. R0 = view:
+             *   0 = fills, 1 = copies (each JOB, so an overlapping copy
+             *       counts twice): R0 jobs, R1..R5 SUMS of microseconds
+             *       (setup = start to binning kicked, bin, mid = binning
+             *       done to render kicked, render, total), R6 worst single
+             *       job. R1 on entry = 1 to zero the counters afterwards.
+             *   2 = health: R0 wedged (1 = the fail-stop latch is set),
+             *       R1 timeouts so far, R2 microsecond timer in use,
+             *       R3 write-bank address seen, R4 that address,
+             *       R5 base rendering uses, R6 framestore base,
+             *       R7 lost interrupts rescued.
+             *   3 = last timeout, part 1: R0 (which|kind<<8|valid<<16),
+             *       R1 INT_STS, R2 INT_MSK, R3 CT0CS, R4 CT0CA, R5 CT0EA,
+             *       R6 CT1CS, R7 CT1CA.
+             *   4 = last timeout, part 2: R0 CT1EA, R1 BFC, R2 RFC,
+             *       R3 BFC before the job, R4 RFC before, R5 bin IRQs,
+             *       R6 render IRQs, R7 hub INT_STS.
+             *   5 = zero both sets of counters.
+             *   7 = interrupt accounting (never reset): R0 lost-interrupt rescues,
+             *       R1 interrupts claimed, R2 empty interrupts, R3 bin interrupts,
+             *       R4 render interrupts, R5 jobs started. Every job should raise
+             *       exactly one bin and one render interrupt, so R5 - R3 and R5 - R4
+             *       should be 0 when idle; more means interrupts really were lost. Only
+             *       valid on a boot that has not used V3D_ClearTest/V3D_ClearToSprite,
+             *       which raise the same interrupts without counting a job.
+             *       R6 times the screen could not be used for a fill or copy, R7 the
+             *       error number of the last such decline.
+             *   9 = event trace (see gfxv_accel.h). R1 = -1 clears the log and arms it;
+             *       R1 = 0..31 reads event R1: R0 = 1 | kind<<8 | outcome<<16 (0 = no such
+             *       event), R1-R5 = a..e (fill: left, bottom, right, top, ECF pointer;
+             *       copy: src left, src bottom, dest left, dest bottom, (w-1)|(h-1)<<16;
+             *       SetMode: R0 in; SetDMAAddress: address, DAG), R6 = (errnum AND &FFFF) | seq<<16 (view 7 R7 has the whole number),
+             *       R7 = events stored | armed<<16.
+             *   8 = one recorded rescue, R1 on entry = 0..3: R0 = valid | which<<8
+             *       (1 bin 2 render) | kind<<16 (0 fill 1 copy), R1 waited us,
+             *       R2 INT_STS, R3 INT_MSK, R4 hub INT_STS, R5 thread CS,
+             *       R6 frame-counter delta | late<<16, R7 (jobs-bin) | (jobs-render)<<16.
+             *   6 = the screen the driver is working from: R0 error
+             *       number of the last reason it declined the screen
+             *       (0 = none), R1 address of that message (read it
+             *       with $R1 in BASIC), R2 log2 bpp, R3 line length,
+             *       R4 XWindLimit, R5 YWindLimit, R6 TotalScreenSize,
+             *       R7 framestore size reported by GraphicsV 9. */
+            unsigned int view = (unsigned int) r->r[0];
+            unsigned int reset = (unsigned int) r->r[1];
+
+            if (view <= 1u)
+            {
+                v3d_prof_t *k = &g_v3d_prof[view];
+
+                r->r[0] = k->n;
+                r->r[1] = k->setup_us;
+                r->r[2] = k->bin_us;
+                r->r[3] = k->mid_us;
+                r->r[4] = k->render_us;
+                r->r[5] = k->total_us;
+                r->r[6] = k->max_us;
+                r->r[7] = 0;
+                if (reset == 1u)
+                {
+                    k->n = k->setup_us = k->bin_us = k->mid_us = 0;
+                    k->render_us = k->total_us = k->max_us = 0;
+                }
+                return NULL;
+            }
+            if (view == 2u)
+            {
+                r->r[0] = g_v3d_wedged ? 1u : 0u;
+                r->r[1] = g_v3d_wedge_count;
+                r->r[2] = v3d_time_is_fine();
+                r->r[3] = g_vrender_valid;
+                r->r[4] = g_vrender_phys;
+                r->r[5] = g_screen_phys_base;
+                r->r[6] = g_screen_fs_base;
+                r->r[7] = g_v3d_irq_rescue_count;
+                return NULL;
+            }
+            if (view == 3u)
+            {
+                const v3d_timeout_diag_t *d = &g_v3d_timeout_diag;
+
+                r->r[0] = d->which | (d->kind << 8) | (d->valid << 16);
+                r->r[1] = d->int_sts;
+                r->r[2] = d->int_msk;
+                r->r[3] = d->ct0cs;
+                r->r[4] = d->ct0ca;
+                r->r[5] = d->ct0ea;
+                r->r[6] = d->ct1cs;
+                r->r[7] = d->ct1ca;
+                return NULL;
+            }
+            if (view == 4u)
+            {
+                const v3d_timeout_diag_t *d = &g_v3d_timeout_diag;
+
+                r->r[0] = d->ct1ea;
+                r->r[1] = d->bfc;
+                r->r[2] = d->rfc;
+                r->r[3] = d->bfc0;
+                r->r[4] = d->rfc0;
+                r->r[5] = d->irq_bin_count;
+                r->r[6] = d->irq_render_count;
+                r->r[7] = d->hub_sts;
+                return NULL;
+            }
+            if (view == 5u)
+            {
+                v3d_prof_reset();
+                return NULL;
+            }
+            if (view == 7u)
+            {
+                r->r[0] = g_v3d_irq_rescue_count;
+                r->r[1] = g_v3d_irq_claimed_count;
+                r->r[2] = g_v3d_irq_spurious_count;
+                r->r[3] = g_v3d_irq_bin_done_count;
+                r->r[4] = g_v3d_irq_render_done_count;
+                r->r[5] = g_v3d_jobs_run;
+                r->r[6] = g_gfxv_screen_decline_count;
+                r->r[7] = g_gfxv_screen_decline_last_errnum;
+                return NULL;
+            }
+            if (view == 9u)
+            {
+                const gfxv_trace_t *t;
+                unsigned int stored, armed;
+
+                if (reset == 0xFFFFFFFFu)
+                {
+                    v3d_gfxv_trace_arm();
+                    return NULL;
+                }
+                t = v3d_gfxv_trace_get(reset, &stored, &armed);
+                r->r[7] = stored | (armed << 16);
+                if (t == NULL)
+                {
+                    r->r[0] = 0;
+                    r->r[1] = r->r[2] = r->r[3] = r->r[4] = r->r[5] = r->r[6] = 0;
+                    return NULL;
+                }
+                r->r[0] = 1u | (t->kind << 8) | (t->outcome << 16);
+                r->r[1] = t->a;
+                r->r[2] = t->b;
+                r->r[3] = t->c;
+                r->r[4] = t->d;
+                r->r[5] = t->e;
+                r->r[6] = (t->errnum & 0xFFFFu) | (t->seq << 16);
+                return NULL;
+            }
+            if (view == 8u)
+            {
+                const v3d_rescue_diag_t *d;
+
+                if (reset >= V3D_RESCUE_DIAG_MAX)
+                    return error_BAD_SWI;
+                d = &g_v3d_rescue_diag[reset];
+                r->r[0] = d->valid | (d->which << 8) | (d->kind << 16);
+                r->r[1] = d->waited_us;
+                r->r[2] = d->int_sts;
+                r->r[3] = d->int_msk;
+                r->r[4] = d->hub_sts;
+                r->r[5] = d->ct_cs;
+                r->r[6] = (d->fc_delta & 0xFFFFu) | (d->late << 16);
+                r->r[7] = (d->jobs_minus_bin & 0xFFFFu) | (d->jobs_minus_render << 16);
+                return NULL;
+            }
+            if (view == 6u)
+            {
+                r->r[0] = g_screen_cached_err ? (unsigned int) g_screen_cached_err->errnum : 0u;
+                r->r[1] = g_screen_cached_err ? (unsigned int) g_screen_cached_err->errmess : 0u;
+                r->r[2] = g_screen_info.log2_bpp;
+                r->r[3] = g_screen_info.line_length;
+                r->r[4] = g_screen_info.xwind_limit;
+                r->r[5] = g_screen_info.ywind_limit;
+                r->r[6] = g_screen_info.total_screen_size;
+                r->r[7] = g_screen_fs_size;
+                return NULL;
+            }
+            return error_BAD_SWI;
+        }
+
+        case SWI_V3D_AccelTune:
+            return accel_tune(r);
 
         default:
             /* error_BAD_SWI is cmunge's own generated macro (see

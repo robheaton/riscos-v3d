@@ -188,6 +188,10 @@ _kernel_oserror *v3d_irq_shutdown(void);
  */
 const io_mapping_t *v3d_irq_permanent_mapping(void);
 
+/* Non-zero once v3d_irq_ensure_ready() has set the interrupt up (and until
+ * v3d_irq_shutdown). V3D_IRQTest refuses to run while this is set. */
+int v3d_irq_is_ready(void);
+
 static inline _kernel_oserror *v3d_regs_map(io_mapping_t *m)
 {
     const io_mapping_t *perm = v3d_irq_permanent_mapping();

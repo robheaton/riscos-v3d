@@ -121,3 +121,60 @@ _kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out, int *already_on_out
     if (rate_out) *rate_out = rate;
     return NULL;
 }
+
+/*
+ * Asks the firmware for a new V3D clock rate (SetClockRate, clock 5), clamped
+ * to the maximum the firmware reports, and reads back what it actually set.
+ * The third word of the request is the firmware's "skip turbo" flag, 0 = allow
+ * turbo, as v3d_ensure_clock_on above already uses it.
+ *
+ * Added v0.10 for a measured reason: the large-operation costs (about 3.4 us a
+ * 64x64 tile for a fill, 6.3 us for a copy) match the V3D tile buffer moving
+ * about four pixels per clock at the 250 MHz this driver leaves the clock at,
+ * which would make them clock-bound, while the firmware reports a 500 MHz maximum
+ * (the stock Pi 4 V3D rate). Only ever called from a foreground SWI with no job in
+ * flight.
+ */
+_kernel_oserror *v3d_set_clock_rate(unsigned int hz, unsigned int *rate_out,
+                                      unsigned int *max_rate_out)
+{
+    unsigned int echo, max_rate, rate;
+    _kernel_oserror *err;
+
+    err = tag_call(TAG_GET_MAX_CLOCK_RATE, CLOCK_ID_V3D, 0, 0, &echo, &max_rate);
+    if (err)
+        return err;
+
+    /* A zero maximum means the firmware did not answer the tag; do not guess a
+     * limit and ask for a rate on the strength of that. */
+    if (!max_rate)
+    {
+        static _kernel_oserror err_no_max = {
+            49, "V3DDriver: the firmware did not report a maximum V3D clock rate"
+        };
+        return &err_no_max;
+    }
+    if (hz > max_rate)
+        hz = max_rate;
+
+    err = tag_call(TAG_SET_CLOCK_RATE, CLOCK_ID_V3D, hz, 0, &echo, &rate);
+    if (err)
+        return err;
+
+    err = tag_call(TAG_GET_CLOCK_RATE, CLOCK_ID_V3D, 0, 0, &echo, &rate);
+    if (err)
+        return err;
+
+    if (!rate)
+    {
+        static _kernel_oserror err_no_rate = {
+            50, "V3DDriver: the firmware did not report the V3D clock rate after "
+                "the request"
+        };
+        return &err_no_rate;
+    }
+
+    if (rate_out) *rate_out = rate;
+    if (max_rate_out) *max_rate_out = max_rate;
+    return NULL;
+}

@@ -54,4 +54,11 @@ _kernel_oserror *v3d_query_clock(unsigned int *state_out,
  */
 _kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out, int *already_on_out);
 
+/*
+ * Sets the V3D clock rate in Hz (clamped to the firmware's maximum) and returns
+ * the rate actually in force and that maximum. Foreground use only, GPU idle.
+ */
+_kernel_oserror *v3d_set_clock_rate(unsigned int hz, unsigned int *rate_out,
+                                      unsigned int *max_rate_out);
+
 #endif

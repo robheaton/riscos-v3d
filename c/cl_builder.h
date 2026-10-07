@@ -22,6 +22,11 @@ typedef struct cl_buf
     unsigned int phys_base;
     unsigned int offset;
     unsigned int capacity;
+    unsigned int overflow; /* set if a write would have passed `capacity` -
+                             * the write is dropped, never performed. Checked
+                             * by the job runner before anything is submitted
+                             * (added 2026-10-04: the writer used to trust its
+                             * callers' size estimates completely) */
 } cl_buf_t;
 
 static inline void cl_init(cl_buf_t *b, void *logical, unsigned int phys,
@@ -31,6 +36,7 @@ static inline void cl_init(cl_buf_t *b, void *logical, unsigned int phys,
     b->phys_base = phys;
     b->offset = 0;
     b->capacity = capacity;
+    b->overflow = 0;
 }
 
 static inline unsigned int cl_paddr(const cl_buf_t *b)
@@ -40,6 +46,11 @@ static inline unsigned int cl_paddr(const cl_buf_t *b)
 
 static inline void cl_u8(cl_buf_t *b, unsigned int v)
 {
+    if (b->offset >= b->capacity)
+    {
+        b->overflow = 1;
+        return;
+    }
     b->base[b->offset++] = (unsigned char) v;
 }
 

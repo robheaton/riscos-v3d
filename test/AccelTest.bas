@@ -118,9 +118,33 @@ PRINT
 REM V3D_AccelTimingStats: R0=worst single accelerated call's duration
 REM ever seen (centiseconds), R1=highest accelerated-call rate seen in
 REM any 1-second window all session.
-SYS "V3D_AccelTimingStats" TO max_dur_cs%, peak_rate%
-PRINT "Worst single accelerated call duration: "; max_dur_cs%; " cs ("; max_dur_cs%*10; " ms)"
+SYS "V3D_AccelTimingStats" TO max_dur_cs%, peak_rate%, max_dur_us%, fine%
+IF fine% = 1 THEN
+  PRINT "Worst single accelerated call duration: "; max_dur_us%; " us"
+ELSE
+  PRINT "Worst single accelerated call duration: "; max_dur_cs%*10; " ms (10ms timer - the 1MHz timer was not available)"
+ENDIF
 PRINT "Peak accelerated calls in any 1-second window: "; peak_rate%
+PRINT
+
+REM V3D_AccelProfile (new in 0.07): the GPU path's health, and where the time
+REM of an accelerated job goes. View 2 = health; views 0/1 = per-job phase
+REM sums for fills / copies; view 6 = why the driver last declined the screen.
+SYS "V3D_AccelProfile", 2 TO wedged%, wcount%, fine%, vrv%, vrp%, pbase%, fbase%, rescued%
+PRINT "GPU fail-stop latch: "; wedged%; "   job timeouts so far: "; wcount%; "   lost interrupts rescued: "; rescued%
+IF wedged% = 1 THEN PROCwedged
+IF vrv% = 1 THEN PRINT "Write-bank address seen from GraphicsV: &"; STR$~(vrp%); "  (rendering base &"; STR$~(pbase%); ", framestore base &"; STR$~(fbase%); ")" ELSE PRINT "No write-bank address seen yet (rendering base &"; STR$~(pbase%); ")"
+PROCjobtimes(0, "Fill")
+PROCjobtimes(1, "Copy")
+SYS "V3D_AccelProfile", 7 TO resc%, iclaim%, ispur%, ibin%, irend%, jobsrun%
+PRINT "Interrupts: "; ibin%; " bin and "; irend%; " render seen for "; jobsrun%; " jobs started"
+PRINT "  not accounted for: "; jobsrun% - ibin%; " bin, "; jobsrun% - irend%; " render (0-1 is normal; more = interrupts really lost); empty interrupts: "; ispur%
+IF resc% > 0 THEN PROCrescues(resc%)
+SYS "V3D_AccelProfile", 6 TO serr%, smsg%, sbpp%, sll%, sxl%, syl%, stot%, sfs%
+IF serr% <> 0 THEN
+  PRINT "*** The driver is DECLINING this screen (error "; serr%; "): "; $smsg%
+  PRINT "    log2bpp "; sbpp%; ", line length "; sll%; ", XWindLimit "; sxl%; ", YWindLimit "; syl%; ", TotalScreenSize "; stot%; ", framestore "; sfs%
+ENDIF
 PRINT
 
 SYS "V3D_AccelStop"
@@ -135,6 +159,46 @@ PRINT "Could be genuinely correct (no plain solid fills or"
 PRINT "non-overlapping copies happened to occur), or could mean"
 PRINT "the decoding needs a closer look."
 END
+
+REM The details the driver recorded for the first few lost-interrupt rescues (see
+REM V3D_AccelProfile view 8): was the interrupt status bit still set (raised but never
+REM delivered), did it arrive late, and how many earlier interrupts were missing?
+DEF PROCrescues(n%)
+  LOCAL i%, a%, b%, c%, d%, e%, f%, g%, h%
+  IF n% > 4 THEN n% = 4
+  FOR i% = 0 TO n% - 1
+    SYS "V3D_AccelProfile", 8, i% TO a%, b%, c%, d%, e%, f%, g%, h%
+    PRINT "  rescue "; i% + 1; ": waiting for the ";
+    IF ((a% >> 8) AND 255) = 1 THEN PRINT "bin"; ELSE PRINT "render";
+    PRINT " job of a ";
+    IF ((a% >> 16) AND 255) = 0 THEN PRINT "fill"; ELSE PRINT "copy";
+    PRINT ", waited "; b%; " us"
+    PRINT "     INT_STS=&"; STR$~(c%); " INT_MSK=&"; STR$~(d%); " hub=&"; STR$~(e%); " thread CS=&"; STR$~(f%); " frames advanced "; g% AND &FFFF; ", interrupt then arrived late: ";
+    IF ((g% >> 16) AND 1) = 1 THEN PRINT "YES" ELSE PRINT "no"
+    PRINT "     jobs-minus-interrupts at that moment: bin "; h% AND &FFFF; ", render "; (h% >> 16) AND &FFFF
+  NEXT
+ENDPROC
+
+DEF PROCjobtimes(view%, name$)
+  LOCAL jn%, js%, jb%, jm%, jr%, jt%, jx%
+  SYS "V3D_AccelProfile", view%, 0 TO jn%, js%, jb%, jm%, jr%, jt%, jx%
+  IF jn% = 0 THEN
+    PRINT name$; " jobs timed: 0"
+  ELSE
+    PRINT name$; " jobs timed: "; jn%; "  average us per job - setup "; js% DIV jn%; ", bin "; jb% DIV jn%; ", mid "; jm% DIV jn%; ", render "; jr% DIV jn%; ", total "; jt% DIV jn%; " (worst "; jx%; ")"
+  ENDIF
+ENDPROC
+
+DEF PROCwedged
+  LOCAL a%, b%, c%, d%, e%, f%, g%, h%
+  PRINT "*** A GPU JOB TIMED OUT and acceleration has been switched off. Registers:"
+  SYS "V3D_AccelProfile", 3 TO a%, b%, c%, d%, e%, f%, g%, h%
+  PRINT "  which|kind|valid=&"; STR$~(a%); " INT_STS=&"; STR$~(b%); " INT_MSK=&"; STR$~(c%)
+  PRINT "  CT0CS=&"; STR$~(d%); " CT0CA=&"; STR$~(e%); " CT0EA=&"; STR$~(f%); " CT1CS=&"; STR$~(g%); " CT1CA=&"; STR$~(h%)
+  SYS "V3D_AccelProfile", 4 TO a%, b%, c%, d%, e%, f%, g%, h%
+  PRINT "  CT1EA=&"; STR$~(a%); " BFC=&"; STR$~(b%); " RFC=&"; STR$~(c%); " BFC0=&"; STR$~(d%); " RFC0=&"; STR$~(e%)
+  PRINT "  IRQs: bin "; f%; " render "; g%; " hub INT_STS=&"; STR$~(h%)
+ENDPROC
 
 DEF PROCfailinfo
   SYS "V3D_AccelFailInfo" TO errnum%, left%, bottom%, right%, top%, failmin%, failmax%, okmin%, okmax%

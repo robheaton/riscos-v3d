@@ -120,6 +120,50 @@ static inline void emit_viewport_offset(cl_buf_t *b, float x, float y,
     cl_u32(b, vy);
 }
 
+/*
+ * Integer-only equivalents of the two packets above whose operands depend
+ * on the rectangle size (added 2026-10-04, v0.07).
+ *
+ * The float versions compile to FPA instructions (flts/fltd/mvfs/fixz...)
+ * because width and height are only known at run time. This module runs
+ * in SVC mode with no FPA hardware, so every one of those instructions
+ * traps into the FPEmulator - about 22 traps on every accelerated call,
+ * each of which also borrows the interrupted task's FP registers. The
+ * values involved are exactly representable as integers, so there is no
+ * reason to pay for that:
+ *
+ *   (w / 2.0f) * 256.0f  ==  float(w) * 128   -> IEEE bits of float(w) with
+ *                                                the exponent raised by 7
+ *   (h / 2.0f) * -256.0f ==  -(float(h) * 128) -> the same with the sign set
+ *   (unsigned)(x * 256.0f) & 0x3FFFFF  ==  (x << 8) & 0x3FFFFF  for integer x
+ *
+ * Checked on the host against the float code for every w in 1..65535 (no
+ * mismatches). 1 <= n < 2^24 is required (a rectangle dimension is at most
+ * a few thousand).
+ */
+static inline unsigned int v3d_f32_bits_of_uint(unsigned int n)
+{
+    unsigned int e = 31u - (unsigned int) __builtin_clz(n);
+    return ((e + 127u) << 23) | ((n << (23u - e)) & 0x7FFFFFu);
+}
+
+static inline void emit_clipper_xy_scaling_wh(cl_buf_t *b, unsigned int width,
+                                               unsigned int height)
+{
+    cl_u8(b, 110);
+    cl_u32(b, v3d_f32_bits_of_uint(width) + (7u << 23));
+    cl_u32(b, (v3d_f32_bits_of_uint(height) + (7u << 23)) | 0x80000000u);
+}
+
+/* centre_x/centre_y are whole pixels, no coarse offset. */
+static inline void emit_viewport_offset_whole(cl_buf_t *b, unsigned int centre_x,
+                                               unsigned int centre_y)
+{
+    cl_u8(b, 108);
+    cl_u32(b, (centre_x << 8) & 0x3FFFFFu);
+    cl_u32(b, (centre_y << 8) & 0x3FFFFFu);
+}
+
 static inline void emit_color_write_masks(cl_buf_t *b, unsigned int mask)
 {
     cl_u8(b, 87);

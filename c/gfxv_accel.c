@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include "gfxv_accel.h"
+#include "accel_api.h"
 #include "V3DDriver.h" /* for v3d_gfxv_entry - the cmunge-generated
                          * veneer symbol from cmhg's vector-handlers
                          * directive; only its address is ever used,
@@ -15,7 +16,10 @@
 #define VECTOR_GRAPHICSV 42u
 
 #define GRAPHICSV_REASON_MASK 0xFFFFu
+#define GRAPHICSV_REASON_SETMODE 2u
+#define GRAPHICSV_REASON_SETDMAADDRESS 6u
 #define GRAPHICSV_REASON_RENDER 13u
+#define GVDAG_VRENDER 3u /* GraphicsV 6 R0: the address VDU output goes to */
 
 #define RENDER_OP_COPY 1u
 #define RENDER_OP_FILL 2u
@@ -196,17 +200,52 @@ volatile unsigned int g_gfxv_copy_overlap_error_count = 0;
  * takes, so this can never produce a wrong picture. Limits are in BYTES
  * of pixel data (width*height*bytes-per-pixel) so they scale with screen
  * depth, plus a minimum height, since short rectangles waste most of each
- * 64-row tile. The overlapping-copy default is an extrapolation (it runs
- * two GPU passes, so roughly twice the fixed cost) pending measurement.
+ * 64-row tile. The overlapping-copy default was an extrapolation for the
+ * two-pass scroll; one-pass scrolls (v0.09) cost the same as a copy, so it is now
+ * the copy limit (see the 2026-10-07 calibration below).
  * All are tunable at run time with V3D_AccelLimits; setting every limit
  * to 0 accelerates everything, which is how the benchmark measures the
  * GPU's raw capability.
+ *
+ * RECALIBRATED FOR v0.08 (2026-10-07). The ~116us fixed cost above turned out
+ * to be ~86% CPU work (zeroing and byte-writing into strongly-ordered memory),
+ * not GPU time, and v0.07/0.08 removes most of it: test/TuneBench.bas measured
+ * a tiny job at 8us (setup 1, bin 2, render 4) instead of 111us, with the
+ * output pixel-identical to the CPU's. Per operation, through OS_Plot on the
+ * real hardware, the GPU now takes about 15us for a 16x16 fill, 25us at
+ * 128x128, 246us at 512x512; 15us for a 32x32 copy, 39us at 128x128, 426us
+ * at 512x512; 68us / 214us for a 128x128 / 256x256 scroll (two passes). The
+ * CPU figures in the table above (2.8us for an 8x8 fill, 24us at 64x64, 93us
+ * at 128x128; 6.5us for an 8x8 copy, 145us at 64x64) put the break-even at
+ * about 55x55 pixels for a fill and about 16 rows for a copy. The defaults sit
+ * a little above those so that, as before, the default is never meaningfully
+ * slower than the CPU; they are a first calibration to be confirmed by the
+ * "Dflt" columns of test/FillCopyBench.bas, not a measured optimum.
+ *
+ * CALIBRATED FROM HARDWARE FOR v0.10 (2026-10-07, FillCopyBench on 0.09, 13 shapes
+ * x 3 operations at 32bpp and at 16bpp). Fill: the GPU wins from 64x64 (1.84x at
+ * 32bpp), loses at 32x32 (0.64x) and for wide-short strips (1024x16: 0.60x) - the
+ * limits above leave exactly those to the CPU. Copy: the GPU wins from 16x16
+ * (1.08x) and by 3x at 32x32 and 9x at 64x64. Scroll: now one GPU pass, it costs
+ * the same as a copy (34 us either way at 128x128), so its limit was lowered from
+ * 8192 to the copy limit: a 32x32 scroll is 3.4x faster on the GPU and the old limit
+ * had left it to the CPU. The one remaining loser was fills of a few awkward shapes
+ * at 16bpp (512x32 0.87x, 16x512 0.90x): they touch 8 tiles but carry little work
+ * per tile, which is what the GFXV_FILL_MIN_BYTES_PER_TILE rule in handle_render_fill
+ * catches (it also needs a rows term, GFXV_FILL_ROW_WEIGHT, or it would wrongly drop
+ * the 32bpp 16x512 fill, which the GPU wins by 1.31x because the CPU is slow on tall
+ * rectangles). A
+ * full cost model (CPU = a + b*bytes + c*rows, GPU = g0 + g1*tiles) was fitted to
+ * all 52 measurements and gave the same overall gain as these limits (1.61x
+ * geometric mean for fills, 3.85x for copies), so it was not adopted.
  */
-#define GFXV_DEFAULT_MIN_FILL_BYTES      600000u /* ~150,000 px at 32bpp */
-#define GFXV_DEFAULT_MIN_FILL_ROWS       64u
-#define GFXV_DEFAULT_MIN_COPY_BYTES      16384u  /* 4,096 px at 32bpp */
-#define GFXV_DEFAULT_MIN_COPY_ROWS       48u
-#define GFXV_DEFAULT_MIN_OVERLAP_BYTES   65536u  /* 16,384 px at 32bpp */
+#define GFXV_FILL_MIN_BYTES_PER_TILE 4500u
+#define GFXV_FILL_ROW_WEIGHT         15u /* bytes of CPU work a row's overhead is worth */
+#define GFXV_DEFAULT_MIN_FILL_BYTES      16384u  /* 4,096 px at 32bpp (64x64) */
+#define GFXV_DEFAULT_MIN_FILL_ROWS       32u
+#define GFXV_DEFAULT_MIN_COPY_BYTES      2048u   /* 512 px at 32bpp (~23x23) */
+#define GFXV_DEFAULT_MIN_COPY_ROWS       16u
+#define GFXV_DEFAULT_MIN_OVERLAP_BYTES   2048u   /* same as a copy: one pass now costs the same */
 
 volatile unsigned int g_gfxv_min_fill_bytes = GFXV_DEFAULT_MIN_FILL_BYTES;
 volatile unsigned int g_gfxv_min_fill_rows = GFXV_DEFAULT_MIN_FILL_ROWS;
@@ -218,6 +257,69 @@ volatile unsigned int g_gfxv_min_overlap_bytes = GFXV_DEFAULT_MIN_OVERLAP_BYTES;
  * (genuine, otherwise-acceleratable fills/copies - not errors). */
 volatile unsigned int g_gfxv_fill_skipped_count = 0;
 volatile unsigned int g_gfxv_copy_skipped_count = 0;
+
+/*
+ * 0.11 event trace - see gfxv_accel.h. g_trace_outcome/errnum are set by the
+ * fill and copy handlers just before each return and read by the dispatcher.
+ */
+volatile unsigned int g_gfxv_screen_decline_count = 0;
+volatile unsigned int g_gfxv_screen_decline_last_errnum = 0;
+static gfxv_trace_t g_trace[GFXV_TRACE_MAX];
+static volatile unsigned int g_trace_n = 0;
+static volatile unsigned int g_trace_armed = 0;
+static unsigned int g_trace_seq = 0;
+static unsigned int g_trace_outcome = TRACE_NONE;
+static unsigned int g_trace_errnum = 0;
+
+void v3d_gfxv_trace_arm(void)
+{
+    g_trace_armed = 0;
+    g_trace_n = 0;
+    g_trace_seq = 0;
+    g_trace_armed = 1;
+}
+
+const gfxv_trace_t *v3d_gfxv_trace_get(unsigned int idx, unsigned int *stored_out,
+                                         unsigned int *armed_out)
+{
+    *stored_out = g_trace_n;
+    *armed_out = g_trace_armed;
+    return idx < g_trace_n ? &g_trace[idx] : NULL;
+}
+
+static void trace_event(unsigned int kind, unsigned int outcome, unsigned int errnum,
+                         unsigned int a, unsigned int b, unsigned int c,
+                         unsigned int d, unsigned int e)
+{
+    gfxv_trace_t *t;
+    unsigned int n;
+
+    if (!g_trace_armed)
+        return;
+    n = g_trace_n; /* read once: the check and the index must agree */
+    if (n >= GFXV_TRACE_MAX)
+    {
+        g_trace_armed = 0;
+        return;
+    }
+    t = &g_trace[n];
+    t->kind = kind;
+    t->outcome = outcome;
+    t->errnum = errnum;
+    t->a = a; t->b = b; t->c = c; t->d = d; t->e = e;
+    t->seq = g_trace_seq++;
+    g_trace_n = n + 1u;
+}
+
+/* The screen could not be used for this call: remember why (this decline
+ * used to leave no trace at all). */
+static void note_no_screen(const _kernel_oserror *err)
+{
+    g_gfxv_screen_decline_count++;
+    g_gfxv_screen_decline_last_errnum = (unsigned int) err->errnum;
+    g_trace_outcome = TRACE_NO_SCREEN;
+    g_trace_errnum = (unsigned int) err->errnum;
+}
 
 /*
  * Returns non-zero if a width x height rectangle is big enough to be worth
@@ -457,7 +559,10 @@ static void handle_render_fill(_kernel_swi_regs *r)
      * dependent blend would. */
     err = v3d_accel_get_screen_log2_bpp(&log2_bpp);
     if (err)
+    {
+        note_no_screen(err);
         return;
+    }
 
     /* GraphicsV 13 2 parameter block: word0=left, word1=TOP, word2=right,
      * word3=BOTTOM (all inclusive), word4=ECF block pointer - confirmed
@@ -490,11 +595,44 @@ static void handle_render_fill(_kernel_swi_regs *r)
                            g_gfxv_min_fill_bytes, g_gfxv_min_fill_rows))
     {
         g_gfxv_fill_skipped_count++;
+        g_trace_outcome = TRACE_SKIP_SMALL;
         return;
     }
 
+    /* Enough work per 64x64 tile to be worth a GPU job. A GPU fill costs about
+     * 8.6 us + 3 us per tile touched; the CPU's cost follows the bytes, plus a
+     * per-row overhead that makes TALL rectangles dear for the CPU. The rule
+     * "bytes + 15*rows >= 4500*tiles" was fitted to the 26 fill shapes measured on
+     * the hardware at both depths (FillCopyBench, 2026-10-07): it declines the two
+     * shapes the GPU lost (16bpp 512x32 and 16x512, about 0.9x) and keeps every
+     * measured winner (32bpp 512x32 and 16x512 at 1.25x/1.31x, 16bpp 96x96 at
+     * 1.24x, everything larger). It is only a refinement of the byte/row limits, so
+     * it is skipped when those are set to zero - "all limits 0 = everything goes to
+     * the GPU" is what the benchmarks and VerifySuite rely on - and only evaluated
+     * for sizes small enough for plain 32-bit arithmetic (bigger ones always win). */
+    if (g_gfxv_min_fill_bytes != 0u || g_gfxv_min_fill_rows != 0u)
+    {
+        unsigned int fw = right - left + 1u, fh = top - bottom + 1u;
+
+        if (fw <= 0xFFFFu && fh <= 0xFFFFu && fw * fh <= 0x3FFFFFu)
+        {
+            unsigned int bytes = (fw * fh) << (log2_bpp - 3u);
+            unsigned int tiles = ((fw + 63u) >> 6) * ((fh + 63u) >> 6);
+
+            if (bytes + GFXV_FILL_ROW_WEIGHT * fh < tiles * GFXV_FILL_MIN_BYTES_PER_TILE)
+            {
+                g_gfxv_fill_skipped_count++;
+                g_trace_outcome = TRACE_SKIP_DENSITY;
+                return;
+            }
+        }
+    }
+
     if (!ecf_decode_striped(ecf, log2_bpp, colours))
+    {
+        g_trace_outcome = TRACE_NOT_SOLID;
         return; /* a real content-dependent blend - not ours to accelerate */
+    }
 
     is_solid = 1;
     for (line = 1; line < 8u; line++)
@@ -523,6 +661,8 @@ static void handle_render_fill(_kernel_swi_regs *r)
             g_gfxv_last_fail_top = top;
             if (area < g_gfxv_fail_min_area) g_gfxv_fail_min_area = area;
             if (area > g_gfxv_fail_max_area) g_gfxv_fail_max_area = area;
+            g_trace_outcome = TRACE_GPU_ERROR;
+            g_trace_errnum = (unsigned int) err->errnum;
             return; /* GPU fill failed (e.g. timeout) - leave unclaimed
                       * so the OS's own CPU fallback still draws
                       * correctly; see gfxv_accel.h's top comment on
@@ -534,6 +674,7 @@ static void handle_render_fill(_kernel_swi_regs *r)
         if (area > g_gfxv_success_max_area) g_gfxv_success_max_area = area;
 
         g_gfxv_claimed_count++;
+        g_trace_outcome = TRACE_CLAIMED;
         r->r[4] = 0; /* claimed - see GraphicsV's own R4=0 convention */
         return;
     }
@@ -551,6 +692,7 @@ static void handle_render_fill(_kernel_swi_regs *r)
                                min_bytes * 8u, g_gfxv_min_fill_rows))
         {
             g_gfxv_fill_skipped_count++;
+            g_trace_outcome = TRACE_SKIP_STRIPED;
             return;
         }
     }
@@ -560,11 +702,14 @@ static void handle_render_fill(_kernel_swi_regs *r)
     {
         g_gfxv_striped_error_count++;
         g_gfxv_striped_last_fail_errnum = (unsigned int) err->errnum;
+        g_trace_outcome = TRACE_STRIPED_ERROR;
+        g_trace_errnum = (unsigned int) err->errnum;
         return; /* GPU fill failed (e.g. timeout) - leave unclaimed, same
                   * fail-safe reasoning as the solid path above. */
     }
 
     g_gfxv_striped_claimed_count++;
+    g_trace_outcome = TRACE_CLAIMED;
     r->r[4] = 0; /* claimed */
 }
 
@@ -595,7 +740,10 @@ static void handle_render_copy(_kernel_swi_regs *r)
      * do, so leave the call unclaimed. */
     err = v3d_accel_get_screen_log2_bpp(&log2_bpp);
     if (err)
+    {
+        note_no_screen(err);
         return;
+    }
 
     /* AABB overlap test: NOT (one rect is entirely to one side of the
      * other on either axis). Checked here, at the protocol layer,
@@ -614,12 +762,13 @@ static void handle_render_copy(_kernel_swi_regs *r)
     {
         g_gfxv_copy_overlap_count++;
 
-        /* Overlapping copies run two GPU passes, so they have their own,
-         * larger byte limit. */
+        /* Overlapping copies have their own byte limit (now equal to the
+         * copy limit: a scroll is one GPU pass since 0.09). */
         if (!accel_worthwhile(width, height, log2_bpp,
                                g_gfxv_min_overlap_bytes, g_gfxv_min_copy_rows))
         {
             g_gfxv_copy_skipped_count++;
+            g_trace_outcome = TRACE_SKIP_SMALL;
             return;
         }
 
@@ -631,12 +780,15 @@ static void handle_render_copy(_kernel_swi_regs *r)
             g_gfxv_copy_overlap_error_count++;
             g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
             copy_last_fail_msg(err->errmess);
+            g_trace_outcome = TRACE_GPU_ERROR;
+            g_trace_errnum = (unsigned int) err->errnum;
             return; /* too large for the scratch-buffer path, or a GPU
                       * failure - leave unclaimed, same fail-safe
                       * reasoning as everywhere else in this driver. */
         }
 
         g_gfxv_copy_overlap_claimed_count++;
+        g_trace_outcome = TRACE_CLAIMED;
         r->r[4] = 0; /* claimed */
         return;
     }
@@ -645,6 +797,7 @@ static void handle_render_copy(_kernel_swi_regs *r)
                            g_gfxv_min_copy_bytes, g_gfxv_min_copy_rows))
     {
         g_gfxv_copy_skipped_count++;
+        g_trace_outcome = TRACE_SKIP_SMALL;
         return;
     }
 
@@ -655,12 +808,31 @@ static void handle_render_copy(_kernel_swi_regs *r)
         g_gfxv_copy_error_count++;
         g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
         copy_last_fail_msg(err->errmess);
+        g_trace_outcome = TRACE_GPU_ERROR;
+        g_trace_errnum = (unsigned int) err->errnum;
         return; /* GPU copy failed - leave unclaimed, same fail-safe
                   * reasoning as handle_render_fill. */
     }
 
     g_gfxv_copy_claimed_count++;
+    g_trace_outcome = TRACE_CLAIMED;
     r->r[4] = 0; /* claimed */
+}
+
+/* Record one fill/copy Render in the trace (when armed). */
+static void trace_render(unsigned int op, const _kernel_swi_regs *r,
+                          unsigned int outcome, unsigned int errnum)
+{
+    const unsigned int *p;
+
+    if (!g_trace_armed)
+        return;
+    p = (const unsigned int *) r->r[2];
+    if (op == RENDER_OP_FILL)
+        trace_event(3u, outcome, errnum, p[0], p[3], p[2], p[1], p[4]);
+    else
+        trace_event(4u, outcome, errnum, p[0], p[1], p[2], p[3],
+                    (p[4] & 0xFFFFu) | (p[5] << 16));
 }
 
 int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
@@ -672,8 +844,35 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
 
     g_gfxv_call_count++;
 
+    /* R4 = (driver << 24) | (head << 16) | reason. This module only ever
+     * looks at driver 0 / head 0 (the framestore it queries and renders to
+     * is driver 0's), so a call addressed to any other driver or head is
+     * not ours. BCMVideo makes the same check; v0.06 masked R4 down to the
+     * reason and so would have claimed another driver's Render. */
+    if (((unsigned int) r->r[4] >> 16) != 0u)
+        return 1;
+
     reason = ((unsigned int) r->r[4]) & GRAPHICSV_REASON_MASK;
     op = (unsigned int) r->r[1];
+
+    /* Never claim these - just watch them go by, then let the real driver
+     * have them (VECTOR_PASSON, R4 untouched). They are how the kernel
+     * tells a display driver that the screen has changed under it, and
+     * they arrive BEFORE the full-screen clear of a new mode, which is the
+     * one call Service_ModeChange (issued afterwards) cannot protect. */
+    if (reason == GRAPHICSV_REASON_SETDMAADDRESS)
+    {
+        trace_event(2u, TRACE_NONE, 0u, (unsigned int) r->r[1], (unsigned int) r->r[0], 0u, 0u, 0u);
+        if ((unsigned int) r->r[0] == GVDAG_VRENDER)
+            v3d_accel_note_vrender((unsigned int) r->r[1]);
+        return 1;
+    }
+    if (reason == GRAPHICSV_REASON_SETMODE)
+    {
+        trace_event(1u, TRACE_NONE, 0u, (unsigned int) r->r[0], 0u, 0u, 0u, 0u);
+        v3d_accel_screen_invalidate();
+        return 1;
+    }
 
     if (reason != GRAPHICSV_REASON_RENDER)
         return 1; /* not ours - VECTOR_PASSON, R4 untouched */
@@ -689,17 +888,21 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
         if (g_gfxv_busy)
         {
             g_gfxv_reentrant_count++;
+            trace_render(op, r, TRACE_REENTERED, 0u);
             return 1; /* leave unclaimed - do NOT touch shared PMP
                         * scratch state while a call is already in
                         * flight; R4 untouched */
         }
 
         g_gfxv_busy = 1;
+        g_trace_outcome = TRACE_NONE;
+        g_trace_errnum = 0;
         if (op == RENDER_OP_FILL)
             handle_render_fill(r);
         else
             handle_render_copy(r);
         g_gfxv_busy = 0;
+        trace_render(op, r, g_trace_outcome, g_trace_errnum);
     }
     /* op 0 (no-op) and any other value: not ours, R4 left untouched */
 

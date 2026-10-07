@@ -21,9 +21,15 @@ REM many calls were really accelerated (GPU% should be ~100 in the GPU
 REM column; Dflt% is 0 where the limit declined the call).
 REM
 REM Uses OS_Plot via SYS directly (not VDU/PLOT statements) and
-REM ColourTrans_SetGCOL, same as RISCOSmark, so it works from a Task
-REM Window. It scribbles on the lower-left of your screen; that is
-REM harmless, drag a window over it to repaint.
+REM ColourTrans_SetGCOL, same as RISCOSmark. It scribbles on the lower-left of
+REM your screen; that is harmless, drag a window over it to repaint.
+REM
+REM HOW TO RUN IT: double-click it in the Filer (a "Run ..." window), or use the
+REM command line (F12). Do NOT type *FillCopyBench into a desktop Task Window:
+REM a Task Window swallows OS_Plot (TaskWindow claims WrchV and the kernel then
+REM sends the plot as bytes), so nothing is drawn and every number is just BASIC
+REM overhead. (This header used to claim the opposite. It was wrong: every
+REM successful run was started from the Filer.)
 REM
 REM Needs the module built with V3D_AccelLimits (SWI 30).
 REM Before running: *RMLoad the built V3DDriver,ffa yourself.
@@ -60,7 +66,7 @@ orgx% = vout%!28 : orgy% = vout%!32
 REM Identify exactly which script and which module build are running, since
 REM files are copied between machines by hand.
 PROCmodinfo
-PRINT "FillCopyBench v4 (solid-colour fill) - module: "; help$
+PRINT "FillCopyBench v5 (solid-colour fill) - module: "; help$
 PRINT "Screen depth: "; 1 << log2bpp%; " bits per pixel"
 PRINT "Graphics window (pixels): "; gwl%; ","; gwb%; " to "; gwr%; ","; gwt%
 PRINT "Graphics origin (OS units): "; orgx%; ","; orgy%
@@ -286,8 +292,11 @@ DEF PROCtable(op%)
       IF cu% < 1 THEN cu% = 1
       IF gu% < 1 THEN gu% = 1
       IF du% < 1 THEN du% = 1
-      s1% = cu% * 100 DIV gu%
-      s2% = cu% * 100 DIV du%
+      REM speedups from the raw operation counts, not from the rounded microseconds:
+      REM (time ratio = inverse count ratio) - at 2-3 us per op the rounding alone used
+      REM to make a harmless 0.94x print as 0.66x and trip the DEFAULT LOSES mark
+      s1% = all%(op%, i%) * 100 DIV cpu%(op%, i%)
+      s2% = dft%(op%, i%) * 100 DIV cpu%(op%, i%)
       mark$ = ""
       IF s1% < 100 THEN mark$ = "  GPU slower"
       IF s2% < 90 THEN mark$ = mark$ + "  DEFAULT LOSES"

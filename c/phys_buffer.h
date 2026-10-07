@@ -67,6 +67,20 @@ _kernel_oserror *pmp_alloc(pmp_area_t *area, unsigned int page_index,
                             unsigned int *phys_addr_out,
                             void **logical_ptr_out);
 
+/* Memory type for the logical mapping of claimed pages. */
+#define PMP_ATTR_STRONGLY_ORDERED 0u /* non-cacheable, non-bufferable */
+#define PMP_ATTR_NC_BUFFERABLE    1u /* non-cacheable, bufferable (Normal) */
+
+/* pmp_alloc with an explicit memory type (pmp_alloc itself uses
+ * PMP_ATTR_STRONGLY_ORDERED, as it always has). */
+_kernel_oserror *pmp_alloc_policy(pmp_area_t *area, unsigned int page_index,
+                                   unsigned int num_pages, unsigned int attr,
+                                   unsigned int *phys_addr_out,
+                                   void **logical_ptr_out);
+
+/* Removes the whole area and every page in it (OS_DynamicArea 1). */
+_kernel_oserror *pmp_destroy(pmp_area_t *area);
+
 /*
  * Releases (unmaps, then unclaims) any pages currently held at
  * [page_index, page_index+num_pages) in `area`. Safe to call on a
@@ -82,9 +96,9 @@ _kernel_oserror *pmp_release(pmp_area_t *area, unsigned int page_index,
 /*
  * Defensive crash-recovery cleanup (see phys_buffer.c for the full
  * reasoning): finds any existing Dynamic Area already named `name`
- * (left behind by a crashed previous instance that never got to run
- * module_final) and releases its physical pages, without attempting
- * to remove the area itself. Call once per name at module_init, before
+ * (left behind by a previous instance that never got to run
+ * module_final, or by v0.06 and earlier which never removed theirs) and
+ * removes it, pages and all (pmp_destroy). Call once per name at module_init, before
  * this instance creates its own PMP area of that name. Never fails
  * module_init - always returns NULL.
  */
