@@ -3581,6 +3581,17 @@ and 1024x768 at 16bpp; back to 1920x1080 32bpp), every one with the GPU on:
   (1.13x) and copies and scrolls from 32x32 (2.1x); the slowest default result is 0.92x at a
   16x16 fill and 0.95-0.96x at 8x8 copies, i.e. the cost of declining a call (about 0.1-0.25 us).
 
+**RISCOSmark, 0.06 against 0.11 (2026-10-07, 1920x1080 16M, one reboot per module).** Rectangle
+Copy, the one RISCOSmark test that reaches GraphicsV, went from 3,306 (1,366% of the RiscPC
+baseline) on 0.06 to 7,750 (3,202%) on 0.11: 2.34x, and 5.8x the 1,333 of the CPU alone. Every
+other test is flat within run-to-run noise (Memory 55,567 -> 55,910; Icon Plotting 55,178 ->
+55,742; Draw Path 14,488 -> 14,448; Draw Fill 2,635 -> 2,633; Draw Render 5,263 -> 5,257), so the
+gain is the driver's and not the machine's. Counters after each run (test/GpuCheck.bas): 0.11 took
+6,746 of 6,865 copies and 1,390 of 1,451 scrolls on the GPU (98%, none failed), against 2,869 of
+3,098 and 526 of 759 on 0.06 (88%); the benchmark ran 2.2x as many copies in the same time. The
+desktop tests (Draw Fill, Draw Render, Icon Plotting) do not reach the accelerator at all, so a
+faster driver cannot move them.
+
 ## Performance: where the GPU actually wins, and why small operations are left to the CPU (2026-10-04, hardware-verified)
 
 With 16bpp done, the question was whether anything could raise performance
