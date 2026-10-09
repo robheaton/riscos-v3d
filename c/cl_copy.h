@@ -111,18 +111,18 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
                                    unsigned int *tiles_y_out);
 
 /*
- * Overlap-safe version of v3d_copy_screen: routes through a freshly-
- * allocated scratch buffer (source -> scratch, then scratch -> dest),
- * so it's correct for ANY overlap, not just shifts of at least a full
- * tile - see this header's top comment and cl_copy.c's own comment on
- * v3d_copy_screen_overlapping for the full reasoning.
+ * Overlap-safe version of v3d_copy_screen, correct for ANY overlap, not just
+ * shifts of at least a full tile. By default (g_v3d_tune.overlap_mode 1) it is
+ * ONE pass over the tiles in an order chosen from the sign of the shift (see
+ * cl_copy.c); with overlap_mode 0 it goes through a bounce buffer instead
+ * (source -> scratch, then scratch -> dest).
  *
- * Bounded to pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL,
- * phys_buffer.h) for the scratch buffer - a copy larger than that is
- * refused
- * with a clear error rather than silently chunked, so the caller's own
- * fallback (leaving the GraphicsV call unclaimed, same as everywhere
- * else in this driver) takes over instead.
+ * Size: the one-pass mode has no cap of its own - a rectangle of more than
+ * max_job_tiles tiles is cut into bands (0.12), so full-screen scrolls at
+ * 1920x1200 or 4K are accelerated. The bounce-buffer mode is bounded by the
+ * buffer's page cap (PMP_MAX_PAGES_PER_CALL, phys_buffer.h) and refuses a bigger
+ * copy with a clear error, so the caller's own fallback (leaving the GraphicsV
+ * call unclaimed, same as everywhere else in this driver) takes over.
  *
  * `bytes_per_pixel`/`format_code` - see v3d_copy_screen's own comment,
  * same contract and same real-hardware-derived values.

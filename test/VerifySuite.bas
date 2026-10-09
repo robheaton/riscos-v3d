@@ -21,7 +21,7 @@ REM kernel source and TaskWindow source on 2026-10-07). The script checks for th
 REM and says so. It takes a few minutes and scribbles on the right-hand part of
 REM the screen.
 REM
-REM Before running: reboot, then *RMLoad V3DDriver,ffa (version 0.10).
+REM Before running: reboot, then *RMLoad V3DDriver,ffa (version 0.10 or later; options 5 and 6 need 0.12).
 
 NFILL% = 150 : NCOPY% = 150 : NOVL% = 150
 REM sizes that are most likely to expose tile-edge and packing bugs
@@ -33,7 +33,7 @@ DATA 1,2,3,4,7,8,15,16,17,31,32,33,63,64,65,100,127,128,129,191,192,193
 
 DIM vin% 80, vout% 80, lim%(4)
 DIM prx%(15), pry%(15), prw%(15), prh%(15), prc%(15)
-limsaved% = FALSE : tuned% = FALSE : clk0% = 0
+limsaved% = FALSE : tuned% = FALSE : banded% = FALSE : clk0% = 0
 stage$ = "setup"
 ON ERROR PROCfail
 
@@ -50,16 +50,21 @@ IF bpp% <> 4 AND bpp% <> 2 THEN PRINT "Needs a 16 or 32 bits-per-pixel mode." : 
 SYS "V3D_AccelProfile", 2 TO wedged%
 IF wedged% = 1 THEN PRINT "The GPU is already switched off (fail-stop). Reboot and try again." : END
 
-IF INSTR(help$, "0.10") = 0 AND INSTR(help$, "0.11") = 0 THEN PRINT "WARNING: this script needs V3DDriver 0.10 or later (V3D_AccelTune 8 = clock)."
+IF INSTR(help$, "0.10") = 0 AND INSTR(help$, "0.11") = 0 AND INSTR(help$, "0.12") = 0 THEN PRINT "WARNING: this script needs V3DDriver 0.10 or later (V3D_AccelTune 8 = clock)."
 PRINT
 PRINT "Which settings should be tested?"
 PRINT "  1 = the 0.10 defaults: scratch_attr=1, zero_mode=1, ONE-PASS scrolls, clock as found"
 PRINT "  2 = the same but with the older TWO-PASS scrolls (overlap_mode=0)"
 PRINT "  3 = the old 0.06-style settings (strongly-ordered scratch, full zeroing, two-pass scrolls)"
 PRINT "  4 = the 0.10 defaults with the V3D clock raised to the firmware's maximum (experiment)"
+PRINT "  5 = BANDING (needs 0.12): the defaults, but ONE TILE ROW (64 pixel rows) per GPU job, so every"
+PRINT "      rectangle taller than 64 rows is split into several jobs - the way a screen taller"
+PRINT "      than 1088 rows is handled; fills, copies and scrolls all banded"
+PRINT "  6 = BANDING with 2 tiles per job: bands of 2 tile rows for the narrowest rectangles, 1 row otherwise"
 REPEAT
   k$ = GET$
-UNTIL k$ = "1" OR k$ = "2" OR k$ = "3" OR k$ = "4"
+UNTIL k$ = "1" OR k$ = "2" OR k$ = "3" OR k$ = "4" OR k$ = "5" OR k$ = "6"
+IF (k$ = "5" OR k$ = "6") AND INSTR(help$, "0.12") = 0 THEN PRINT "Options 5 and 6 need V3DDriver 0.12 (V3D_AccelTune 9)." : END
 SYS "V3D_AccelLimits", -1, -1, -1, -1, -1 TO lim%(0), lim%(1), lim%(2), lim%(3), lim%(4)
 limsaved% = TRUE
 tuned% = TRUE
@@ -68,6 +73,13 @@ PRINT "V3D clock: "; clk0%; " MHz now, firmware maximum "; clkmax%; " MHz"
 IF k$ = "1" THEN PROCapply(1, 1, 1) : PRINT "Testing: defaults (zero_mode=1, scratch_attr=1, overlap_mode=1 = one-pass scrolls)"
 IF k$ = "2" THEN PROCapply(1, 1, 0) : PRINT "Testing: zero_mode=1, scratch_attr=1, overlap_mode=0 (two-pass scrolls)"
 IF k$ = "3" THEN PROCapply(0, 0, 0) : PRINT "Testing: zero_mode=0, scratch_attr=0, overlap_mode=0 (0.06-style)"
+IF k$ = "5" OR k$ = "6" THEN
+  PROCapply(1, 1, 1)
+  lim9% = 1 : IF k$ = "6" THEN lim9% = 2
+  banded% = TRUE
+  SYS "V3D_AccelTune", 9, lim9% TO oldmax%
+  PRINT "Testing: defaults with a job limit of "; lim9%; " tile(s) (was "; oldmax%; "): big rectangles are BANDED"
+ENDIF
 IF k$ = "4" THEN
   PROCapply(1, 1, 1)
   SYS "V3D_AccelTune", 8, clkmax% TO clknow%
@@ -166,11 +178,23 @@ PROCrestore
 PRINT
 PRINT "Scrolls: "; NOVL%; " GPU scrolls cost "; jobs%; " GPU jobs; the driver saw "; ov1% - ov0%; " of them as overlapping."
 PRINT "  (one-pass scrolls: jobs = "; NOVL%; "; two-pass: jobs = "; NOVL% + ov1% - ov0%; ")"
+nbandfail% = 0
+IF banded% THEN
+  PRINT "  (banded: a scroll taller than its bands costs several jobs, so more jobs than scrolls is expected)"
+  IF jobs% < NOVL% + NOVL% DIV 4 THEN
+    PRINT "*** the scrolls were NOT split into bands as intended ("; jobs% - NOVL%; " extra jobs) - this run did not exercise the banding"
+    nbandfail% = 1
+  ENDIF
+ENDIF
 PRINT "RESULT fills "; nfill% - bfill%; "/"; nfill%; " ok;  copies "; ncopy% - bcopy%; "/"; ncopy%; " ok;  scrolls "; novl% - bovl%; "/"; novl%; " ok;  not accelerated "; nskip%
-IF bfill% + bcopy% + bovl% + nskip% = 0 THEN
+IF bfill% + bcopy% + bovl% + nskip% + nbandfail% = 0 THEN
   PRINT "ALL "; nfill% + ncopy% + novl%; " CASES IDENTICAL TO THE CPU."
 ELSE
-  PRINT "*** DIFFERENCES FOUND - see the FAIL lines above."
+  IF bfill% + bcopy% + bovl% + nskip% = 0 THEN
+    PRINT "The comparisons found no differences, but the banding was not exercised - do not count this run."
+  ELSE
+    PRINT "*** DIFFERENCES FOUND - see the FAIL lines above."
+  ENDIF
 ENDIF
 END
 
@@ -197,6 +221,9 @@ DEF PROCrestore
   REM Limits first (cannot fail), then the fallible tuning and clock calls: after a GPU
   REM timeout the driver refuses them, and anything after a refusal would be skipped.
   IF limsaved% THEN SYS "V3D_AccelLimits", lim%(0), lim%(1), lim%(2), lim%(3), lim%(4)
+  REM the job limit next: setting 9 never fails, and if it stayed at 6 after a timeout every
+  REM real operation wider than 6 tiles would be refused until the next reboot
+  IF banded% THEN SYS "V3D_AccelTune", 9, 510
   SYS "V3D_AccelStart"
   IF clk0% > 0 THEN SYS "V3D_AccelTune", 8, clk0%
   IF tuned% THEN PROCapply(1, 1, 1)

@@ -77,7 +77,7 @@ ON ERROR PROCfail
 
 PROCmodinfo
 PRINT "TuneBench v1 - module: "; help$
-IF INSTR(help$, "0.10") = 0 AND INSTR(help$, "0.11") = 0 THEN PRINT "WARNING: this script needs V3DDriver 0.10 or later (V3D_AccelTune 8 = clock)."
+IF INSTR(help$, "0.10") = 0 AND INSTR(help$, "0.11") = 0 AND INSTR(help$, "0.12") = 0 THEN PRINT "WARNING: this script needs V3DDriver 0.10 or later (V3D_AccelTune 8 = clock)."
 
 SYS "V3D_PowerOn" TO pok%, prate%
 IF pok% <> 1 THEN PRINT "FAIL: V3D_PowerOn returned ok="; pok% : END

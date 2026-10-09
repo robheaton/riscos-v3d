@@ -86,14 +86,14 @@ static inline unsigned int bytes_to_pages(unsigned int bytes)
  * explicit clear+store pair per tile, no primitives (see this file's
  * top comment).
  */
-static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
-                                   unsigned int width, unsigned int height,
-                                   unsigned int clear_color_rgba,
-                                   unsigned int target_phys,
-                                   unsigned int target_stride,
-                                   unsigned int format_code,
-                                   unsigned int *tiles_x_out,
-                                   unsigned int *tiles_y_out)
+static _kernel_oserror *run_fill_job(pmp_area_t *pmp, unsigned int base_page,
+                                       unsigned int width, unsigned int height,
+                                       unsigned int clear_color_rgba,
+                                       unsigned int target_phys,
+                                       unsigned int target_stride,
+                                       unsigned int format_code,
+                                       unsigned int *tiles_x_out,
+                                       unsigned int *tiles_y_out)
 {
     unsigned int tiles_x, tiles_y, n_tiles;
     unsigned int col, row;
@@ -189,6 +189,55 @@ static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
 
     *tiles_x_out = tiles_x;
     *tiles_y_out = tiles_y;
+    return NULL;
+}
+
+/*
+ * A fill of any size. One GPU job holds at most WORST_CASE_N_TILES tiles (the scratch
+ * slot is sized for that once and never grown inside a GraphicsV call), so a bigger
+ * rectangle is cut into horizontal BANDS, each a whole number of tile rows tall, and each
+ * band is its own job. Bands are disjoint rectangles, so a fill needs no ordering and no
+ * care at the joins: band k starts exactly done = k * band_h rows below the top, its
+ * target address is that many rows further on, and its tile grid is the tile grid of the
+ * whole rectangle (band_h is a multiple of 64). A rectangle of up to 510 tiles takes the
+ * unchanged single-job path (511 and 512 tiles, which the old page-granular scratch check happened
+ * to accept as one job, are now two: one extra ~9 us job on a ~1.5 ms operation). Everything that can be checked up front (dimensions, the
+ * scratch slot) is checked by the first band, before anything is drawn.
+ */
+static _kernel_oserror *run_fill(pmp_area_t *pmp, unsigned int base_page,
+                                   unsigned int width, unsigned int height,
+                                   unsigned int clear_color_rgba,
+                                   unsigned int target_phys,
+                                   unsigned int target_stride,
+                                   unsigned int format_code,
+                                   unsigned int *tiles_x_out,
+                                   unsigned int *tiles_y_out)
+{
+    unsigned int band_h, nbands, k, y0, h, tx, ty;
+    _kernel_oserror *err;
+
+    err = v3d_band_height(width, height, &band_h);
+    if (err)
+        return err;
+
+    if (height <= band_h)
+        return run_fill_job(pmp, base_page, width, height, clear_color_rgba,
+                             target_phys, target_stride, format_code,
+                             tiles_x_out, tiles_y_out);
+
+    nbands = v3d_band_count(height, band_h);
+    for (k = 0; k < nbands; k++)
+    {
+        v3d_band_span(height, band_h, k, &y0, &h);
+        err = run_fill_job(pmp, base_page, width, h, clear_color_rgba,
+                            target_phys + y0 * target_stride, target_stride,
+                            format_code, &tx, &ty);
+        if (err)
+            return err;
+    }
+
+    *tiles_x_out = div_round_up(width, TILE_SIZE);
+    *tiles_y_out = div_round_up(height, TILE_SIZE);
     return NULL;
 }
 

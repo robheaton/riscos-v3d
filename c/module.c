@@ -33,6 +33,7 @@
 #include "cl_common.h"
 #include "gfxv_accel.h"
 #include "accel_api.h"
+#include "screen_base.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -358,6 +359,14 @@ static _kernel_oserror *ensure_pmp_fill(void)
  * Observing that call gives the real target. Until one has been seen, a
  * screen whose write bank and display bank differ is declined rather than
  * guessed at.
+ *
+ * (d) 0.12: the write address belongs to ONE framebuffer. It is forgotten at the start of
+ * every mode change (v3d_accel_mode_changing: GraphicsV 2 and Service_PreModeChange), because
+ * the display driver then allocates a new framebuffer, usually somewhere else. Without that,
+ * a desktop mode change left the old address in force: every fill was declined (error 35)
+ * until the next mode change - found on the hardware by ModeChangeTest, whose first probe
+ * ran in a mode the desktop had been switched to after the module was loaded. See
+ * screen_base.h, which holds the rule and is tested on the host.
  */
 static int g_screen_framestore_verified = 0;
 static _kernel_oserror *g_screen_cached_err = NULL; /* static blocks only */
@@ -365,8 +374,7 @@ static v3d_screen_info_t g_screen_info;
 static unsigned int g_screen_phys_base = 0;
 static unsigned int g_screen_fs_base = 0;
 static unsigned int g_screen_fs_size = 0;
-static unsigned int g_vrender_valid = 0;
-static unsigned int g_vrender_phys = 0;
+static v3d_vrender_t g_vrender = { 0, 0 };
 
 /* Wrap-safe: is [start, start+len) inside 0..limit inclusive, len >= 1? */
 static inline int span_ok(unsigned int start, unsigned int len, unsigned int limit)
@@ -382,8 +390,17 @@ void v3d_accel_screen_invalidate(void)
 
 void v3d_accel_note_vrender(unsigned int phys)
 {
-    g_vrender_valid = 1;
-    g_vrender_phys = phys;
+    v3d_vrender_note(&g_vrender, phys);
+    v3d_accel_screen_invalidate();
+}
+
+/* A mode change is starting (GraphicsV 2, Service_PreModeChange): the display driver is about
+ * to allocate a new framebuffer, so a write address learned for the old one is wrong for it.
+ * Forget it - the kernel's report for the new mode, if one comes, replaces it, and if none
+ * comes the framestore base is used. See screen_base.h. */
+void v3d_accel_mode_changing(void)
+{
+    v3d_vrender_forget(&g_vrender);
     v3d_accel_screen_invalidate();
 }
 
@@ -443,23 +460,19 @@ static _kernel_oserror *ensure_screen_framestore(void)
         return g_screen_cached_err;
     }
 
-    base = fs_base;
-    if (g_vrender_valid)
+    switch (v3d_choose_base(&g_vrender, fs_base, fs_size, vis_bytes,
+                            g_screen_info.screen_start, g_screen_info.display_start, &base))
     {
-        if (g_vrender_phys < fs_base ||
-            (unsigned long long) (g_vrender_phys - fs_base) + vis_bytes > fs_size)
-        {
+        case V3D_BASE_ERR_VRENDER:
             g_screen_cached_err = &err_vrender;
             g_screen_framestore_verified = 1;
             return g_screen_cached_err;
-        }
-        base = g_vrender_phys;
-    }
-    else if (g_screen_info.screen_start != g_screen_info.display_start)
-    {
-        g_screen_cached_err = &err_bank;
-        g_screen_framestore_verified = 1;
-        return g_screen_cached_err;
+        case V3D_BASE_ERR_BANK:
+            g_screen_cached_err = &err_bank;
+            g_screen_framestore_verified = 1;
+            return g_screen_cached_err;
+        default:
+            break;
     }
 
     g_screen_fs_base = fs_base;
@@ -552,8 +565,10 @@ void v3d_service_handler(int service_number, _kernel_swi_regs *r, void *pw)
      * Service_PreModeChange (before it) - see the screen cache comment
      * above for why the vector hook, not these, is what protects the
      * mode-change CLS. */
-    if (service_number == 0x46 || service_number == 0x4D)
-        v3d_accel_screen_invalidate();
+    if (service_number == 0x4D)
+        v3d_accel_mode_changing();    /* before: forget the old framebuffer's write address */
+    else if (service_number == 0x46)
+        v3d_accel_screen_invalidate(); /* after: rebuild from the new mode's variables */
 }
 
 /*
@@ -1329,7 +1344,11 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
  *   8 V3D clock in MHz: sets it (R1 = MHz, clamped to the firmware's maximum)
  *     or reads it (R1 = -1). Returns R0 = the rate now in force in MHz, R1 =
  *     the firmware's maximum in MHz. Foreground only, never during a job.
- * Defaults (v0.10): zero_mode 1, scratch_attr 1, overlap_mode 1, clock left as the
+ *   9 max_job_tiles (1-510, -1 reads): the most 64x64 tiles one GPU job may hold. A
+ *     fill or copy of more tiles is cut into bands of whole tile rows that fit (v3d_band_height
+ *     in cl_common.c), at least one row per band, so 1 means "one row of tiles per job".
+ *     Lowering it is how banding is tested on a screen that never needs it.
+ * Defaults (v0.10): zero_mode 1, scratch_attr 1, overlap_mode 1, max_job_tiles 510, clock left as the
  * firmware has it. Setting 0, 4 and 7 to 0 and resetting (key 5) restores the
  * v0.06 behaviour exactly. Settings 1-3 (cl_mode, flush_mode, render_only), which
  * existed in v0.07-v0.09, were removed in v0.10: they saved nothing.
@@ -1408,6 +1427,19 @@ static _kernel_oserror *accel_tune(_kernel_swi_regs *r)
         case 6:
             r->r[0] = g_v3d_wedged ? 1u : 0u;
             v3d_gpu_rearm();
+            return NULL;
+
+        case 9:
+            /* Tiles in one GPU job (1-510, default 510): a bigger fill or copy is cut into
+             * bands of that many tiles or fewer (v3d_band_height). Lowering it is how the
+             * banding is tested on a screen that would never need it. */
+            r->r[0] = g_v3d_tune.max_job_tiles;
+            if (val != 0xFFFFFFFFu)
+            {
+                if (val < 1u || val > WORST_CASE_N_TILES)
+                    return &err_bad_setting;
+                g_v3d_tune.max_job_tiles = val;
+            }
             return NULL;
 
         case 8:
@@ -2648,8 +2680,8 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 r->r[0] = g_v3d_wedged ? 1u : 0u;
                 r->r[1] = g_v3d_wedge_count;
                 r->r[2] = v3d_time_is_fine();
-                r->r[3] = g_vrender_valid;
-                r->r[4] = g_vrender_phys;
+                r->r[3] = g_vrender.valid;
+                r->r[4] = g_vrender.phys;
                 r->r[5] = g_screen_phys_base;
                 r->r[6] = g_screen_fs_base;
                 r->r[7] = g_v3d_irq_rescue_count;

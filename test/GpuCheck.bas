@@ -48,6 +48,33 @@ ELSE
   PRINT "(This is an older module: it does not report the too-small counts or the GPU health.)"
 ENDIF
 
+REM Interrupt accounting, screen declines and the details of any lost-interrupt rescue (0.11 and later).
+IF INSTR(help$, "0.11") <> 0 OR INSTR(help$, "0.12") <> 0 THEN
+  SYS "V3D_AccelProfile", 7 TO i0%, i1%, i2%, i3%, i4%, i5%, i6%, i7%
+  PRINT
+  PRINT "Interrupts: "; i3%; " bin and "; i4%; " render seen for "; i5%; " jobs started; empty interrupts: "; i2%
+  PRINT "  not accounted for: "; i5% - i3%; " bin, "; i5% - i4%; " render (0 or 1 is normal; more means interrupts were lost)"
+  IF i6% = 0 THEN
+    PRINT "Screen declined for a fill or copy: never"
+  ELSE
+    PRINT "*** Screen declined for a fill or copy "; i6%; " time(s), last error number "; i7%
+  ENDIF
+  IF i0% > 0 THEN
+    n% = i0% : IF n% > 4 THEN n% = 4
+    PRINT "Lost-interrupt rescues so far: "; i0%; " (details of the first "; n%; "):"
+    FOR k% = 0 TO n% - 1
+      SYS "V3D_AccelProfile", 8, k% TO a%, b%, c%, d%, e%, f%, g%, h%
+      w$ = "render" : IF ((a% >> 8) AND 255) = 1 THEN w$ = "bin"
+      t$ = "fill" : IF ((a% >> 16) AND 255) <> 0 THEN t$ = "copy"
+      late$ = "no" : IF ((g% >> 16) AND 1) = 1 THEN late$ = "YES"
+      PRINT "  rescue "; k% + 1; ": waited "; b%; " us for the "; w$; " job of a "; t$
+      PRINT "    INT_STS=&"; STR$~(c%); " INT_MSK=&"; STR$~(d%); " hub=&"; STR$~(e%); " thread CS=&"; STR$~(f%)
+      PRINT "    frame counter moved by "; g% AND &FFFF; "; the interrupt arrived late anyway: "; late$
+      PRINT "    jobs minus interrupts then: bin "; h% AND &FFFF; ", render "; (h% >> 16) AND &FFFF
+    NEXT
+  ENDIF
+ENDIF
+
 PRINT
 total% = fclaimed% + cdirect% + covl%
 IF total% = 0 THEN

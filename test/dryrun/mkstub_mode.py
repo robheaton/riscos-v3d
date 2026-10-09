@@ -66,10 +66,10 @@ for line in src:
     out.append(stmt)
 
 VARS = r'''
-DIM scr% 9000000
+DIM scr% 10000000
 DIM jobs%(1)
 DIM modmem% 200
-DIM tmp% 200000
+DIM tmp% 10000000
 DIM pts%(3)
 sr0% = 0 : sr1% = 0 : sr2% = 0 : sr3% = 0 : sr4% = 0 : sr5% = 0 : sr6% = 0 : sr7% = 0
 accel% = 0 : gcol% = 0 : nfill% = 0 : ncopy% = 0 : novl% = 0
@@ -184,6 +184,8 @@ DEF PROCsys_plot(a%,b%,c%)
   IF a% = 101 THEN
     x1% = pts%(2) : y1% = pts%(3) : x2% = b% : y2% = c%
     w% = x2% - x1% + 1 : h% = y2% - y1% + 1
+    REM -BUG 5 emulation: a GPU job over 1088 rows loses everything past the first 1088 rows (a missing band)
+    IF accel% = 1 AND bugmode% = 5 AND h% > 1088 THEN y2% = y1% + 1087 : h% = 1088
     IF accel% = 1 AND bugmode% <> 4 THEN
       ncalls% += 1 : nrender% += 1 : nfops% += 1 : nsolid% += 1
       IF bugmode% <> 3 THEN nfill% += 1
@@ -199,6 +201,7 @@ DEF PROCsys_plot(a%,b%,c%)
     x1% = pts%(0) : y1% = pts%(1) : x2% = pts%(2) : y2% = pts%(3)
     w% = x2% - x1% + 1 : h% = y2% - y1% + 1
     dx% = b% : dy% = c%
+    IF accel% = 1 AND bugmode% = 5 AND h% > 1088 THEN h% = 1088
     ovl% = (x1% < dx% + w%) AND (dx% < x1% + w%) AND (y1% < dy% + h%) AND (dy% < y1% + h%)
     IF accel% = 1 THEN
       IF ovl% THEN novl% += 1 ELSE ncopy% += 1

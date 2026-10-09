@@ -13,7 +13,7 @@
 /* Tunables, health, profile                                         */
 /* ---------------------------------------------------------------- */
 
-v3d_tune_t g_v3d_tune = { 1, 1, 1 };
+v3d_tune_t g_v3d_tune = { 1, 1, 1, WORST_CASE_N_TILES };
 
 volatile unsigned int g_v3d_wedged = 0;
 unsigned int g_v3d_wedge_count = 0;
@@ -35,8 +35,7 @@ static _kernel_oserror err_bad_dims = {
 };
 
 static _kernel_oserror err_too_big = {
-    14, "V3DDriver: rectangle too large for the cached scratch buffers "
-        "(screens above 1920x1088 are not accelerated yet)"
+    14, "V3DDriver: rectangle too large for the cached scratch buffers"
 };
 
 static _kernel_oserror err_no_slot = {
@@ -461,6 +460,30 @@ _kernel_oserror *v3d_check_dims(unsigned int width, unsigned int height)
 {
     if (width == 0u || height == 0u || width > 16384u || height > 16384u)
         return &err_bad_dims;
+    return NULL;
+}
+
+_kernel_oserror *v3d_band_height(unsigned int width, unsigned int height,
+                                 unsigned int *band_h_out)
+{
+    unsigned int tiles_x, max_tiles, rows;
+    _kernel_oserror *err;
+
+    err = v3d_check_dims(width, height);
+    if (err)
+        return err;
+
+    max_tiles = g_v3d_tune.max_job_tiles;
+    if (max_tiles < 1u || max_tiles > WORST_CASE_N_TILES)
+        max_tiles = WORST_CASE_N_TILES;
+
+    tiles_x = v3d_div_round_up(width, TILE_SIZE);
+    rows = max_tiles / tiles_x; /* whole tile rows that fit one job */
+    if (rows == 0u)
+        rows = 1u; /* a limit below one row of tiles still takes whole rows: a row is at most 256
+                    * tiles (16384 px / 64), always inside the slot, so this never refuses */
+
+    *band_h_out = rows * TILE_SIZE;
     return NULL;
 }
 

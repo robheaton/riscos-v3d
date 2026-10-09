@@ -36,6 +36,7 @@ _kernel_oserror *v3d_accel_get_screen_log2_bpp(unsigned int *log2_bpp_out);
  * the physical address the VDU now writes to (GraphicsV 6, R0=3). */
 void v3d_accel_screen_invalidate(void);
 void v3d_accel_note_vrender(unsigned int phys);
+void v3d_accel_mode_changing(void);
 
 /* OS_ReadMonotonicTime wrapper (centiseconds). Only for the slow paths
  * that have no timer mapped - the hot path uses v3d_time_us(). */

@@ -5,3 +5,6 @@ cmhg/*.h
 test/host/scratch_test
 test/host/fpcheck
 test/host/overlap_order_test
+test/host/fillsim
+test/host/copysim
+test/host/cl_common_sim.o

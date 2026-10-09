@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "../../c/cl_bands.h" /* the driver's own band arithmetic (0.12) */
 
 #define TILE 64
 #define MEMW 700   /* pixels per memory row (stride) */
@@ -71,6 +72,22 @@ static void tile_copy(int sx, int sy, int dx, int dy, int w, int h, int mode)
     }
 }
 
+/* mode 2 (0.12): the same ordered copy, but cut into bands of band_h rows (a multiple of 64)
+ * the way run_copy in c/cl_copy.c does it: each band is its own job over a strip of the
+ * rectangle with the source and destination moved down by the strip's first row, and the
+ * bands are visited last-first when the shift is downwards (rows descending). Must give
+ * exactly the same memory as the one big job (and so as memmove). */
+static void tile_copy_banded(int sx, int sy, int dx, int dy, int w, int h, unsigned band_h)
+{
+    unsigned nb = v3d_band_count((unsigned) h, band_h), k, y0, hh;
+
+    for (k = 0; k < nb; k++)
+    {
+        v3d_band_span((unsigned) h, band_h, (dy > sy) ? nb - 1u - k : k, &y0, &hh);
+        tile_copy(sx, sy + (int) y0, dx, dy + (int) y0, w, (int) hh, 1);
+    }
+}
+
 static void fill_memory(void)
 {
     int x, y;
@@ -82,7 +99,7 @@ static void fill_memory(void)
 int main(int argc, char **argv)
 {
     long limit = argc > 1 ? atol(argv[1]) : 20000;
-    long cases = 0, bad_ordered = 0, bad_forward = 0, overlapping = 0;
+    long cases = 0, bad_ordered = 0, bad_forward = 0, bad_banded = 0, overlapping = 0;
     long k;
 
     for (k = 0; k < limit; k++)
@@ -109,7 +126,7 @@ int main(int argc, char **argv)
             overlapping += ov;
         }
 
-        for (mode = 0; mode <= 1; mode++)
+        for (mode = 0; mode <= 2; mode++)
         {
             int bad = 0;
             fill_memory();
@@ -124,7 +141,10 @@ int main(int argc, char **argv)
                     for (x = 0; x < w; x++)
                         ref[dy + y][dx + x] = tmp[y][x];
             }
-            tile_copy(sx, sy, dx, dy, w, h, mode);
+            if (mode == 2)
+                tile_copy_banded(sx, sy, dx, dy, w, h, 64u * (1u + rnd(3)));
+            else
+                tile_copy(sx, sy, dx, dy, w, h, mode);
             for (y = 0; y < MEMH && !bad; y++)
                 for (x = 0; x < MEMW; x++)
                     if (mem[y][x] != ref[y][x]) { bad = 1; break; }
@@ -136,6 +156,12 @@ int main(int argc, char **argv)
                         printf("ORDERED FAILURE: %dx%d src(%d,%d) -> dest(%d,%d)\n", w, h, sx, sy, dx, dy);
                     bad_ordered++;
                 }
+                else if (mode == 2)
+                {
+                    if (bad_banded < 5)
+                        printf("BANDED FAILURE: %dx%d src(%d,%d) -> dest(%d,%d)\n", w, h, sx, sy, dx, dy);
+                    bad_banded++;
+                }
                 else
                     bad_forward++;
             }
@@ -146,5 +172,6 @@ int main(int argc, char **argv)
     printf("%ld cases (%ld genuinely overlapping)\n", cases, overlapping);
     printf("ordered by shift sign : %ld failures\n", bad_ordered);
     printf("always-forward order  : %ld failures (expected: many - this is the case the old analysis rejected)\n", bad_forward);
-    return bad_ordered != 0;
+    printf("ordered AND banded     : %ld failures (bands of 1-3 tile rows, as run_copy cuts a big job)\n", bad_banded);
+    return bad_ordered != 0 || bad_banded != 0;
 }

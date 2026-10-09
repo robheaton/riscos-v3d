@@ -22,6 +22,7 @@
 #include "kernel.h"
 #include "phys_buffer.h"
 #include "cl_builder.h"
+#include "cl_bands.h"
 
 #define TILE_SIZE 64u
 
@@ -91,6 +92,7 @@ typedef struct
     unsigned int zero_mode;
     unsigned int scratch_attr;
     unsigned int overlap_mode;
+    unsigned int max_job_tiles; /* 0.12: tiles in one GPU job; see v3d_band_height */
 } v3d_tune_t;
 
 extern v3d_tune_t g_v3d_tune;
@@ -207,13 +209,13 @@ void v3d_prof_reset(void);
 /* ---------------------------------------------------------------- */
 
 /*
- * Slot capacity: sized once, for a worst-case 30x17-tile rectangle
- * (1920x1088, the largest standard desktop mode). Anything bigger is
- * REFUSED, never handled by a per-call allocation: allocating inside a
- * GraphicsV call makes OS_DynamicArea broadcast Service_MemoryMoved from
- * inside a Wimp-dispatched call, which is what froze the machine under
- * Task Manager (README, "Task Manager freeze"). Larger screens are a
- * planned feature (size the slot from the mode), not a fallback.
+ * Slot capacity: sized once, for a worst-case 30x17-tile JOB (1920x1088). A job
+ * bigger than that is never handled by a per-call allocation: allocating inside a
+ * GraphicsV call makes OS_DynamicArea broadcast Service_MemoryMoved from inside a
+ * Wimp-dispatched call, which is what froze the machine under Task Manager (README,
+ * "Task Manager freeze"). Since 0.12 a fill or copy of more tiles than that is cut
+ * into bands of at most this many tiles, each its own job in the same slot (see
+ * v3d_band_height), so the slot never grows however big the screen is.
  */
 #define WORST_CASE_TILES_X 30u
 #define WORST_CASE_TILES_Y 17u
@@ -297,6 +299,24 @@ void v3d_build_rcl_header(cl_buf_t *rcl, unsigned int width, unsigned int height
 
 /* Rejects zero, and absurdly large, rectangles. */
 _kernel_oserror *v3d_check_dims(unsigned int width, unsigned int height);
+
+/*
+ * 0.12 BATCHING. One GPU job is limited to WORST_CASE_N_TILES (510) 64x64 tiles because
+ * the scratch slot is sized once, for that, and is never grown inside a GraphicsV call.
+ * A fill or copy of more tiles than that (1920x1200 is 570, 4K is 2040) is therefore cut
+ * into BANDS: horizontal strips whose height is a whole number of tile rows, each one a
+ * separate job over a strip of the same width. This returns the strip height in pixels
+ * for a width x height rectangle (a multiple of 64; >= height means one job is enough).
+ * Because every strip starts on a tile-row boundary of the original rectangle, the tile
+ * grid of the whole is exactly the tile grid of the strips put together - see cl_fill.c
+ * and cl_copy.c for what that buys. g_v3d_tune.max_job_tiles (V3D_AccelTune 9, 1-510)
+ * lowers the limit so the splitting can be tested on any screen; it is a target, not a
+ * wall: a band is always at least one whole tile row, so a width of more tiles than the
+ * limit is cut into one-row bands, not refused (0.12: the first version refused it, and
+ * VerifySuite's "6 tiles" option therefore split almost nothing).
+ */
+_kernel_oserror *v3d_band_height(unsigned int width, unsigned int height,
+                                 unsigned int *band_h_out);
 
 typedef struct
 {

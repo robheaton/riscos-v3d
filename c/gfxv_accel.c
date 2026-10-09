@@ -57,13 +57,11 @@ extern _kernel_oserror *v3d_accel_render_copy(unsigned int src_left, unsigned in
                                                 unsigned int width, unsigned int height);
 
 /* Overlap-safe twin, used instead when handle_render_copy's own
- * overlap check finds the rectangles intersect - routes through a
- * scratch buffer (see cl_copy.c's v3d_copy_screen_overlapping), so
- * it's correct for any overlap, not just shifts of at least a full
- * tile. Slower than the direct path (two full copy passes instead of
- * one) and bounded to a maximum size (see its own comment) - genuinely
- * large overlapping copies still fall back to this handler leaving the
- * call unclaimed, same as any other failure. */
+ * overlap check finds the rectangles intersect (a scroll). By default one
+ * ordered pass over the tiles (see cl_copy.c's v3d_copy_screen_overlapping),
+ * correct for any overlap; with overlap_mode 0 two passes through a bounce
+ * buffer, bounded to 8MB - a bigger copy then falls back to this handler
+ * leaving the call unclaimed, same as any other failure. */
 extern _kernel_oserror *v3d_accel_render_copy_overlapping(unsigned int src_left, unsigned int src_bottom,
                                                              unsigned int dest_left, unsigned int dest_bottom,
                                                              unsigned int width, unsigned int height);
@@ -870,7 +868,7 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
     if (reason == GRAPHICSV_REASON_SETMODE)
     {
         trace_event(1u, TRACE_NONE, 0u, (unsigned int) r->r[0], 0u, 0u, 0u, 0u);
-        v3d_accel_screen_invalidate();
+        v3d_accel_mode_changing();
         return 1;
     }
 

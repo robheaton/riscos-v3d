@@ -26,10 +26,10 @@ cmhg/V3DDriver.o: cmhg/V3DDriver.cmhg
 	$(CMUNGE) $(CMUNGEFLAGS) -o $@ $<
 
 # All .c files include the generated header, so it must exist first.
-c/module.o: c/module.c c/accel_api.h c/cl_common.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/cl_clear.h c/cl_fill.h c/cl_copy.h c/memsplit.h c/v3d_clock.h c/v3d_irq.h c/screen_info.h c/gfxv_accel.h cmhg/V3DDriver.h
+c/module.o: c/module.c c/screen_base.h c/accel_api.h c/cl_common.h c/cl_bands.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/cl_clear.h c/cl_fill.h c/cl_copy.h c/memsplit.h c/v3d_clock.h c/v3d_irq.h c/screen_info.h c/gfxv_accel.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/module.c -o c/module.o
 
-c/cl_copy.o: c/cl_copy.c c/cl_copy.h c/cl_common.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/v3d_irq.h
+c/cl_copy.o: c/cl_copy.c c/cl_copy.h c/cl_common.h c/cl_bands.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/v3d_irq.h
 	$(CC) $(CFLAGS) -c c/cl_copy.c -o c/cl_copy.o
 
 c/gfxv_accel.o: c/gfxv_accel.c c/gfxv_accel.h c/accel_api.h cmhg/V3DDriver.h
@@ -38,16 +38,16 @@ c/gfxv_accel.o: c/gfxv_accel.c c/gfxv_accel.h c/accel_api.h cmhg/V3DDriver.h
 c/screen_info.o: c/screen_info.c c/screen_info.h
 	$(CC) $(CFLAGS) -c c/screen_info.c -o c/screen_info.o
 
-c/phys_buffer.o: c/phys_buffer.c c/phys_buffer.h c/cl_common.h cmhg/V3DDriver.h
+c/phys_buffer.o: c/phys_buffer.c c/phys_buffer.h c/cl_common.h c/cl_bands.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/phys_buffer.c -o c/phys_buffer.o
 
 c/cl_clear.o: c/cl_clear.c c/cl_clear.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/sprite.h c/v3d_irq.h
 	$(CC) $(CFLAGS) -c c/cl_clear.c -o c/cl_clear.o
 
-c/cl_common.o: c/cl_common.c c/cl_common.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/v3d_irq.h
+c/cl_common.o: c/cl_common.c c/cl_common.h c/cl_bands.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/v3d_irq.h
 	$(CC) $(CFLAGS) -c c/cl_common.c -o c/cl_common.o
 
-c/cl_fill.o: c/cl_fill.c c/cl_fill.h c/cl_common.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/v3d_irq.h
+c/cl_fill.o: c/cl_fill.c c/cl_fill.h c/cl_common.h c/cl_bands.h c/cl_builder.h c/cl_packets.h c/v3d_regs.h c/io_map.h c/phys_buffer.h c/v3d_irq.h
 	$(CC) $(CFLAGS) -c c/cl_fill.c -o c/cl_fill.o
 
 c/sprite.o: c/sprite.c c/sprite.h
@@ -62,7 +62,7 @@ c/memsplit.o: c/memsplit.c c/memsplit.h c/bcmsupport.h
 c/v3d_clock.o: c/v3d_clock.c c/v3d_clock.h c/bcmsupport.h
 	$(CC) $(CFLAGS) -c c/v3d_clock.c -o c/v3d_clock.o
 
-c/v3d_irq.o: c/v3d_irq.c c/v3d_irq.h c/cl_common.h c/io_map.h c/v3d_regs.h cmhg/V3DDriver.h
+c/v3d_irq.o: c/v3d_irq.c c/v3d_irq.h c/cl_common.h c/cl_bands.h c/io_map.h c/v3d_regs.h cmhg/V3DDriver.h
 	$(CC) $(CFLAGS) -c c/v3d_irq.c -o c/v3d_irq.o
 
 V3DDriver,ffa: $(OBJS)
@@ -73,7 +73,9 @@ clean:
 
 # Host-side tests (run on the development machine, not RISC OS): the scratch
 # cache / control-list code built against a mock allocator, and the integer
-# floating-point replacement checked against the float original.
+# floating-point replacement checked against the float original, and (0.12) the REAL fill and copy
+# code - band splitting included - run against a mock job runner that plays the render control
+# list back on a model screen (fillsim, copysim).
 hosttest:
 	gcc -O1 -Wall -Itest/host/shim -Ic -o test/host/scratch_test test/host/scratch_test.c c/cl_common.c
 	./test/host/scratch_test
@@ -81,5 +83,10 @@ hosttest:
 	./test/host/fpcheck
 	gcc -O2 -Wall -o test/host/overlap_order_test test/host/overlap_order_test.c
 	./test/host/overlap_order_test
+	gcc -O1 -Wno-int-to-pointer-cast -Itest/host/shim -Ic -Dv3d_job_run=v3d_job_run_real -c -o test/host/cl_common_sim.o c/cl_common.c
+	gcc -O1 -Wno-int-to-pointer-cast -Itest/host/shim -Ic -o test/host/fillsim test/host/fillsim.c c/cl_fill.c test/host/cl_common_sim.o
+	./test/host/fillsim
+	gcc -O1 -Wno-int-to-pointer-cast -Itest/host/shim -Ic -o test/host/copysim test/host/copysim.c c/cl_copy.c test/host/cl_common_sim.o
+	./test/host/copysim
 
 .PHONY: all clean hosttest

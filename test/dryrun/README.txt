@@ -19,7 +19,9 @@ Generate and run (from this directory, with Brandy at ./brandy/root):
     python3 mkstub.py 0 ../AccelTest.bas stub_accel.bas
     printf ' ' | brandy/root/usr/bin/sbrandy -size 32M -quit stub_accel.bas
 
-    python3 mkstub_mode.py 0            # ModeChangeTest; 1 = the fake clear misses 40 rows
+    python3 mkstub_mode.py 0            # ModeChangeTest; 1 = the fake clear misses 40 rows; 2 = one 64x64 tile missed;
+                                        # 3 = screen declined; 4 = plots never reach the driver; 5 = a screen over 1088
+                                        # rows loses everything below row 1088 (a dropped band - must FAIL)
     brandy/root/usr/bin/sbrandy -size 64M -quit stub_mode.bas
 
 mkstub*.py turn every `SYS` into a call to a stub procedure, emulate OS_Plot

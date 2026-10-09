@@ -64,7 +64,7 @@ sr0% = 0 : sr1% = 0 : sr2% = 0 : sr3% = 0 : sr4% = 0 : sr5% = 0 : sr6% = 0 : sr7
 accel% = 0 : gcol% = 0 : nfillc% = 0 : ncopyc% = 0 : novlc% = 0
 lim0% = 16384 : lim1% = 32 : lim2% = 2048 : lim3% = 16 : lim4% = 2048
 sxl% = 1299 : syl% = 699 : sbpp% = SBPP : sll% = 1300 * sbpp% : bugmode% = BUGFLAG
-$(modmem% + 32) = "V3DDriver" + CHR$(9) + "0.07 (stub)"
+$(modmem% + 32) = "V3DDriver" + CHR$(9) + "0.12 (stub)"
 modmem%!&14 = 32
 '''.replace('SBPP', BPP).replace('BUGFLAG', BUG)
 

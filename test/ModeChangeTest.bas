@@ -42,15 +42,16 @@ REM (Started from the F12 command line instead - *BASIC then CHAIN "<file>" - th
 REM mode changes are still handled correctly, but the verification drawing does not
 REM reach the driver at all there, so every verify reads -1; the plot probe shows it.)
 REM
-REM Before running: reboot, then *RMLoad the built V3DDriver,ffa (version 0.11).
+REM Before running: reboot, then *RMLoad the built V3DDriver,ffa (version 0.12; 0.11 also works).
 
-NM% = 6
+NM% = 8
 DIM mname$(NM%), mdepth%(NM%)
 FOR i% = 1 TO NM%
   READ mname$(i%), mdepth%(i%)
 NEXT
 DATA "X1024 Y768 C16M",32, "X1920 Y1080 C16M",32, "X1280 Y720 C16M",32
-DATA "X1920 Y1080 C64K",16, "X1024 Y768 C64K",16, "X1920 Y1080 C16M",32
+DATA "X1920 Y1080 C64K",16, "X1024 Y768 C64K",16, "X1920 Y1200 C16M",32
+DATA "X1920 Y1200 C64K",16, "X1920 Y1080 C16M",32
 
 DIM pcol%(9), vin% 80, vout% 80, lim%(4)
 FOR i% = 0 TO 9
@@ -65,6 +66,7 @@ DIM rst%(NM%, 1, 7), rview%(NM%, 15), rmsg$(NM%)
 DIM rtn%(NM%, 1), rtr%(NM%, 1, 23, 6)
 DIM rtmo%(NM%, 15), rtmoflag%(NM%)
 DIM pr%(NM%, 2, 7), rgw%(NM%, 9), rlater%(NM%)
+DIM rbigrun%(NM%), rbig%(NM%, 7)
 DIM stat%(3, 7), tm%(1023), stl%(3), spx%(3)
 
 bg32% = 0 : bg16% = 0 : have32% = FALSE : have16% = FALSE
@@ -74,7 +76,11 @@ ON ERROR PROCfail
 
 PROCmodinfo
 PRINT "ModeChangeTest v3 - module: "; help$
-IF INSTR(help$, "0.11") = 0 THEN PRINT "This script needs V3DDriver 0.11 (it uses the event trace). Reboot, load 0.11 and try again." : END
+IF INSTR(help$, "0.11") = 0 AND INSTR(help$, "0.12") = 0 THEN
+  PRINT "This script needs V3DDriver 0.11 or later (it uses the event trace)."
+  PRINT "Reboot, load a newer module and try again."
+  END
+ENDIF
 
 SYS "V3D_PowerOn" TO pok%, prate%
 IF pok% <> 1 THEN PRINT "FAIL: V3D_PowerOn returned ok="; pok% : END
@@ -144,6 +150,12 @@ FOR i% = 1 TO NM%
       rvf%(i%) = FNverifyfill
       rvc%(i%) = FNverifycopy
       rvo%(i%) = FNverifyoverlap
+      rbigrun%(i%) = 0
+      IF ylim% + 1 > 1088 THEN
+        stage$ = "big operations in " + mname$(i%)
+        PROCbigtest(i%)
+        rbigrun%(i%) = 1
+      ENDIF
       PROCgetstats(2)
       PROCgrabtrace(i%, 1)
       PROCgetviews(i%)
@@ -155,6 +167,10 @@ FOR i% = 1 TO NM%
       rst%(i%, 1, 6) = stat%(2, 6) : rst%(i%, 1, 7) = stat%(2, 7)
       ok% = (rleft%(i%) = 0) AND (rlater%(i%) = 0) AND (rvf%(i%) = 0) AND (rvc%(i%) = 0) AND (rvo%(i%) = 0)
       ok% = ok% AND (rview%(i%, 0) = 0) AND (rview%(i%, 7) = 0) AND (stat%(2, 6) = stat%(0, 6))
+      IF rbigrun%(i%) THEN
+        ok% = ok% AND (rbig%(i%, 0) = 0) AND (rbig%(i%, 2) = 0) AND (rbig%(i%, 1) > 0) AND (rbig%(i%, 3) > 0)
+        ok% = ok% AND (rbig%(i%, 7) = 0) AND (rbig%(i%, 6) > 0)
+      ENDIF
       rok%(i%) = ok%
       IF NOT ok% THEN nbad% += 1
     ENDIF
@@ -414,6 +430,116 @@ DEF PROCresample(bg%, m%)
   rlater%(m%) = sbad%
 ENDPROC
 
+REM ---- the big operations (screens taller than 1088 rows) ----
+REM A screen of more than 510 tiles cannot be one GPU job; the driver cuts the work into
+REM bands. Test it at full-screen size against a pattern whose every pixel is known:
+REM   1. write the pattern straight into the screen memory;
+REM   2. scroll the WHOLE screen up 21 rows with the GPU (one rectangle, full width and height), then
+REM      back down 21 rows (the other direction visits the bands in the opposite order);
+REM   3. fill the WHOLE screen with one colour with the GPU;
+REM and sample the result against what it must be. The counters must show the GPU did them.
+DEF PROCbigtest(m%)
+  LOCAL x%, y%, a%, v%, bad%, n%, c0%, c1%, c2%, c3%, c4%, d0%, d1%, d2%, d3%, d4%, d5%, w%, h%, fillcol%
+  w% = xlim% + 1 : h% = ylim% + 1
+  REM 1. the pattern: 32bpp: x + y<<16; 16bpp: (x + 29*y) AND &FFFF
+  FOR y% = 0 TO ylim%
+    a% = ss% + (ylim% - y%) * ll%
+    IF bpp% = 4 THEN
+      FOR x% = 0 TO xlim%
+        a%!(x% * 4) = x% + (y% << 16)
+      NEXT
+    ELSE
+      FOR x% = 0 TO xlim%
+        v% = (x% + 29 * y%) AND &FFFF
+        a%?(x% * 2) = v% AND 255
+        a%?(x% * 2 + 1) = v% >> 8
+      NEXT
+    ENDIF
+  NEXT
+  SYS "V3D_AccelLimits", 0, 0, 0, 0, 0
+  SYS "V3D_AccelStart"
+  SYS "V3D_AccelCopyStats" TO c0%, c1%, c2%, c3%, c4%
+  REM 2. scroll the whole screen: rows 0..h-22 move to rows 21..h-1 (y counted from the bottom)
+  PROCcopyrect(0, 0, w%, h% - 21, 0, 21)
+  SYS "V3D_AccelCopyStats" TO d0%, d1%, d2%, d3%, d4%, d5%
+  rbig%(m%, 1) = d4% - c4%
+  bad% = 0 : n% = 0
+  FOR y% = 0 TO ylim% STEP 3
+    FOR x% = 0 TO xlim% STEP 11
+      n% += 1
+      IF y% >= 21 THEN
+        IF FNbigpix(x%, y%) <> FNbigexp(x%, y% - 21) THEN bad% += 1
+      ELSE
+        IF FNbigpix(x%, y%) <> FNbigexp(x%, y%) THEN bad% += 1
+      ENDIF
+    NEXT
+  NEXT
+  FOR y% = 0 TO ylim%
+    n% += 2
+    IF y% >= 21 THEN
+      IF FNbigpix(0, y%) <> FNbigexp(0, y% - 21) THEN bad% += 1
+      IF FNbigpix(xlim%, y%) <> FNbigexp(xlim%, y% - 21) THEN bad% += 1
+    ELSE
+      IF FNbigpix(0, y%) <> FNbigexp(0, y%) THEN bad% += 1
+      IF FNbigpix(xlim%, y%) <> FNbigexp(xlim%, y%) THEN bad% += 1
+    ENDIF
+  NEXT
+  rbig%(m%, 0) = bad% : rbig%(m%, 4) = n%
+  REM 2b. and back DOWN the screen by the same 21 rows (the opposite band order). After the up-scroll
+  REM     above, the screen holds P(x,y-21) for y>=21 and P(x,y) below; moving rows 21..h-1 down to
+  REM     0..h-22 must leave P(x,y) for y<=h-22 and P(x,y-21) for the top 21 rows.
+  SYS "V3D_AccelCopyStats" TO c0%, c1%, c2%, c3%, c4%
+  PROCcopyrect(0, 21, w%, h% - 21, 0, 0)
+  SYS "V3D_AccelCopyStats" TO d0%, d1%, d2%, d3%, d4%, d5%
+  rbig%(m%, 6) = d4% - c4%
+  bad% = 0
+  FOR y% = 0 TO ylim% STEP 3
+    FOR x% = 0 TO xlim% STEP 11
+      IF y% <= ylim% - 21 THEN
+        IF FNbigpix(x%, y%) <> FNbigexp(x%, y%) THEN bad% += 1
+      ELSE
+        IF FNbigpix(x%, y%) <> FNbigexp(x%, y% - 21) THEN bad% += 1
+      ENDIF
+    NEXT
+  NEXT
+  FOR y% = 0 TO ylim%
+    IF y% <= ylim% - 21 THEN
+      IF FNbigpix(0, y%) <> FNbigexp(0, y%) THEN bad% += 1
+      IF FNbigpix(xlim%, y%) <> FNbigexp(xlim%, y%) THEN bad% += 1
+    ELSE
+      IF FNbigpix(0, y%) <> FNbigexp(0, y% - 21) THEN bad% += 1
+      IF FNbigpix(xlim%, y%) <> FNbigexp(xlim%, y% - 21) THEN bad% += 1
+    ENDIF
+  NEXT
+  rbig%(m%, 7) = bad%
+  REM 3. fill the whole screen. First learn the colour the CPU makes of it: a small
+  REM    patch drawn with the GPU stopped, read back.
+  SYS "ColourTrans_SetGCOL", &F3774200,,,0,0
+  SYS "V3D_AccelStop"
+  PROCfillrect(20, 20, 8, 8)
+  fillcol% = FNbigpix(22, 22)
+  SYS "V3D_AccelLimits", 0, 0, 0, 0, 0
+  SYS "V3D_AccelStart"
+  SYS "V3D_AccelStats" TO c0%, c1%, c2%, c3%, c4%
+  PROCfillrect(0, 0, w%, h%)
+  SYS "V3D_AccelStats" TO d0%, d1%, d2%, d3%, d4%, d5%
+  rbig%(m%, 3) = d4% - c4%
+  PROCsample(fillcol%)
+  rbig%(m%, 2) = sbad% : rbig%(m%, 5) = nsamp%
+  SYS "V3D_AccelLimits", lim%(0), lim%(1), lim%(2), lim%(3), lim%(4)
+ENDPROC
+
+REM What the screen holds at (x%,y%) now, and what the pattern says it should hold.
+DEF FNbigpix(x%, y%)
+  LOCAL a%
+  a% = ss% + (ylim% - y%) * ll% + x% * bpp%
+  IF bpp% = 4 THEN = !a%
+= ?a% + 256 * a%?1
+
+DEF FNbigexp(x%, y%)
+  IF bpp% = 4 THEN = x% + (y% << 16)
+= (x% + 29 * y%) AND &FFFF
+
 REM ---- the report ----
 DEF PROCreport
   LOCAL m%, k%, npage%
@@ -421,6 +547,11 @@ DEF PROCreport
   PRINT "==== ModeChangeTest v3 report - "; help$; " ===="
   PRINT "background pixel: 32bpp &"; STR$~(bg32%); "  16bpp &"; STR$~(bg16%)
   PROCreportprobe(0)
+  IF pr%(0, 0, 4) = 0 OR pr%(0, 1, 4) = 0 OR pr%(0, 2, 4) = 0 THEN
+    PRINT "*** At the start the driver took NO plain fill (CLAIMED 0): it was declining the screen you started in."
+    PRINT "    The 'screen declines' line of the first mode gives the error number (35 = a stale write address"
+    PRINT "    left by a desktop mode change after the module was loaded; fixed in the 0.12 rev b build)."
+  ENDIF
   npage% = 0
   FOR m% = 1 TO NM%
     IF rrun%(m%) THEN
@@ -463,6 +594,15 @@ DEF PROCreportprobe(m%)
   NEXT
 ENDPROC
 
+DEF PROCreportbig(m%)
+  PRINT "  big ops: whole-screen scroll up 21 rows: "; rbig%(m%, 0); " of "; rbig%(m%, 4); " sampled pixels wrong, ";
+  PRINT "GPU did "; rbig%(m%, 1); " scroll(s)"
+  PRINT "           and back down 21 rows: "; rbig%(m%, 7); " sampled pixels wrong, ";
+  PRINT "GPU did "; rbig%(m%, 6); " scroll(s)"
+  PRINT "           whole-screen fill: "; rbig%(m%, 2); " of "; rbig%(m%, 5); " sampled pixels not the fill colour, ";
+  PRINT "GPU claimed "; rbig%(m%, 3); " fill(s)"
+ENDPROC
+
 DEF PROCreportmode(m%)
   LOCAL k%, t%
   PRINT
@@ -486,6 +626,7 @@ DEF PROCreportmode(m%)
   ENDIF
   PRINT "  verify: fill ";  rvf%(m%);  " copy ";  rvc%(m%);  " overlap ";  rvo%(m%);
   PRINT "   (-1 = the GPU did not take it, >0 = wrong pixels)"
+  IF rbigrun%(m%) THEN PROCreportbig(m%)
   PRINT "  at the mode change : GraphicsV calls ";  rst%(m%, 0, 0);  " Render calls ";  rst%(m%, 0, 1);
   PRINT " fill ops ";  rst%(m%, 0, 2);  " solid ";  rst%(m%, 0, 3);  " CLAIMED ";  rst%(m%, 0, 4);
   PRINT " errors ";  rst%(m%, 0, 5)

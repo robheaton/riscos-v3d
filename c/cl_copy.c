@@ -70,14 +70,14 @@ static inline unsigned int bytes_to_pages(unsigned int bytes)
 #define COPY_COLS_DESCENDING 1u
 #define COPY_ROWS_DESCENDING 2u
 
-static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
-                                   unsigned int width, unsigned int height,
-                                   unsigned int src_phys, unsigned int dest_phys,
-                                   unsigned int src_stride, unsigned int dest_stride,
-                                   unsigned int format_code,
-                                   unsigned int *tiles_x_out,
-                                   unsigned int *tiles_y_out,
-                                   unsigned int order)
+static _kernel_oserror *run_copy_job(pmp_area_t *pmp, unsigned int base_page,
+                                       unsigned int width, unsigned int height,
+                                       unsigned int src_phys, unsigned int dest_phys,
+                                       unsigned int src_stride, unsigned int dest_stride,
+                                       unsigned int format_code,
+                                       unsigned int *tiles_x_out,
+                                       unsigned int *tiles_y_out,
+                                       unsigned int order)
 {
     unsigned int tiles_x, tiles_y, n_tiles;
     unsigned int col, row, ci, ri;
@@ -154,6 +154,71 @@ static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
 
     *tiles_x_out = tiles_x;
     *tiles_y_out = tiles_y;
+    return NULL;
+}
+
+/*
+ * A copy of any size, in the same bands as a fill (see run_fill in cl_fill.c): a rectangle
+ * of more than WORST_CASE_N_TILES tiles becomes several jobs, each a strip a whole number
+ * of tile rows tall, with the source and destination addresses advanced by the same
+ * number of rows.
+ *
+ * Splitting must not change the RESULT of an overlapping copy (a scroll), and it does not:
+ * the ordered one-pass copy in v3d_copy_screen_overlapping is correct because tiles are
+ * visited in a particular sequence (rows from the far end when the shift is downwards,
+ * columns from the far end when it is to the right). The bands are visited in the same
+ * direction as the rows (last band first when `order` has COPY_ROWS_DESCENDING) and each
+ * band applies `order` inside itself, so the sequence of tiles - and therefore every load
+ * and store, including the clipping of the final partial tile row, which is in the last
+ * band either way - is exactly the sequence of the one big job.
+ * test/host/overlap_order_test.c checks this by simulation against memmove.
+ *
+ * One thing is NOT the same as a single job: if band k >= 2 fails (a GPU timeout, or the
+ * fail-stop latch being set by the interrupt handler in between) after earlier bands have
+ * stored, the caller leaves the call to the CPU, which redoes the whole scroll from a source the
+ * earlier bands have already moved, so that one scroll is drawn wrongly. A failure at the start
+ * of a single big job happens before anything is stored, so the CPU redo was always right
+ * there. This only exists for rectangles of more than max_job_tiles tiles (at 1920x1200 or
+ * above), which used to be refused up front and done by the CPU. The failure itself is the
+ * GPU fail-stop case: the GPU is then off and the next redraw repairs the screen.
+ * Everything that can be refused up front is refused by the first band.
+ */
+static _kernel_oserror *run_copy(pmp_area_t *pmp, unsigned int base_page,
+                                   unsigned int width, unsigned int height,
+                                   unsigned int src_phys, unsigned int dest_phys,
+                                   unsigned int src_stride, unsigned int dest_stride,
+                                   unsigned int format_code,
+                                   unsigned int *tiles_x_out,
+                                   unsigned int *tiles_y_out,
+                                   unsigned int order)
+{
+    unsigned int band_h, nbands, k, y0, h, tx, ty;
+    _kernel_oserror *err;
+
+    err = v3d_band_height(width, height, &band_h);
+    if (err)
+        return err;
+
+    if (height <= band_h)
+        return run_copy_job(pmp, base_page, width, height, src_phys, dest_phys,
+                             src_stride, dest_stride, format_code,
+                             tiles_x_out, tiles_y_out, order);
+
+    nbands = v3d_band_count(height, band_h);
+    for (k = 0; k < nbands; k++)
+    {
+        v3d_band_span(height, band_h,
+                      (order & COPY_ROWS_DESCENDING) ? nbands - 1u - k : k, &y0, &h);
+        err = run_copy_job(pmp, base_page, width, h,
+                            src_phys + y0 * src_stride,
+                            dest_phys + y0 * dest_stride,
+                            src_stride, dest_stride, format_code, &tx, &ty, order);
+        if (err)
+            return err;
+    }
+
+    *tiles_x_out = div_round_up(width, TILE_SIZE);
+    *tiles_y_out = div_round_up(height, TILE_SIZE);
     return NULL;
 }
 
@@ -359,13 +424,13 @@ _kernel_oserror *v3d_copy_screen(pmp_area_t *pmp, unsigned int base_page,
  * emitted, which a single-core CLE walking an explicit TileCoordinates list
  * does - is what test/VerifySuite.bas checks on the real machine.
  *
- * Bounded to pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL) for the scratch buffer
- * itself (same cap already governing every synthetic-buffer test in
- * this project) - large overlapping copies (e.g. a full-screen
- * scroll) are refused with a clear error rather than silently
- * chunked, so the caller's own fallback (leaving the GraphicsV call
- * unclaimed) takes over instead of this driver attempting something
- * only partially tested.
+ * Size limits depend on the mode (g_v3d_tune.overlap_mode):
+ *   1 (default, one pass): no cap of its own. run_copy cuts a rectangle of more than
+ *     max_job_tiles tiles into bands (0.12), so a full-screen scroll at 1920x1200 or 4K
+ *     reaches the GPU; only what v3d_band_height refuses is refused.
+ *   0 (two passes through the bounce buffer): bounded by the 8MB scratch buffer
+ *     (PMP_MAX_PAGES_PER_CALL pages); a bigger copy is refused with a clear error and the
+ *     caller leaves the GraphicsV call unclaimed, so the CPU does it.
  */
 /*
  * Cached scratch PIXEL buffer for the overlap-safe path
@@ -435,7 +500,7 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
     {
         static _kernel_oserror err_too_big = {
             14, "V3DDriver: overlapping copy too large for a scratch-"
-                "buffer pass (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL))"
+                "buffer pass (the bounce buffer's page cap, PMP_MAX_PAGES_PER_CALL)"
         };
         return &err_too_big;
     }
