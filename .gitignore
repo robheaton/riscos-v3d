@@ -8,3 +8,7 @@ test/host/overlap_order_test
 test/host/fillsim
 test/host/copysim
 test/host/cl_common_sim.o
+test/host/beacon_test
+test/host/*.ppm
+beacons/
+V3DDriver_beacons,ffa

@@ -8,10 +8,12 @@ tile to a requested colour, stores it to memory, and the CPU reads
 back exactly that colour through a physical buffer the GPU wrote to.
 Confirmed on real hardware, not just build-verified.
 
-> **Known limitation**: do not `*RMKill`/`*RMLoad` this module without
-> a full reboot in between - it reliably freezes the machine. Always
-> reboot before loading a freshly-built module. See "Known
-> limitations" further down for the full story.
+> **Reloading without a reboot** (`*RMKill` then `*RMLoad`) used to
+> freeze the machine. It is root-caused and fixed in 0.12 rev c
+> (2026-10-09) - see "The reload freeze: root-caused and fixed" near the
+> end. The fix is hardware-verified on the diagnostic build; the plain
+> rev c build is still being re-verified, so until that is recorded
+> there, keep rebooting between loads.
 
 - **M0/M1** — power on the V3D block, read its identity registers back
   correctly (confirms it reports itself as V3D 4.2, matching the known
@@ -1825,33 +1827,17 @@ detail, the most concrete lead if this is resumed.
 
 ## Known limitations
 
-- **Do not `*RMKill`/`*RMLoad` this module without a full reboot in
-  between.** Doing so reliably freezes the machine outright (a hard,
-  unrecoverable freeze requiring a physical reset) the moment any real
-  GPU work is exercised afterward - confirmed reproducible across many
-  hardware tests. **Always reboot before loading a freshly-built module
-  for testing.** This does not affect the module's actual operation
-  once loaded - only development-time reloading. Since auto-start is
-  back on by default (see below), this now bites on every ordinary
-  reload, not just ones where `V3D_AccelStart` was manually run.
-
-  STILL UNRESOLVED as of 2026-09-29, now **PAUSED after seven failed
-  fix attempts** (dangling vector claim, reset-pulsing a warm core, a
-  leaked PMP Dynamic Area, a diagnostic bisection build, `cl_clear.c`
-  scratch-page caching, a GFXH-1897 hardware-erratum guard, and a
-  `V3D_CTL_SLCACTL` reserved-bits fix) - see "Revisited again
-  (2026-09-28/29)" above for the full writeup of the last two, both
-  real, independently-verified bugs against the real hardware
-  erratum/register documentation, neither of which turned out to be
-  the cause. Real V3D register forensics were finally captured (first
-  time in this bug's whole history) and the ASB bus gate theory was
-  directly tested and ruled out. `module_final` is now confirmed,
-  directly, to genuinely run on every `*RMKill` - ruling out "cleanup
-  silently never executes" as the explanation for any of the seven
-  attempts. Paused at Rob's own call given the hardware-cycle cost so
-  far, not abandoned - the three still-unchecked patches from the same
-  upstream erratum series (PM-runtime cache/MMU handling) are the most
-  concrete lead if this is picked back up.
+- **`*RMKill`/`*RMLoad` without a reboot: ROOT-CAUSED AND FIXED in 0.12
+  rev c (2026-10-09).** It used to freeze the machine hard (or time out
+  the first GPU job) after a reload, through eight rounds of
+  investigation. The cause was that `V3D_PowerOn` always took its
+  cold-start path - including a reset pulse - on a V3D that was already
+  running, because the firmware flag it trusted always reads "off". See
+  "The reload freeze: root-caused and fixed" near the end of this file
+  for the evidence, the fix and what is still unverified. The long
+  history of failed attempts further up (seven fixes aimed at other
+  things) is kept as written; where it says "unresolved", this
+  supersedes it.
 
 - **A second, separate freeze, ROOT-CAUSED AND FIXED**: opening Task
   Manager while `GraphicsV` acceleration was active used to hard-freeze
@@ -3699,6 +3685,82 @@ accounting, any screen declines, and the register details of the first four lost
 **Memory.** The firmware allocates the framebuffer at twice the visible height (a 1920x1080 32bpp mode reports
 16.6 MB), so 4K at 32bpp needs about 66 MB and will not fit `gpu_mem=64`; use 128 or more for 4K. Nothing
 the driver itself allocates comes out of `gpu_mem`.
+
+## The reload freeze: root-caused and fixed (2026-10-09, 0.12 rev c)
+
+**Status: fixed. Hardware-verified on the diagnostic build (`WARM` switch on: six runs of `StressTest` across
+reloads, no freeze and no timeout). Before the fix, nine of the ten reload tests of this round failed (B, C and
+F-L; the tenth, build E, passed once and was luck). The plain rev c module is being re-verified; this section is
+updated when that is recorded.**
+
+**The bug.** `*RMKill V3DDriver` then `*RMLoad` with no reboot, then GPU work, froze the machine hard - or, in a
+milder form, made the first GPU job of the new instance time out (`error 7`, `CS=0x10`). The accelerated desktop
+path reloaded cleanly in every test A/D run; the legacy test SWIs (`V3D_ClearTest`, `V3D_ClearToSprite`) did not.
+
+**The cause.** `v3d_power_on` chose between a *warm* path (the V3D is already up: leave it alone) and a *cold*
+path (power it up: `PM_GRAFX` reset pulse, then open the ASB bus gates) from the firmware's "V3D clock is on"
+flag, as returned by `v3d_ensure_clock_on`. On a Pi 4 that flag reads **0 (off) all the time** - on a fresh boot,
+and equally while the V3D is up and running its jobs. So the warm path never ran: every first `V3D_PowerOn` of
+every module instance took the cold path. On a fresh boot that is safe (the V3D is held in reset and both ASB
+gates are stopped). On a reload it resets a *running* V3D with its ASB gates *open*; Linux's own power-off stops
+the slave and then the master gate before asserting reset, and the cold path never does. The result was a slave
+bridge left FULL and a core that ignored writes: a soft timeout, or a stalled bus.
+
+**The evidence** (`test/ReloadProbe.bas` on the diagnostic build, photographed on real hardware):
+
+| moment | V3D state |
+|---|---|
+| fresh boot, before `PowerOn` | `PM_GRAFX=&1000` (reset HELD), ASB gates `&7` (REQ_STOP+ACK+EMPTY), every register `&DEADBEEF`, firmware clock state `&0` |
+| fresh boot, after `PowerOn` | `PM_GRAFX=&1040` (released), gates `&4` (EMPTY), core ident `&4443356`, core interrupt mask `&0`, frame counters 0/0 |
+| after 50 `StressTest` iterations | same, frame counters 100/100, core mask `&FF00FC`, **firmware clock state still `&0`** |
+| after `*RMKill` + `*RMLoad`, before `PowerOn` | V3D fully alive and intact: reset released, gates `&4`, counters still 100/100, `CA=EA=&305206B` retained. Then `V3D_PowerOn` froze the machine |
+
+The soft failures fit it exactly. A failing job's error text (`V3D_ClearTest`, after the message was extended in
+this round) read `HMK=0x3F` (hub interrupt mask: our "mask everything" write had landed) but `MSK=0` (core mask:
+write lost, and the reset default) with `BFC=0>0 RFC=0>0` (frame counters back at 0 although the first run had
+left them at 100): the core had been reset by the second instance's `PowerOn`, and its register bank then ignored
+writes. In the four failing dumps that printed it (F, G, H, J) the ASB slave gate read `0x00FABF68` (FULL);
+healthy is `&4` (EMPTY).
+
+**The fix.** `v3d_hw_is_up()` (`c/module.c`) asks the hardware instead of the firmware: the V3D is up if
+`PM_GRAFX` has `V3DRSTN` set, neither ASB gate has `REQ_STOP` or `ACK` set, and the core `IDENT0` reads the V3D
+magic (`'V','3','D'`; a powered-down V3D answers `0xDEADBEEF`). If so, `v3d_power_on` reads the clock rate from
+the firmware for reporting and does nothing else - no `SET_CLOCK_STATE`, no reset pulse. A cold V3D (fresh boot)
+takes the old path unchanged.
+
+**How it was found** (each step a hardware round trip; the order matters because most of it was ruled OUT):
+1. A diagnostic build that drew a numbered bar on the screen at each step (`c/beacon.c`) did not freeze once - but
+   one pass proved nothing. A single module whose behaviour is chosen by `*RMLoad` words (so code layout is
+   identical across variants) then separated the ingredients: hooks present but inert (failed), barriers only
+   (failed), screen drawing only (failed), drawing plus barriers - the original passing build - (froze). So the
+   first pass was luck, not a cure.
+2. A plain module with two-minute gaps between steps failed in exactly the same way (the "settle time" theory).
+3. Making the legacy submission match the accelerated one (permanent register mapping, barrier before the doorbell;
+   words `LPERM` `LDSB`) also failed - but its extended error message showed the counter reset above.
+4. `ReloadProbe` then read the power side, the hub bank and the core bank before and after the first `PowerOn`
+   of a reloaded instance: the V3D was intact until `PowerOn` ran. The same probe on a fresh boot gave the first
+   healthy baseline (`&DEADBEEF`, reset held, gates stopped) and showed the firmware clock flag never turning on.
+5. The earlier "skip the pulse if the clock is already on" fix (2026-09-26, `g_powered_on` history in
+   `v3d_power_on`'s comment) had the right idea and a wrong source of truth: it could never engage.
+
+**Not established.** (a) Why the accelerated reloads (tests A, D) passed before the fix. A working theory is that
+`VerifySuite`, which ends by sending the clock rate to the firmware (`V3D_AccelTune 8,250`), makes the firmware flag
+read "on" afterwards; `ReloadProbe`'s optional step 8 tests exactly that, and has not been run. (b) The legacy test
+SWIs still have no fail-stop latch: after a timeout the next submission goes to a possibly dead core (a retry in
+the same instance escalated to a hard freeze on 28 Sept). (c) The cold path itself would still be unsafe if it were
+ever run on a V3D that is up but fails `v3d_hw_is_up` (for example an unexpected ident); stopping the ASB gates
+before asserting reset, as Linux does, would harden it.
+
+**Tooling kept from this round** (all compile to nothing unless asked for): `make beacons` builds
+`V3DDriver_beacons,ffa`, the same sources with `-DV3D_BEACONS`, whose behaviour is chosen by `*RMLoad` words -
+`BDRAW` (numbered bar on screen at each step: white = reached, red = latest; the first diagnostic builds used the
+palette byte order by mistake and showed cyan and green - the positions were always right),
+`BDSB` (a `DSB` at each step), `BZPOWER`/`BZCLEAR`/`BZLIFE` (restrict to one part of the code), `LPERM`/`LDSB`
+(legacy submission like the accelerated one) and `WARM` (the fix; **without it the diagnostic build reproduces the
+old bug**, which is what makes it useful for regression testing). `V3D_RegSnapshot` takes selectors in R0
+(`&51D00001` power side, `&51D00002` hub, `&51D00003` core). `test/ReloadProbe.bas` prints them decoded.
+`test/host/beacon_test.c` (in `make hosttest`) checks the drawing code and that the inert setting does nothing.
+The legacy timeout message now shows the interrupt masks and both frame counters before and after the kick.
 
 ## Performance: where the GPU actually wins, and why small operations are left to the CPU (2026-10-04, hardware-verified)
 

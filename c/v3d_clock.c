@@ -13,6 +13,7 @@
 
 #include "v3d_clock.h"
 #include "bcmsupport.h"
+#include "beacon.h"
 #include <stddef.h>
 
 #define TAG_GET_CLOCK_STATE    0x00030001u
@@ -45,9 +46,20 @@ static _kernel_oserror *tag_call(unsigned int tag, unsigned int a0,
     req[7] = a2;
     req[8] = 0;
 
+#ifdef V3D_BEACONS
+    /* before/after pair per kind of call, so the bar shows which mailbox request was in flight */
+    v3d_beacon(tag == TAG_GET_CLOCK_STATE ? B_CK_STATE_BEFORE
+             : tag == TAG_SET_CLOCK_STATE ? B_CK_SETSTATE_BEFORE
+             : tag == TAG_GET_CLOCK_RATE  ? B_CK_RATE_BEFORE : B_CK_SETRATE_BEFORE);
+#endif
     err = bcm_send_temp_property_buffer(req, resp);
     if (err)
         return err;
+#ifdef V3D_BEACONS
+    v3d_beacon(tag == TAG_GET_CLOCK_STATE ? B_CK_STATE_AFTER
+             : tag == TAG_SET_CLOCK_STATE ? B_CK_SETSTATE_AFTER
+             : tag == TAG_GET_CLOCK_RATE  ? B_CK_RATE_AFTER : B_CK_SETRATE_AFTER);
+#endif
 
     if (out0) *out0 = resp[5];
     if (out1) *out1 = resp[6];
@@ -89,7 +101,14 @@ _kernel_oserror *v3d_ensure_clock_on(unsigned int *rate_out, int *already_on_out
      * an already-stable clock rather than a true no-op, a hardware
      * reset pulse landing moments later on a momentarily-disturbed
      * clock would produce exactly this symptom. Only ask the firmware
-     * to change anything when the clock is actually confirmed off. */
+     * to change anything when the clock is actually confirmed off.
+     *
+     * CAUTION (2026-10-09, real hardware): the state this returns is NOT
+     * a usable "is the V3D powered" test. On a Pi 4 the firmware reports
+     * the V3D clock as OFF (state 0) on a fresh boot AND while the V3D is
+     * up and running jobs, so *already_on_out is false in every case seen.
+     * v3d_power_on therefore asks the hardware first (v3d_hw_is_up in
+     * module.c) and only reaches this function for a genuinely cold V3D. */
     err = tag_call(TAG_GET_CLOCK_STATE, CLOCK_ID_V3D, 0, 0, &echo, &state);
     if (err)
         return err;

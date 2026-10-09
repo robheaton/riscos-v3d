@@ -73,7 +73,7 @@ DIM jobs%(1)
 DIM modmem% 100
 DIM tmp% 80200
 DIM pts%(3)
-sr0% = 0 : sr1% = 0 : sr2% = 0 : sr3% = 0 : sr4% = 0 : sr5% = 0 : sr6% = 0 : sr7% = 0
+sr0% = 0 : sr1% = 0 : sr2% = 0 : sr3% = 0 : sr4% = 0 : sr5% = 0 : sr6% = 0 : sr7% = 0 : sr8% = 0 : sr9% = 0
 accel% = 0 : corrupt% = CORRUPT : gcol% = 0 : nfill% = 0 : ncopy% = 0 : novl% = 0 : npts% = 0
 $(modmem% + 32) = "V3DDriver" + CHR$(9) + "0.07 (stub)"
 modmem%!&14 = 32
@@ -92,7 +92,7 @@ ENDPROC
 DEF PROCsys_V3D_AccelProfile(a%,b%,c%,d%,e%)
   LOCAL k%
   FOR k% = 0 TO 7 : sr0% = 0 : NEXT
-  sr0% = 0 : sr1% = 0 : sr2% = 0 : sr3% = 0 : sr4% = 0 : sr5% = 0 : sr6% = 0 : sr7% = 0
+  sr0% = 0 : sr1% = 0 : sr2% = 0 : sr3% = 0 : sr4% = 0 : sr5% = 0 : sr6% = 0 : sr7% = 0 : sr8% = 0 : sr9% = 0
   IF a% = 0 OR a% = 1 THEN
     sr0% = jobs%(a%) : sr1% = jobs%(a%) * 10 : sr2% = jobs%(a%) * 20 : sr3% = jobs%(a%) * 5
     sr4% = jobs%(a%) * 30 : sr5% = jobs%(a%) * 65 : sr6% = 80
@@ -172,5 +172,5 @@ CORR = _s.argv[1] if len(_s.argv) > 1 else '0'
 defined = set(re.findall(r'DEF (PROCsys_\w+)', PROCS))
 extra = ''
 for n in sorted(used - defined):
-    extra += 'DEF %s(a%%,b%%,c%%,d%%,e%%)\n  sr0%% = 0 : sr1%% = 0 : sr2%% = 0 : sr3%% = 0 : sr4%% = 0 : sr5%% = 0 : sr6%% = 0 : sr7%% = 0\nENDPROC\n' % n
+    extra += 'DEF %s(a%%,b%%,c%%,d%%,e%%)\n  sr0%% = 0 : sr1%% = 0 : sr2%% = 0 : sr3%% = 0 : sr4%% = 0 : sr5%% = 0 : sr6%% = 0 : sr7%% = 0 : sr8%% = 0 : sr9%% = 0\nENDPROC\n' % n
 open(OUT, 'w').write(VARS.replace('CORRUPT', CORR) + '\n'.join(out) + '\n' + PROCS + '\n' + extra)

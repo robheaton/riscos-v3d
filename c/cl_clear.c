@@ -45,6 +45,20 @@
 #include "cl_packets.h"
 #include "v3d_regs.h"
 #include "io_map.h"
+#include "beacon.h"
+
+/* Reload-freeze round 8: in the diagnostic build the legacy submission can be made to look like the accelerated
+ * one, chosen at load time (words LPERM / LDSB, see beacon.h): LPERM = use the permanent register mapping instead
+ * of the per-job OS_Memory 14/15 temporary window; LDSB = one DSB before the doorbell writes, as v3d_job_run does. */
+#ifdef V3D_BEACONS
+#define LEG_MAP(m)      (g_v3d_legacy_perm ? v3d_regs_map(m) : io_map(V3D_MB_BASE, (m)))
+#define LEG_UNMAP(m)    do { if (g_v3d_legacy_perm) v3d_regs_unmap(m); else io_unmap(m); } while (0)
+#define LEG_PRE_KICK()  do { if (g_v3d_legacy_dsb) __asm__ __volatile__(".word 0xF57FF04F" ::: "memory"); } while (0) /* DSB SY, as V3D_DSB */
+#else
+#define LEG_MAP(m)      io_map(V3D_MB_BASE, (m))
+#define LEG_UNMAP(m)    io_unmap(m)
+#define LEG_PRE_KICK()  ((void) 0)
+#endif
 #include "sprite.h"
 #include "v3d_irq.h"
 
@@ -144,6 +158,16 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
         dst[(*pos)++] = hex[(v >> i) & 0xFu];
 }
 
+static void append_dec(char *dst, unsigned int *pos, unsigned int v)
+{
+    char tmp[11];
+    unsigned int n = 0;
+
+    do { tmp[n++] = (char) ('0' + v % 10u); v /= 10u; } while (v && n < sizeof tmp);
+    while (n && *pos < ERRMESS_CAPACITY - 1u)
+        dst[(*pos)++] = tmp[--n];
+}
+
 /*
  * On timeout, reads V3D_CTL_INT_STS and decodes it into out_err's
  * message before returning it - a raw "timed out" is a dead end to
@@ -189,6 +213,7 @@ static void append_hex32(char *dst, unsigned int *pos, unsigned int v)
 typedef struct diag_bufs
 {
     unsigned int cl, render_target, tile_alloc, tile_state;
+    unsigned int bfc0, rfc0; /* BFC/RFC read just before the kick, for the timeout message */
 } diag_bufs_t;
 
 static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
@@ -197,7 +222,7 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
 {
     io_mapping_t v3d;
     unsigned int sts = 0, cs = 0, ca = 0, ea = 0;
-    unsigned int rb_qba = 0, rb_qea = 0;
+    unsigned int msk = 0, hmsk = 0, hsts2 = 0, bfc_now = 0, rfc_now = 0;
     unsigned int mmu_ctl = 0, hub_sts = 0, vio_id = 0, vio_addr = 0;
     unsigned int asb_m = 0, asb_s = 0;
     unsigned int pos = 0;
@@ -206,8 +231,13 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     if (!io_map(V3D_MB_BASE, &v3d))
     {
         sts = IO_WORD(v3d, V3D_CTL_INT_STS);
+        msk = IO_WORD(v3d, V3D_CTL_INT_MSK_STS);
+        hmsk = IO_WORD(v3d, V3D_HUB_INT_MSK_STS);
+        bfc_now = IO_WORD(v3d, V3D_CLE_BFC);
+        rfc_now = IO_WORD(v3d, V3D_CLE_RFC);
         mmu_ctl = IO_WORD(v3d, V3D_MMU_CTL);
         hub_sts = IO_WORD(v3d, V3D_HUB_INT_STS);
+        hsts2 = hub_sts;
         /* Added 2026-09-28: first real reload-freeze repro that hit this
          * bounded timeout instead of a hard freeze showed CT0CA/CT0EA/
          * CT0QBA/CT0QEA all read 0xFFFFFFFF while CS/STS/MMU_CTL read a
@@ -230,16 +260,12 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
             cs = IO_WORD(v3d, V3D_CLE_CT0CS);
             ca = IO_WORD(v3d, V3D_CLE_CT0CA);
             ea = IO_WORD(v3d, V3D_CLE_CT0EA);
-            rb_qba = IO_WORD(v3d, V3D_CLE_CT0QBA);
-            rb_qea = IO_WORD(v3d, V3D_CLE_CT0QEA);
         }
         else
         {
             cs = IO_WORD(v3d, V3D_CLE_CT1CS);
             ca = IO_WORD(v3d, V3D_CLE_CT1CA);
             ea = IO_WORD(v3d, V3D_CLE_CT1EA);
-            rb_qba = IO_WORD(v3d, V3D_CLE_CT1QBA);
-            rb_qea = IO_WORD(v3d, V3D_CLE_CT1QEA);
         }
 
         if (cs & V3D_CT_CS_CTRUN)
@@ -278,20 +304,33 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
      * on the very first real hardware hit of this exact code, 2026-09-
      * 28). X = 'S' if ASB_REQ_STOP set else '-', Y = 'A' if ASB_ACK
      * set else '-'. */
-    append_str(out_err->errmess, &pos, " ASBM=");
-    append_hex32(out_err->errmess, &pos, asb_m);
+    append_str(out_err->errmess, &pos, " ASB=");
     append_str(out_err->errmess, &pos, (asb_m & ASB_REQ_STOP) ? "(S" : "(-");
     append_str(out_err->errmess, &pos, (asb_m & ASB_ACK) ? "A)" : "-)");
-    append_str(out_err->errmess, &pos, " ASBS=");
-    append_hex32(out_err->errmess, &pos, asb_s);
     append_str(out_err->errmess, &pos, (asb_s & ASB_REQ_STOP) ? "(S" : "(-");
     append_str(out_err->errmess, &pos, (asb_s & ASB_ACK) ? "A)" : "-)");
     append_str(out_err->errmess, &pos, " STS=");
     append_hex32(out_err->errmess, &pos, sts);
     if (sts & V3D_INT_OUTOMEM) append_str(out_err->errmess, &pos, "(OOM)");
     if (sts & V3D_INT_GMPV) append_str(out_err->errmess, &pos, "(GMPV)");
+    /* Added for the reload-freeze round 8: did the HARDWARE finish the job (frame counter moved) while the
+     * interrupt was never counted? MSK/HMK = which interrupts were enabled, HST = hub status. */
+    append_str(out_err->errmess, &pos, " MSK=");
+    append_hex32(out_err->errmess, &pos, msk);
+    append_str(out_err->errmess, &pos, " HST=");
+    append_hex32(out_err->errmess, &pos, hsts2);
+    append_str(out_err->errmess, &pos, " HMK=");
+    append_hex32(out_err->errmess, &pos, hmsk);
+    append_str(out_err->errmess, &pos, " BFC=");
+    append_dec(out_err->errmess, &pos, bufs->bfc0);
+    append_str(out_err->errmess, &pos, ">");
+    append_dec(out_err->errmess, &pos, bfc_now);
+    append_str(out_err->errmess, &pos, " RFC=");
+    append_dec(out_err->errmess, &pos, bufs->rfc0);
+    append_str(out_err->errmess, &pos, ">");
+    append_dec(out_err->errmess, &pos, rfc_now);
     append_str(out_err->errmess, &pos, " MMU=");
-    append_hex32(out_err->errmess, &pos, mmu_ctl & 1u);
+    append_dec(out_err->errmess, &pos, mmu_ctl & 1u);
     if (mmu_ctl & V3D_MMU_CTL_ENABLE)
     {
         append_str(out_err->errmess, &pos, " HUBSTS=");
@@ -305,23 +344,15 @@ static void diagnose_timeout(_kernel_oserror *out_err, const char *what,
     append_hex32(out_err->errmess, &pos, ca);
     append_str(out_err->errmess, &pos, " EA=");
     append_hex32(out_err->errmess, &pos, ea);
-    append_str(out_err->errmess, &pos, " QBA=w");
+    append_str(out_err->errmess, &pos, " QBA=");
     append_hex32(out_err->errmess, &pos, qba);
-    append_str(out_err->errmess, &pos, "/r");
-    append_hex32(out_err->errmess, &pos, rb_qba);
-    append_str(out_err->errmess, &pos, " QEA=w");
+    append_str(out_err->errmess, &pos, " QEA=");
     append_hex32(out_err->errmess, &pos, qea);
-    append_str(out_err->errmess, &pos, "/r");
-    append_hex32(out_err->errmess, &pos, rb_qea);
     /* render_target dropped from this message (2026-09-28, freed room
      * for ASBM/ASBS above) - it's the render phase's own buffer, the
      * least relevant of the three to a BIN-phase timeout specifically;
      * still in diag_bufs_t and available to a future render-phase
      * diagnostic if needed. */
-    append_str(out_err->errmess, &pos, " tAl=");
-    append_hex32(out_err->errmess, &pos, bufs->tile_alloc);
-    append_str(out_err->errmess, &pos, " tSt=");
-    append_hex32(out_err->errmess, &pos, bufs->tile_state);
     out_err->errmess[pos] = '\0';
 }
 
@@ -477,6 +508,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     unsigned int page = base_page;
     diag_bufs_t diag_bufs;
 
+    v3d_beacon(B_CT_ENTER);
     {
         clear_scratch_cache_t *cache = find_or_create_clear_scratch(pmp, base_page,
                                                                        render_page_count, &err);
@@ -537,11 +569,14 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
         for (i = 0; i < (TILE_STATE_PAGE_COUNT * PAGE_SIZE) / 4u; i++)
             p[i] = 0;
     }
+    v3d_beacon(B_CT_ZEROED);
 
     diag_bufs.cl = cl_phys;
     diag_bufs.render_target = render_phys;
     diag_bufs.tile_alloc = tile_alloc_phys;
     diag_bufs.tile_state = tile_state_phys;
+    diag_bufs.bfc0 = 0;
+    diag_bufs.rfc0 = 0;
 
     /* --- BCL: empty bin (no primitives - see the reference's full
      * always-present state-setup block below, added after hardware
@@ -611,11 +646,16 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
      * (clear + store) inline; we have no supertiles to walk. */
     emit_end_of_rendering(&rcl);
     rcl_end = cl_paddr(&rcl);
+    v3d_beacon(B_CT_BUILT);
 
     /* --- kick off binning (short-held mapping - see v3d_poll_counter's
      * comment for why long-held ones are dangerous) --- */
-    err = io_map(V3D_MB_BASE, &v3d);
+    LEG_PRE_KICK();
+    err = LEG_MAP(&v3d);
     if (err) return err;
+    v3d_beacon(B_CT_MAP1);
+    diag_bufs.bfc0 = IO_WORD(v3d, V3D_CLE_BFC);
+    diag_bufs.rfc0 = IO_WORD(v3d, V3D_CLE_RFC);
 
     /* Clear out any overflow allocation left attached to a previous
      * job - see V3D_PTB_BPOS's comment in v3d_regs.h. Real driver does
@@ -634,8 +674,9 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     IO_WORD(v3d, V3D_CLE_CT0QTS) = tile_state_phys | V3D_CLE_CT0QTS_ENABLE;
     IO_WORD(v3d, V3D_CLE_CT0QBA) = bcl_start;
     IO_WORD(v3d, V3D_CLE_CT0QEA) = bcl_end; /* kicks off binning */
+    v3d_beacon(B_CT_KICK_BIN);
 
-    io_unmap(&v3d);
+    LEG_UNMAP(&v3d);
 
     {
         static _kernel_oserror err_bin_timeout = { 7, "" };
@@ -646,18 +687,21 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
         if (err)
             return err;
     }
+    v3d_beacon(B_CT_BIN_DONE);
 
     /* --- kick off rendering --- */
-    err = io_map(V3D_MB_BASE, &v3d);
+    err = LEG_MAP(&v3d);
     if (err) return err;
+    v3d_beacon(B_CT_MAP2);
 
     v3d_flush_caches(&v3d);
     last_render_irq = g_v3d_irq_render_done_count;
 
     IO_WORD(v3d, V3D_CLE_CT1QBA) = rcl_start;
     IO_WORD(v3d, V3D_CLE_CT1QEA) = rcl_end; /* kicks off rendering - see thread 0's comment */
+    v3d_beacon(B_CT_KICK_RENDER);
 
-    io_unmap(&v3d);
+    LEG_UNMAP(&v3d);
 
     {
         static _kernel_oserror err_render_timeout = { 8, "" };
@@ -668,6 +712,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
         if (err)
             return err;
     }
+    v3d_beacon(B_CT_RENDER_DONE);
 
     *render_target_phys_out = render_phys;
     *render_target_log_out = render_log;
@@ -759,6 +804,8 @@ _kernel_oserror *v3d_16bpp_format_test(pmp_area_t *pmp, unsigned int base_page,
     diag_bufs.render_target = render_phys;
     diag_bufs.tile_alloc = tile_alloc_phys;
     diag_bufs.tile_state = tile_state_phys;
+    diag_bufs.bfc0 = 0;
+    diag_bufs.rfc0 = 0;
 
     cl_init(&bcl, cl_log, cl_phys, PAGE_SIZE);
     bcl_start = cl_paddr(&bcl);

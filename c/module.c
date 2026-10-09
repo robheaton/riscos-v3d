@@ -34,6 +34,7 @@
 #include "gfxv_accel.h"
 #include "accel_api.h"
 #include "screen_base.h"
+#include "beacon.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -624,6 +625,53 @@ static void record_call_duration(unsigned int t_start)
 }
 
 /*
+ * Is the V3D ALREADY powered, out of reset and bridged - judged from the hardware itself?
+ *
+ * Found on real hardware 2026-10-09 (ReloadProbe photos): the firmware's GET_CLOCK_STATE for the V3D clock reads 0
+ * ("off") even while the V3D is running happily - after a complete first power-on, and after fifty jobs. So the
+ * "firmware clock already on" test that v3d_power_on used to choose between the warm and the cold path was
+ * ALWAYS false: every first PowerOn of every module instance took the COLD path, which pulses PM_GRAFX reset on the
+ * V3D with its ASB bus gates OPEN (Linux stops the slave and then the master gate BEFORE asserting reset; the cold
+ * path never does, because on a fresh boot they are already stopped). On a reloaded module that left the slave
+ * bridge FULL and the core ignoring writes: a soft timeout at the first job, or a bus stall - the "reload freeze".
+ *
+ * The three things a genuinely powered V3D shows, none of which needs the firmware's opinion:
+ *   - PM_GRAFX has V3DRSTN set (reset released; a fresh boot reads reset HELD),
+ *   - neither ASB gate has REQ_STOP or ACK set (a fresh boot reads both stopped),
+ *   - the core's IDENT0 reads the V3D magic 'V','3','D' (a powered-down V3D answers 0xDEADBEEF).
+ * Each is checked in that order and every read is of a block known to answer without hanging in that state.
+ */
+static int v3d_hw_is_up(void)
+{
+    io_mapping_t m;
+    unsigned int grafx, asb_m, asb_s, ident;
+
+    if (io_map(PM_MB_BASE, &m))
+        return 0;
+    grafx = IO_WORD(m, PM_GRAFX);
+    io_unmap(&m);
+    if (!(grafx & PM_V3DRSTN))
+        return 0;
+
+    if (io_map(V3D_MB_BASE, &m))
+        return 0;
+    asb_m = IO_WORD(m, ASB_V3D_M_CTRL);
+    asb_s = IO_WORD(m, ASB_V3D_S_CTRL);
+    if ((asb_m | asb_s) & (ASB_REQ_STOP | ASB_ACK))
+    {
+        io_unmap(&m);
+        return 0;
+    }
+    ident = IO_WORD(m, V3D_CTL_IDENT0);
+    io_unmap(&m);
+    return (ident & 0x00FFFFFFu) == 0x00443356u;
+}
+
+#ifndef V3D_BEACONS
+#define g_v3d_warm_detect 1u /* the diagnostic build switches this with the load word WARM */
+#endif
+
+/*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
  * reference (pm.cpp) - direct PM_GRAFX reset deassert + ASB master/slave
  * gate release. No firmware mailbox call required for this step.
@@ -659,11 +707,19 @@ static void record_call_duration(unsigned int t_start)
  * again - the machine froze running real GPU work right after such a
  * reload, without an intervening full reboot. g_powered_on can only
  * ever answer "did *this instance* power on", not "does the hardware
- * actually need it" - the fix is to ask the hardware directly instead:
- * v3d_ensure_clock_on() now reports whether the firmware clock was
- * *already* on before this call touched anything, which is real,
- * instance-independent hardware truth. If so, skip the reset/gate
- * sequence entirely, regardless of this instance's own history.
+ * actually need it" - so the hardware has to be asked.
+ *
+ * THE FIRST ATTEMPT AT THAT ASKED THE WRONG THING (found 2026-10-09).
+ * It used v3d_ensure_clock_on()'s report of whether the FIRMWARE's clock
+ * flag was already on, believing that was "real, instance-independent
+ * hardware truth". It is not: on a Pi 4 the firmware reports the V3D
+ * clock as OFF (state 0) all the time - on a fresh boot, and equally
+ * while the V3D is up and running its jobs - so that test was never
+ * true, the warm path never ran, and every first PowerOn of every module
+ * instance reset-pulsed a running V3D with its bus gates open. That is
+ * the reload freeze. v3d_hw_is_up() (above) now asks the registers
+ * themselves, and if the V3D is already up there is no power-on to do.
+ * See README.md, "The reload freeze: root-caused and fixed".
  */
 static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
 {
@@ -682,6 +738,26 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
         return NULL;
     }
 
+    v3d_beacon(B_PO_ENTER);
+
+    /* --- already up? Ask the hardware, not the firmware flag (see v3d_hw_is_up). If so there is nothing to
+     * power on, and above all no reset pulse: report the clock rate the firmware gives and carry on. */
+    if (g_v3d_warm_detect && v3d_hw_is_up())
+    {
+        unsigned int st, rate, mx;
+
+        err = v3d_query_clock(&st, &rate, &mx);
+        if (err)
+            return err;
+        if (!rate)
+            rate = 250000000u; /* the firmware's default; only reported, never programmed */
+        g_powered_on = 1;
+        g_v3d_clock_rate = rate;
+        *clock_rate_out = rate;
+        v3d_beacon(B_PO_RETURN);
+        return NULL;
+    }
+
     /* --- firmware clock gate: confirmed root cause of every CLE hang
      * logged so far (2026-09-26 hardware test: V3D_ClockInfo reported
      * state=0, clock gated off) - see v3d_clock.h. Must happen before
@@ -689,9 +765,11 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
      * CLE is used: a gated block can still be read/written (explaining
      * why ReadIdent/TestBuffer always worked regardless), so this was
      * never going to show up as a register-access failure. */
+    v3d_beacon(B_PO_CLK_BEFORE);
     err = v3d_ensure_clock_on(&clock_rate, &clock_already_on);
     if (err)
         return err;
+    v3d_beacon(B_PO_CLK_AFTER);
 
     if (clock_already_on)
     {
@@ -713,12 +791,17 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
                 "open (a previous power-on did not complete) - reboot"
         };
 
+        v3d_beacon(B_PO_MAP_BEFORE);
         err = io_map(V3D_MB_BASE, &chk);
         if (err)
             return err;
+        v3d_beacon(B_PO_MAP_AFTER);
         asb_m = IO_WORD(chk, ASB_V3D_M_CTRL);
+        v3d_beacon(B_PO_ASBM_READ);
         asb_s = IO_WORD(chk, ASB_V3D_S_CTRL);
+        v3d_beacon(B_PO_ASBS_READ);
         io_unmap(&chk);
+        v3d_beacon(B_PO_UNMAP_AFTER);
 
         if ((asb_m | asb_s) & (ASB_REQ_STOP | ASB_ACK))
             return &err_asb_closed;
@@ -726,10 +809,12 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
         g_powered_on = 1;
         g_v3d_clock_rate = clock_rate;
         *clock_rate_out = clock_rate;
+        v3d_beacon(B_PO_RETURN);
         return NULL;
     }
 
     /* --- PM_GRAFX: assert then deassert V3D reset (real pulse) --- */
+    v3d_beacon(B_PO_RESET_BEFORE);
     err = io_map(PM_MB_BASE, &pm);
     if (err)
         return err;
@@ -744,8 +829,10 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
     IO_WORD(pm, PM_GRAFX) = PM_PASSWORD | val | PM_V3DRSTN; /* deassert reset */
 
     io_unmap(&pm);
+    v3d_beacon(B_PO_RESET_AFTER);
 
     /* --- ASB master/slave gates (same megabyte as V3D_HUB/CORE0) --- */
+    v3d_beacon(B_PO_ASB_BEFORE);
     err = io_map(V3D_MB_BASE, &v3d);
     if (err)
         return err;
@@ -779,10 +866,12 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
     }
 
     io_unmap(&v3d);
+    v3d_beacon(B_PO_ASB_AFTER);
 
     g_powered_on = 1;
     g_v3d_clock_rate = clock_rate;
     *clock_rate_out = clock_rate;
+    v3d_beacon(B_PO_RETURN);
     return NULL;
 }
 
@@ -1172,6 +1261,10 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
 {
     (void) podule_base;
 
+    v3d_beacon_configure(cmd_tail);
+    v3d_beacon_prepare(B_ZLIFE);
+    v3d_beacon(B_INIT_ENTER);
+
     /* V3DDriver$InitRan/$FinalRan (see set_ran_marker): confirmed on
      * real hardware 2026-09-29 that module_final DOES run on *RMKill -
      * both markers appeared as expected. Discarded here (like
@@ -1238,6 +1331,7 @@ _kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
     /* Deliberately doing nothing else here: no other hardware is
      * touched, and no IO region is mapped, until a SWI or a real
      * GraphicsV call actually asks for it. */
+    v3d_beacon(B_INIT_DONE);
     return NULL;
 }
 
@@ -1308,14 +1402,19 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
     (void) podule_base;
     (void) pw;
 
+    v3d_beacon_prepare(B_ZLIFE);
+    v3d_beacon(B_FINAL_ENTER);
     (void) set_ran_marker("V3DDriver$FinalRan");
 
     idle = gpu_is_idle();
+    v3d_beacon(B_FINAL_IDLE);
     if (!idle && !fatal)
         return &err_gpu_busy;
 
     (void) v3d_gfxv_shutdown();
+    v3d_beacon(B_FINAL_GFXV);
     (void) v3d_irq_shutdown();
+    v3d_beacon(B_FINAL_IRQ);
 
     if (idle)
     {
@@ -1324,10 +1423,12 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
         if (g_pmp_fill_created)
             (void) pmp_destroy(&g_pmp_fill);
     }
+    v3d_beacon(B_FINAL_PMP);
 
     g_pmp_created = 0;
     g_pmp_fill_created = 0;
     g_powered_on = 0;
+    v3d_beacon(B_FINAL_DONE);
     return NULL;
 }
 
@@ -1539,6 +1640,26 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
 {
     (void) pw;
 
+#ifdef V3D_BEACONS
+    /* only the SWIs on the reload-freeze path draw a bar: the polling tools must not flicker it */
+    switch (swi_no)
+    {
+        case SWI_V3D_PowerOn:
+        case SWI_V3D_ReadIdent:
+        case SWI_V3D_ClockInfo:
+            v3d_beacon_prepare(B_ZPOWER);
+            v3d_beacon(B_SWI_ENTER);
+            break;
+        case SWI_V3D_ClearTest:
+        case SWI_V3D_ClearToSprite:
+            v3d_beacon_prepare(B_ZCLEAR);
+            v3d_beacon(B_SWI_ENTER);
+            break;
+        default:
+            break;
+    }
+#endif
+
     switch (swi_no)
     {
         case SWI_V3D_PowerOn:
@@ -1549,6 +1670,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 return err;
             r->r[0] = 1; /* success flag */
             r->r[1] = clock_rate; /* Hz, confirmed on from v3d_ensure_clock_on */
+            v3d_beacon(B_SWI_EXIT);
             return NULL;
         }
 
@@ -2499,7 +2621,67 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
              * confirm it; ASB_ACK's state says whether the gate is
              * actually granted either way. */
             io_mapping_t v3d;
-            _kernel_oserror *err = io_map(V3D_MB_BASE, &v3d);
+            _kernel_oserror *err;
+
+            /* Reload-freeze round 8: three SELECTED read-only banks, so a freeze in one of them still leaves
+             * the earlier banks' values on the screen. R0 = the selector on entry (a value an old caller's
+             * leftover R0 will not have):
+             *   0x51D00001  power side only: PM_GRAFX (R0), ASB master gate (R1), ASB slave gate (R2)
+             *   0x51D00002  hub bank: HUB_IDENT0, HUB_INT_STS, HUB_INT_MSK_STS, MMU_CTL (R0-R3)
+             *   0x51D00003  core bank: CTL_IDENT0, CTL_INT_STS, CTL_INT_MSK_STS, CLE_BFC, CLE_RFC, CT0CS,
+             *               CT1CS, CT0CA, CT0EA, CT0QTS (R0-R9)
+             * Anything else gives the original snapshot below. */
+            {
+                unsigned int sel = (unsigned int) r->r[0];
+
+                if (sel == 0x51D00001u)
+                {
+                    io_mapping_t pm;
+
+                    err = io_map(PM_MB_BASE, &pm);
+                    if (err)
+                        return err;
+                    r->r[0] = IO_WORD(pm, PM_GRAFX);
+                    io_unmap(&pm);
+                    err = io_map(V3D_MB_BASE, &v3d);
+                    if (err)
+                        return err;
+                    r->r[1] = IO_WORD(v3d, ASB_V3D_M_CTRL);
+                    r->r[2] = IO_WORD(v3d, ASB_V3D_S_CTRL);
+                    io_unmap(&v3d);
+                    return NULL;
+                }
+                if (sel == 0x51D00002u || sel == 0x51D00003u)
+                {
+                    err = io_map(V3D_MB_BASE, &v3d);
+                    if (err)
+                        return err;
+                    if (sel == 0x51D00002u)
+                    {
+                        r->r[0] = IO_WORD(v3d, V3D_HUB_IDENT0);
+                        r->r[1] = IO_WORD(v3d, V3D_HUB_INT_STS);
+                        r->r[2] = IO_WORD(v3d, V3D_HUB_INT_MSK_STS);
+                        r->r[3] = IO_WORD(v3d, V3D_MMU_CTL);
+                    }
+                    else
+                    {
+                        r->r[0] = IO_WORD(v3d, V3D_CTL_IDENT0);
+                        r->r[1] = IO_WORD(v3d, V3D_CTL_INT_STS);
+                        r->r[2] = IO_WORD(v3d, V3D_CTL_INT_MSK_STS);
+                        r->r[3] = IO_WORD(v3d, V3D_CLE_BFC);
+                        r->r[4] = IO_WORD(v3d, V3D_CLE_RFC);
+                        r->r[5] = IO_WORD(v3d, V3D_CLE_CT0CS);
+                        r->r[6] = IO_WORD(v3d, V3D_CLE_CT1CS);
+                        r->r[7] = IO_WORD(v3d, V3D_CLE_CT0CA);
+                        r->r[8] = IO_WORD(v3d, V3D_CLE_CT0EA);
+                        r->r[9] = IO_WORD(v3d, V3D_CLE_CT0QTS);
+                    }
+                    io_unmap(&v3d);
+                    return NULL;
+                }
+            }
+
+            err = io_map(V3D_MB_BASE, &v3d);
             if (err)
                 return err;
 
