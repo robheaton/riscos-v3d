@@ -89,6 +89,7 @@ enum
  *   BDRAW    draw the numbered bar on the screen at each point
  *   BDSB     execute a DSB barrier at each point
  *   BZPOWER / BZCLEAR / BZLIFE   restrict the above to those zones (none of the three given = all zones)
+ * OLDCOLD skips the cold path's "stop the bus gates first" hardening, so that noWARM OLDCOLD reproduces the original reload bug.
  * WARM turns on the real fix under test: v3d_power_on decides warm/cold from the hardware (PM_GRAFX, ASB gates, core
  * ident) instead of the firmware clock flag, so a reloaded module never reset-pulses a running V3D.
  * Two more words change the OLD test path itself (V3D_ClearTest / V3D_ClearToSprite), to make it submit jobs the way the
@@ -101,6 +102,7 @@ enum
 void v3d_beacon_configure(const char *cmd_tail);
 void v3d_beacon_prepare(unsigned int zone);
 void v3d_beacon(unsigned int step);
+extern unsigned int g_v3d_cold_unsafe; /* OLDCOLD: skip stopping the ASB gates before the reset (reproduces the old bug with noWARM) */
 extern unsigned int g_v3d_warm_detect;  /* WARM: v3d_power_on asks the hardware whether the V3D is already up (the fix) */
 extern unsigned int g_v3d_legacy_perm; /* LPERM: legacy kicks use the permanent register mapping   */
 extern unsigned int g_v3d_legacy_dsb;  /* LDSB: legacy submission executes a DSB before the doorbell */

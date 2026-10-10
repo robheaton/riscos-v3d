@@ -29,6 +29,7 @@ static unsigned int g_current;       /* the step shown red (0 = none)           
 static unsigned int g_draw = 0;      /* BDRAW: draw the bar                                   */
 static unsigned int g_dsb = 0;       /* BDSB: barrier at every point                          */
 static unsigned int g_zones = B_ZPOWER | B_ZCLEAR | B_ZLIFE;
+unsigned int g_v3d_cold_unsafe = 0;
 unsigned int g_v3d_warm_detect = 0;
 unsigned int g_v3d_legacy_perm = 0;
 unsigned int g_v3d_legacy_dsb = 0;
@@ -173,6 +174,7 @@ void v3d_beacon_configure(const char *cmd_tail)
     if (has_word(cmd_tail, "BZCLEAR")) z |= B_ZCLEAR;
     if (has_word(cmd_tail, "BZLIFE")) z |= B_ZLIFE;
     g_zones = z ? z : (B_ZPOWER | B_ZCLEAR | B_ZLIFE);
+    g_v3d_cold_unsafe = has_word(cmd_tail, "OLDCOLD") ? 1u : 0u;
     g_v3d_warm_detect = has_word(cmd_tail, "WARM") ? 1u : 0u;
     g_v3d_legacy_perm = has_word(cmd_tail, "LPERM") ? 1u : 0u;
     g_v3d_legacy_dsb = has_word(cmd_tail, "LDSB") ? 1u : 0u;
@@ -190,6 +192,8 @@ void v3d_beacon_configure(const char *cmd_tail)
     if (g_zones & B_ZCLEAR) { line[n++] = 'C'; }
     if (g_zones & B_ZLIFE)  { line[n++] = 'L'; }
     s = g_v3d_warm_detect ? " WARM" : " noWARM";
+    while (*s) line[n++] = *s++;
+    s = g_v3d_cold_unsafe ? " OLDCOLD" : "";
     while (*s) line[n++] = *s++;
     s = g_v3d_legacy_perm ? " LPERM" : " noLPERM";
     while (*s) line[n++] = *s++;

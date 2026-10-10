@@ -669,7 +669,63 @@ static int v3d_hw_is_up(void)
 
 #ifndef V3D_BEACONS
 #define g_v3d_warm_detect 1u /* the diagnostic build switches this with the load word WARM */
+#define g_v3d_cold_unsafe 0u /* the diagnostic build's load word OLDCOLD skips v3d_stop_bridge, to reproduce the old bug */
 #endif
+
+/*
+ * Before the cold path asserts reset, make sure the ASB bus gates are STOPPED - slave first, then master, each with
+ * the PM password and a wait for its ACK - exactly as Linux's bcm2835_asb_power_off does before it asserts reset
+ * (drivers/pmdomain/bcm/bcm2835-power.c). On a fresh boot both gates are already stopped (REQ_STOP and ACK set), so
+ * this does nothing and the proven power-on sequence is unchanged. It matters when the cold path runs on a V3D that
+ * is up behind OPEN gates - which v3d_power_on only reaches now if v3d_hw_is_up() did not recognise it (an
+ * unexpected ident, a half-powered state): resetting a live V3D behind an open bridge is what jammed the slave
+ * bridge in the reload freeze. If a gate will not stop, nothing is reset and the user is told to reboot.
+ */
+static _kernel_oserror *v3d_stop_bridge(void)
+{
+    static _kernel_oserror err_no_stop = {
+        52, "V3DDriver: a V3D bus gate did not stop, so the V3D is not being reset - reboot"
+    };
+    io_mapping_t m;
+    _kernel_oserror *err;
+    unsigned int spin, reg;
+    static const unsigned int order[2] = { ASB_V3D_S_CTRL, ASB_V3D_M_CTRL }; /* slave, then master */
+    unsigned int i;
+
+    if (g_v3d_cold_unsafe)
+        return NULL;
+
+    err = io_map(V3D_MB_BASE, &m);
+    if (err)
+        return err;
+
+    if ((IO_WORD(m, ASB_V3D_S_CTRL) & ASB_REQ_STOP) && (IO_WORD(m, ASB_V3D_M_CTRL) & ASB_REQ_STOP))
+    {
+        io_unmap(&m);
+        return NULL; /* already stopped: a fresh boot */
+    }
+
+    for (i = 0; i < 2u; i++)
+    {
+        reg = order[i];
+        IO_WORD(m, reg) = PM_PASSWORD | (IO_WORD(m, reg) | ASB_REQ_STOP);
+        for (spin = 0; !(IO_WORD(m, reg) & ASB_ACK); spin++)
+        {
+            if (spin > 100000u)
+            {
+                /* put back what was stopped, newest first, and refuse */
+                unsigned int j;
+                for (j = i + 1u; j-- > 0u; )
+                    IO_WORD(m, order[j]) = PM_PASSWORD | (IO_WORD(m, order[j]) & ~ASB_REQ_STOP);
+                io_unmap(&m);
+                return &err_no_stop;
+            }
+        }
+    }
+
+    io_unmap(&m);
+    return NULL;
+}
 
 /*
  * Power-on sequence, transcribed from the MIT-licensed bare-metal
@@ -814,6 +870,10 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
     }
 
     /* --- PM_GRAFX: assert then deassert V3D reset (real pulse) --- */
+    err = v3d_stop_bridge();
+    if (err)
+        return err;
+
     v3d_beacon(B_PO_RESET_BEFORE);
     err = io_map(PM_MB_BASE, &pm);
     if (err)
