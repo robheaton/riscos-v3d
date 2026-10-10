@@ -2899,6 +2899,32 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             unsigned int view = (unsigned int) r->r[0];
             unsigned int reset = (unsigned int) r->r[1];
 
+            /* 10 = census of fill/copy work (0.12 rev f): R1 = -1 zeroes the census and the job-time sums and
+             * starts the clock; otherwise R1 = kind (0 fill, 1 copy, 2 scroll), R2 = size bucket 0-9 (pixel area
+             * up to 64, 256, 1K, 4K, 16K, 64K, 256K, 1M, 4M, above). Returns R0 taken by the GPU, R1 left to
+             * the CPU, R2 kilopixels the GPU did, R3 kilopixels left to the CPU, R4 microseconds since the reset. */
+            if (view == 10u)
+            {
+                if (reset == 0xFFFFFFFFu)
+                {
+                    v3d_census_reset();
+                    v3d_prof_reset();
+                    r->r[0] = r->r[1] = r->r[2] = r->r[3] = r->r[4] = 0;
+                }
+                else
+                {
+                    unsigned int out[5];
+
+                    v3d_census_read(reset, (unsigned int) r->r[2], out);
+                    r->r[0] = out[0];
+                    r->r[1] = out[1];
+                    r->r[2] = out[2];
+                    r->r[3] = out[3];
+                    r->r[4] = out[4];
+                }
+                return NULL;
+            }
+
             if (view <= 1u)
             {
                 v3d_prof_t *k = &g_v3d_prof[view];

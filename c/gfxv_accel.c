@@ -268,6 +268,13 @@ static volatile unsigned int g_trace_n = 0;
 static volatile unsigned int g_trace_armed = 0;
 static unsigned int g_trace_seq = 0;
 static unsigned int g_trace_outcome = TRACE_NONE;
+
+/* Census storage (see census_note below). */
+extern unsigned int v3d_time_us(void);
+typedef struct { unsigned int n_gpu, n_cpu, kpix_gpu, kpix_cpu; } census_t;
+static census_t g_census[V3D_CENSUS_KINDS][V3D_CENSUS_BUCKETS];
+static unsigned int g_census_start_us = 0;
+static unsigned int g_census_scroll = 0; /* set by handle_render_copy when it takes the overlapping branch */
 static unsigned int g_trace_errnum = 0;
 
 void v3d_gfxv_trace_arm(void)
@@ -760,6 +767,7 @@ static void handle_render_copy(_kernel_swi_regs *r)
         src_bottom < dest_bottom + height && dest_bottom < src_bottom + height)
     {
         g_gfxv_copy_overlap_count++;
+        g_census_scroll = 1u;
 
         /* Overlapping copies have their own byte limit (now equal to the
          * copy limit: a scroll is one GPU pass since 0.09). */
@@ -816,6 +824,78 @@ static void handle_render_copy(_kernel_swi_regs *r)
     g_gfxv_copy_claimed_count++;
     g_trace_outcome = TRACE_CLAIMED;
     r->r[4] = 0; /* claimed */
+}
+
+/*
+ * CENSUS (0.12 rev f): how much fill and copy work real use actually sends through GraphicsV, by kind and size, and
+ * who did it. Every fill and copy Render that is not a re-entry is counted in one of 3 kinds (fill, copy, scroll =
+ * overlapping copy) x 10 size buckets (pixel area up to 64, 256, 1K, 4K, 16K, 64K, 256K, 1M, 4M and above), split
+ * into "taken by the GPU" and "left to the CPU" (for any reason), with the kilopixels in each. It is never reset by
+ * anything but V3D_AccelProfile 10, so a session can be measured. Cost: a few instructions per call.
+ */
+
+void v3d_census_reset(void)
+{
+    unsigned int k, b;
+
+    for (k = 0; k < V3D_CENSUS_KINDS; k++)
+        for (b = 0; b < V3D_CENSUS_BUCKETS; b++)
+            g_census[k][b].n_gpu = g_census[k][b].n_cpu = g_census[k][b].kpix_gpu = g_census[k][b].kpix_cpu = 0;
+    g_census_start_us = v3d_time_us();
+}
+
+/* out[0..3] = n_gpu, n_cpu, kpix_gpu, kpix_cpu; out[4] = microseconds since the last reset. */
+void v3d_census_read(unsigned int kind, unsigned int bucket, unsigned int *out)
+{
+    out[4] = v3d_time_us() - g_census_start_us;
+    if (kind >= V3D_CENSUS_KINDS || bucket >= V3D_CENSUS_BUCKETS)
+    {
+        out[0] = out[1] = out[2] = out[3] = 0;
+        return;
+    }
+    out[0] = g_census[kind][bucket].n_gpu;
+    out[1] = g_census[kind][bucket].n_cpu;
+    out[2] = g_census[kind][bucket].kpix_gpu;
+    out[3] = g_census[kind][bucket].kpix_cpu;
+}
+
+static void census_note(unsigned int op, const _kernel_swi_regs *r, unsigned int outcome)
+{
+    const unsigned int *p = (const unsigned int *) r->r[2];
+    unsigned int w, h, area, thresh = 64u, bucket = 0u, kind;
+    census_t *c;
+
+    if (op == RENDER_OP_FILL)
+    {
+        w = p[2] - p[0] + 1u;
+        h = p[1] - p[3] + 1u;
+        kind = 0u;
+    }
+    else
+    {
+        w = p[4] + 1u;
+        h = p[5] + 1u;
+        kind = g_census_scroll ? 2u : 1u;
+    }
+    if (w > 16384u || h > 16384u)
+        return; /* nonsense dimensions: never count garbage */
+    area = w * h;
+    while (area > thresh && bucket < V3D_CENSUS_BUCKETS - 1u)
+    {
+        thresh <<= 2;
+        bucket++;
+    }
+    c = &g_census[kind][bucket];
+    if (outcome == TRACE_CLAIMED)
+    {
+        c->n_gpu++;
+        c->kpix_gpu += (area + 512u) >> 10;
+    }
+    else
+    {
+        c->n_cpu++;
+        c->kpix_cpu += (area + 512u) >> 10;
+    }
 }
 
 /* Record one fill/copy Render in the trace (when armed). */
@@ -896,11 +976,13 @@ int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw)
         g_gfxv_busy = 1;
         g_trace_outcome = TRACE_NONE;
         g_trace_errnum = 0;
+        g_census_scroll = 0u;
         if (op == RENDER_OP_FILL)
             handle_render_fill(r);
         else
             handle_render_copy(r);
         g_gfxv_busy = 0;
+        census_note(op, r, g_trace_outcome);
         trace_render(op, r, g_trace_outcome, g_trace_errnum);
     }
     /* op 0 (no-op) and any other value: not ours, R4 left untouched */

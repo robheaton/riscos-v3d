@@ -168,4 +168,11 @@ _kernel_oserror *v3d_gfxv_shutdown(void);
  */
 int v3d_gfxv_handler(_kernel_swi_regs *r, void *pw);
 
+
+/* Census of the fill and copy work seen (see gfxv_accel.c): 3 kinds (0 fill, 1 copy, 2 scroll) x 10 size buckets. */
+#define V3D_CENSUS_KINDS   3u
+#define V3D_CENSUS_BUCKETS 10u
+void v3d_census_reset(void);
+void v3d_census_read(unsigned int kind, unsigned int bucket, unsigned int *out);
+
 #endif /* GFXV_ACCEL_H */

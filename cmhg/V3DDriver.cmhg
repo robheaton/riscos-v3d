@@ -14,7 +14,7 @@
 ; request a real allocation via !Allocate to allocate@riscosopen.org.
 
 title-string:            V3DDriver
-help-string:              V3DDriver 0.12 (rev e: reload fixed, safer cold start, test SWIs fail-stop, accel auto-starts - see NoAutoStart)
+help-string:              V3DDriver 0.12 (rev f: reload fixed, safer cold start, fill and copy census, accel auto-starts - see NoAutoStart)
 initialisation-code:      module_init
 finalisation-code:        module_final
 swi-chunk-base-number:    0xC0040
