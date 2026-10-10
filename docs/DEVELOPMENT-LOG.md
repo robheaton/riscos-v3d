@@ -1,3 +1,8 @@
+> **This is the unabridged development log**, kept as it was written during bring-up (September-October 2026): every
+> hardware round trip, wrong turn and fix, with dates. It is long and some early statements are superseded by later
+> sections - read the dates. For what the driver is and how to use it, see the [README](../README.md). The story of the
+> reload freeze, now fixed, is in the section "The reload freeze: root-caused and fixed".
+
 # V3DDriver — real desktop fills and copies now GPU-accelerated via GraphicsV, hardware-verified
 
 An independent RISC OS module driving the Raspberry Pi 4/CM4's
@@ -3795,8 +3800,8 @@ before asserting reset, as Linux does, would harden it.
 `BDRAW` (numbered bar on screen at each step: white = reached, red = latest; the first diagnostic builds used the
 palette byte order by mistake and showed cyan and green - the positions were always right),
 `BDSB` (a `DSB` at each step), `BZPOWER`/`BZCLEAR`/`BZLIFE` (restrict to one part of the code), `LPERM`/`LDSB`
-(legacy submission like the accelerated one) and `WARM` (the fix; **without it the diagnostic build reproduces the
-old bug**, which is what makes it useful for regression testing). `V3D_RegSnapshot` takes selectors in R0
+(legacy submission like the accelerated one) and `WARM` (the fix; with the cold-start hardening of rev e, reproducing the old bug needs **`noWARM` plus `OLDCOLD`**, which is what
+makes the diagnostic build useful for regression testing). `V3D_RegSnapshot` takes selectors in R0
 (`&51D00001` power side, `&51D00002` hub, `&51D00003` core). `test/ReloadProbe.bas` prints them decoded.
 `test/host/beacon_test.c` (in `make hosttest`) checks the drawing code and that the inert setting does nothing.
 The legacy timeout message now shows the interrupt masks and both frame counters before and after the kick.
