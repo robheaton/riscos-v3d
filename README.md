@@ -3783,8 +3783,10 @@ takes the old path unchanged.
 **Not established.** (a) Why the accelerated reloads (tests A, D) passed before the fix. A working theory is that
 `VerifySuite`, which ends by sending the clock rate to the firmware (`V3D_AccelTune 8,250`), makes the firmware flag
 read "on" afterwards; `ReloadProbe`'s optional step 8 tests exactly that, and has not been run. (b) The legacy test
-SWIs still have no fail-stop latch: after a timeout the next submission goes to a possibly dead core (a retry in
-the same instance escalated to a hard freeze on 28 Sept). (c) The cold path itself would still be unsafe if it were
+SWIs had no fail-stop latch: after a timeout the next submission went to a possibly dead core (a retry in the
+same instance escalated to a hard freeze on 28 Sept). Rev d (2026-10-10) latches on a legacy timeout exactly as the
+accelerated path does and refuses further submissions until a reboot or `V3D_AccelTune 6`; the normal path is
+unchanged, but the latch itself has not been provoked on hardware. (c) The cold path itself would still be unsafe if it were
 ever run on a V3D that is up but fails `v3d_hw_is_up` (for example an unexpected ident); stopping the ASB gates
 before asserting reset, as Linux does, would harden it.
 

@@ -61,6 +61,7 @@
 #endif
 #include "sprite.h"
 #include "v3d_irq.h"
+#include "cl_common.h" /* g_v3d_wedged, v3d_gpu_check: the fail-stop latch shared with the accelerated path */
 
 #define CL_PAGE_COUNT           1u  /* BCL+RCL combined, both tiny */
 #define RENDER_TARGET_PAGE_COUNT 4u /* 64*64*4 bytes = 16384 = 4 pages */
@@ -387,6 +388,11 @@ static _kernel_oserror *v3d_poll_counter(volatile unsigned int *irq_counter,
             return NULL;
     }
 
+    /* Fail-stop, exactly as the accelerated path does (note_timeout in cl_common.c): latch FIRST, so nothing below
+     * can undo it. A job that timed out leaves the CLE in a state nobody has checked, and a retry in the same
+     * module instance has hard-frozen the machine before (28 Sept). The legacy test SWIs and the accelerated path
+     * now refuse to submit until the user reboots or re-arms with V3D_AccelTune 6. */
+    g_v3d_wedged = 1;
     diagnose_timeout(timeout_err, what, is_bin, qba, qea, bufs);
     return timeout_err;
 }
@@ -508,6 +514,9 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     unsigned int page = base_page;
     diag_bufs_t diag_bufs;
 
+    err = v3d_gpu_check(); /* latched by an earlier timeout: do not feed a possibly dead CLE */
+    if (err)
+        return err;
     v3d_beacon(B_CT_ENTER);
     {
         clear_scratch_cache_t *cache = find_or_create_clear_scratch(pmp, base_page,
@@ -771,6 +780,10 @@ _kernel_oserror *v3d_16bpp_format_test(pmp_area_t *pmp, unsigned int base_page,
     unsigned int last_bin_irq, last_render_irq;
     unsigned int page = base_page;
     diag_bufs_t diag_bufs;
+
+    err = v3d_gpu_check(); /* latched by an earlier timeout: do not feed a possibly dead CLE */
+    if (err)
+        return err;
 
     err = pmp_alloc(pmp, page, CL_PAGE_COUNT, &cl_phys, &cl_log);
     if (err) return err;
