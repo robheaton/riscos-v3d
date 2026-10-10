@@ -12,3 +12,6 @@ test/host/beacon_test
 test/host/*.ppm
 beacons/
 V3DDriver_beacons,ffa
+dist4k/build/
+dist4k/build2/
+dist4k/*.zip

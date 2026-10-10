@@ -1,0 +1,74 @@
+V3DDriver 0.12 rev c - 4K test pack
+===================================
+
+What this is
+------------
+An independent RISC OS module that uses the Raspberry Pi 4's GPU (the V3D) to
+draw rectangle fills and copies (window scrolling and dragging) for the desktop.
+It has been hardware-tested at 1920x1080 and 1920x1200 in both 32 and 16 bits
+per pixel. It has NEVER been run at 4K - nobody who has worked on it has a 4K
+display - and that is what this pack is for. Thank you for helping.
+
+Needs: Raspberry Pi 4B, Pi 400 or Compute Module 4 (the BCM2711 chip), a recent
+RISC OS 5 build, and a 4K (3840x2160) display. NOT the Pi 5, NOT the Pi 3.
+The module changes nothing on disk. If anything goes wrong, power-cycle.
+
+What is in the folder
+---------------------
+  V3DDriver     the module
+  VerifySuite   draws hundreds of fills and copies on the GPU and on the CPU and
+                compares every pixel (takes a few minutes)
+  GpuCheck      prints what the GPU has done so far
+  TraceDump     (only if something looks wrong) shows what the driver saw
+
+Before you start - config.txt
+-----------------------------
+A 4K screen needs more video memory than the default. In config.txt use
+    gpu_mem=128
+(or more), then reboot. For 4K at 60 Hz on a Pi 4 you also need the usual HDMI
+settings (for example hdmi_enable_4kp60=1) and a cable and display that can do
+it; 4K at 30 Hz works without. If your usual 4K setup already works on RISC OS,
+leave it as it is and just check gpu_mem.
+
+The test
+--------
+Please write down what you see at each step. Double-click files in the Filer; do
+NOT type the test names into a Task Window (a Task Window swallows the drawing
+the scripts test, and they will tell you so).
+
+ 1. Reboot. In the Display manager choose 3840 x 2160 and "16 million colours"
+    (32 bits per pixel). Note the exact mode you chose.
+ 2. Double-click V3DDriver in the Filer. It loads and starts accelerating.
+    Nothing is printed. Use the desktop for a minute: drag some windows about,
+    scroll a long window, open a few more. Note any glitches (pieces of window in
+    the wrong place, stripes, black areas, a freeze).
+ 3. Double-click GpuCheck. Note ALL of its output. Near the top it names the
+    module version (it should say "0.12" and "rev c"). The line that matters
+    most is "RESULT:" at the bottom, and whether it says the screen was ever
+    declined.
+ 4. Double-click VerifySuite. When it asks, press 1. It takes a few minutes and
+    draws on the right-hand part of the screen. It ends with either
+    "ALL ... CASES IDENTICAL TO THE CPU" (good) or a list of cases that differ.
+    Note the last lines, and the "Screen:" line near the top.
+ 5. Press the 5 option the same way: run VerifySuite again and press 5. (At 4K
+    the driver cuts big rectangles into bands anyway; option 5 forces many more
+    cuts, which is the harshest test.)
+ 6. Run GpuCheck again and note its output.
+ 7. Now repeat steps 3 to 6 at "65 thousand colours" (16 bits per pixel). To
+    change the mode with the module loaded is itself part of the test: the
+    driver has to notice the new screen. If you prefer, reboot first.
+
+If it freezes: note the last thing you saw (and which step it was), power-cycle,
+and tell us. If the screen cannot be set to 4K at all, or the desktop is blank
+or garbled, say so and what config.txt contains - that tells us about memory,
+not the driver.
+
+What to send back
+-----------------
+  - Pi model and memory size, RISC OS version, the monitor
+  - the config.txt lines you changed
+  - the exact mode(s) you tested
+  - the output of GpuCheck and VerifySuite (photos of the screen are fine)
+  - anything that looked wrong, however small
+
+Not being able to say "it works" is useful too: please send what you got.

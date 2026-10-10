@@ -34,7 +34,7 @@ REM
 REM Needs the module built with V3D_AccelLimits (SWI 30).
 REM Before running: *RMLoad the built V3DDriver,ffa yourself.
 
-NS% = 13
+NS% = 17
 NOP% = 3
 dur% = 50 : REM measurement time per run, in centiseconds
 DIM W%(NS%), H%(NS%)
@@ -47,6 +47,9 @@ FOR i% = 1 TO NS%
 NEXT
 DATA 8,8, 16,16, 32,32, 64,64, 96,96, 128,128, 192,192, 256,256, 384,384, 512,512
 DATA 1024,16, 512,32, 16,512
+REM Big rectangles (added for large screens, where a job is cut into bands): they are skipped on a screen too
+REM small to hold them and their copy destination, like any other size that does not fit.
+DATA 768,768, 1024,1024, 1600,700, 1900,1000
 
 limsaved% = FALSE
 stage$ = "setup"
@@ -66,7 +69,7 @@ orgx% = vout%!28 : orgy% = vout%!32
 REM Identify exactly which script and which module build are running, since
 REM files are copied between machines by hand.
 PROCmodinfo
-PRINT "FillCopyBench v5 (solid-colour fill) - module: "; help$
+PRINT "FillCopyBench v6 (solid-colour fill, big sizes) - module: "; help$
 PRINT "Screen depth: "; 1 << log2bpp%; " bits per pixel"
 PRINT "Graphics window (pixels): "; gwl%; ","; gwb%; " to "; gwr%; ","; gwt%
 PRINT "Graphics origin (OS units): "; orgx%; ","; orgy%

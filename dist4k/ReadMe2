@@ -1,0 +1,61 @@
+V3DDriver 0.12 rev c - test pack 2 (big screens: is it correct, and is it faster?)
+===================================================================================
+
+Thank you for the first round. It showed the GPU driver working correctly on a
+3440x1440 screen (VerifySuite: all 450 cases identical to the CPU, including the
+cases that cut a big rectangle into several GPU jobs). Two questions are left:
+
+  1. Is it ALSO correct at 32 bits per pixel, and at a true 4K (3840x2160)
+     screen if you can set one? (Only 16 bits per pixel at 3440x1440 so far.)
+  2. Is it actually FASTER than the CPU at these sizes? The desktop mostly draws
+     small things that the driver leaves to the CPU on purpose, so you may not
+     notice it; this pack measures it directly.
+
+The folder
+----------
+  V3DDriver       the module (same one as before: 0.12 rev c)
+  VerifySuite     pixel-by-pixel check of the GPU against the CPU
+  GpuCheck        prints what the GPU has done so far
+  FillCopyBench   NEW: times fills, copies and scrolls of 17 sizes, three ways:
+                  CPU only, GPU for everything, and the driver's default rules
+  TraceDump       only if something looks wrong
+
+Always double-click scripts in the Filer. NEVER type them into a Task Window
+(it swallows the drawing, and the numbers come out meaningless).
+
+Part A - correctness at 32 bits per pixel (about 10 minutes)
+------------------------------------------------------------
+ 1. Set your biggest mode (3840x2160 if you can; otherwise 3440x1440) at
+    "16 million colours" (32 bits per pixel). Write down the mode.
+ 2. Double-click V3DDriver (skip if it is already loaded).
+ 3. Double-click VerifySuite, press 1. Note the "Screen:" line near the top and
+    the last line ("ALL ... IDENTICAL TO THE CPU" is a pass).
+ 4. Run it again and press 5 (forces many more cuts). Note the last line.
+
+Part B - speed (about 5 minutes per run)
+----------------------------------------
+ 5. Double-click FillCopyBench. It prints the screen depth and the driver's
+    limits, then runs three passes (CPU, GPU, GPU with default limits). It
+    scribbles on the lower-left of the screen; that is harmless. Do not touch
+    the mouse while it runs.
+ 6. When it says "Done", press SPACE. It prints three tables (fill, copy,
+    scroll). PHOTOGRAPH ALL OF THEM. The columns that matter are "Speedup"
+    (above 1.00x the GPU is faster) and "Dflt" (what you really get).
+ 7. Repeat steps 1 to 6 at "65 thousand colours" (16 bits per pixel).
+
+Part C - how it feels (optional)
+--------------------------------
+ 8. Drag a big window around, scroll a long page, switch between large windows.
+    Then in a Task Window type   *RMKill V3DDriver   and do the same without the
+    GPU. Say honestly whether you can tell the difference.
+
+What to send back
+-----------------
+  - the exact modes tested (width x height, bits per pixel)
+  - the last lines of every VerifySuite run
+  - photos of the FillCopyBench tables for each depth
+  - anything that glitched or froze (and the last thing on screen)
+  - if you have RISCOSmark, its totals with and without the module
+
+Big numbers above 1.00x on the large sizes at the bottom of the tables are the
+interesting ones. A result that says the GPU is NOT faster is just as useful.

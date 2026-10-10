@@ -11,9 +11,9 @@ Confirmed on real hardware, not just build-verified.
 > **Reloading without a reboot** (`*RMKill` then `*RMLoad`) used to
 > freeze the machine. It is root-caused and fixed in 0.12 rev c
 > (2026-10-09) - see "The reload freeze: root-caused and fixed" near the
-> end. The fix is hardware-verified on the diagnostic build; the plain
-> rev c build is still being re-verified, so until that is recorded
-> there, keep rebooting between loads.
+> end. Hardware-verified on the plain rev c module (2026-10-10): reload
+> without a reboot works for the test SWIs, for the accelerated desktop,
+> and between the two.
 
 - **M0/M1** — power on the V3D block, read its identity registers back
   correctly (confirms it reports itself as V3D 4.2, matching the known
@@ -3688,10 +3688,12 @@ the driver itself allocates comes out of `gpu_mem`.
 
 ## The reload freeze: root-caused and fixed (2026-10-09, 0.12 rev c)
 
-**Status: fixed. Hardware-verified on the diagnostic build (`WARM` switch on: six runs of `StressTest` across
-reloads, no freeze and no timeout). Before the fix, nine of the ten reload tests of this round failed (B, C and
-F-L; the tenth, build E, passed once and was luck). The plain rev c module is being re-verified; this section is
-updated when that is recorded.**
+**Status: fixed and hardware-verified. On the diagnostic build (`WARM` switch on): six runs of `StressTest` across
+reloads, no freeze and no timeout. Before the fix, nine of the ten reload tests of this round failed (B, C and
+F-L; the tenth, build E, passed once and was luck). On the plain rev c module (2026-10-10, three fresh boots, all
+passed): (1) old test path, then two reloads of it, `StressTest` each time; (2) old test path, then the
+accelerated module, `VerifySuite` 450/450 identical to the CPU; (3) accelerated desktop with real use and the Task
+Manager, `*RMKill`/`*RMLoad`, desktop use again, `VerifySuite`, `GpuCheck`, and a second reload.**
 
 **The bug.** `*RMKill V3DDriver` then `*RMLoad` with no reboot, then GPU work, froze the machine hard - or, in a
 milder form, made the first GPU job of the new instance time out (`error 7`, `CS=0x10`). The accelerated desktop
