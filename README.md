@@ -3686,6 +3686,41 @@ accounting, any screen declines, and the register details of the first four lost
 16.6 MB), so 4K at 32bpp needs about 66 MB and will not fit `gpu_mem=64`; use 128 or more for 4K. Nothing
 the driver itself allocates comes out of `gpu_mem`.
 
+### 0.12 on a bigger screen: a friend's Pi, 3440x1440 (2026-10-10, hardware-verified; true 3840x2160 still untested)
+
+The module (0.12 rev c) was run on a friend's Pi 4 with a 3440x1440 screen - 1,242 tiles, more than twice the 510
+one GPU job can hold, so every large rectangle really is cut into bands. (His V3D clock was 250 MHz with a
+firmware maximum of 650 MHz.) The best he can display is 3440x1440, so true 4K has still not been run: it is about
+2,040 tiles through the same code.
+
+**Correctness.** `VerifySuite` options 1 and 5, at 16 bpp and at 32 bpp: all 450 cases identical to the CPU each
+time, fills, copies and scrolls 150/150, nothing "not accelerated". Option 5 forced the cutting: 224 GPU jobs for
+150 scrolls (150 at the default). `GpuCheck` after desktop use: 21,034 operations on the GPU, none failed, no
+timeouts, interrupts exactly one per job, the screen never declined. So nothing in the driver refuses a screen of
+this size; before 0.12 anything over about 1920x1088 was declined outright.
+
+**Speed** (`FillCopyBench` v6, microseconds per operation, CPU against GPU; the photographed tables do not show the
+depth line, presumably 32 bpp as in the same session's `VerifySuite`):
+
+| operation | size | CPU us | GPU us | speed-up |
+|---|---|---|---|---|
+| copy | 64x64 | 146 | 17 | 8.4x |
+| copy | 128x128 | 299 | 34 | 8.8x |
+| copy | 512x512 | 1968 | 365 | 5.4x |
+| copy | 768x768 | 4032 | 823 | 4.9x |
+| copy | 1024x1024 | 6849 | 1457 | 4.7x |
+| scroll | 1024x1024 | 7575 | 1461 | 5.2x |
+| scroll | 1900x1000 | 11111 | 2659 | 4.2x |
+| fill | 128x128 | 96 | 22 | 4.2x |
+| fill | 512x512 | 591 | 226 | 2.6x |
+| fill | 1024x1024 | 1785 | 910 | 2.0x |
+| fill | 1900x1000 | 2192 | 1650 | 1.3x |
+
+The GPU first wins at 64x64 for fills and 16x16 for copies. A thin 1024x16 fill is slower on the GPU (0.67x); the
+default size limits leave it to the CPU (0.99x). His first impression, "no performance increase", fits what the
+desktop mostly draws: of 48,398 fills `GpuCheck` saw, 47,758 were small ones left to the CPU on purpose. Copies and
+scrolls of big windows are where the GPU takes over.
+
 ## The reload freeze: root-caused and fixed (2026-10-09, 0.12 rev c)
 
 **Status: fixed and hardware-verified. On the diagnostic build (`WARM` switch on): six runs of `StressTest` across
