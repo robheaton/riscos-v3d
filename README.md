@@ -116,6 +116,12 @@ The full story - every hardware round trip, the bugs found, and the long hunt fo
 firmware clock flag that always reads "off", so every first power-on reset-pulsed a running V3D) - is in
 [`docs/DEVELOPMENT-LOG.md`](docs/DEVELOPMENT-LOG.md).
 
+## Licence
+
+GNU General Public License, version 2 or (at your option) any later version - the same licence as the Linux V3D
+driver this one follows. See [`LICENSE`](LICENSE); third-party notices, including the MIT notice for the bare-metal
+reference the register offsets come from, are in [`NOTICE`](NOTICE).
+
 ## Credits
 
 Register offsets and the power-on sequence are taken, with attribution, from the MIT-licensed bare-metal reference

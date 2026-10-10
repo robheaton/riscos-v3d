@@ -1,0 +1,56 @@
+V3DDriver - GPU acceleration for the RISC OS desktop on the Raspberry Pi 4
+
+Copyright (C) 2026 Rob Heaton
+
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public
+License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later
+version (SPDX: GPL-2.0-or-later). The full text of version 2 is in the file LICENSE. It is the same licence as the
+Linux V3D driver this one follows.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+
+Third-party material
+====================
+
+1. rpi4-gpu-bare-metal-examples (MIT licence)
+   https://github.com/Random06457/rpi4-gpu-bare-metal-examples
+
+   The V3D register offsets (c/v3d_regs.h) and the power-on sequence (v3d_power_on in c/module.c) are transcribed from
+   this project. Its licence, which requires this notice to be kept, follows. It is compatible with the GPL.
+
+------------------------------------------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2022 Random06457
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+------------------------------------------------------------------------------------------------------------------
+
+2. The Linux kernel V3D and power-management drivers (GPL-2.0-or-later, Copyright (C) Broadcom)
+   drivers/gpu/drm/v3d/ and drivers/pmdomain/bcm/bcm2835-power.c
+
+   This driver's behaviour was checked against them throughout: the V3D interrupt enable and acknowledge order, the
+   cache flush sequence including the GFXH-1897 erratum guard, the job submission order, and the power-down order of
+   the ASB bus gates. Register names follow v3d_regs.h there.
+
+3. RISC OS and ROOL's published sources and documentation (the kernel's GraphicsV handling, BCMSupport, BCMVideo, the
+   OS_Memory and OS_DynamicArea documentation) were read to find out how the interfaces behave; they are not
+   redistributed here.
