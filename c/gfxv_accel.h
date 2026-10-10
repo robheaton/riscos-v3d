@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * gfxv_accel.h - steps 4-5 of the planned GraphicsV Render accelerator
  * (see README.md's "GraphicsV Render accelerator" section): claim

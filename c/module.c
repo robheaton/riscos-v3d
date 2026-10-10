@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * module.c - RISC OS module skeleton for milestone M0/M1 of an
  * independent V3D (Pi 4 / CM4 GPU) driver: power on the block, read

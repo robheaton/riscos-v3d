@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * screen_info.h - read-only groundwork for GraphicsV Render acceleration
  * (see README.md's "GraphicsV Render accelerator" section): fetch the

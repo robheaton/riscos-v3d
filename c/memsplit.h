@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * memsplit.h - query the ARM/VideoCore memory split via the firmware's
  * property-tag mailbox interface.

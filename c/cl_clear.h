@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * cl_clear.h - M2: the smallest possible real V3D job - bin an empty
  * primitive list, render a single 64x64 tile by clearing it to a solid

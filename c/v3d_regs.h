@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * v3d_regs.h - BCM2711 V3D / power-management / mailbox register offsets.
  *

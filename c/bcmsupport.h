@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * bcmsupport.h - shared helper for calling into RISC OS's BCMSupport
  * module's property-tag mailbox SWI. See memsplit.c for why we go

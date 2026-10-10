@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * cl_copy.h - GraphicsV Render op 1 (rectangle copy) for the planned
  * GraphicsV Render accelerator (see README.md), needed for window-

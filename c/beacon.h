@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * beacon.h - screen beacons for localising a HARD FREEZE (compile-time option, off by default).
  *

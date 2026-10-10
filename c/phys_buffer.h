@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * phys_buffer.h - physically-contiguous buffer allocation for the V3D
  * control lists / shader / tile-alloc memory that M2 onward will need.

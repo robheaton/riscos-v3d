@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * io_map.h - temporary IO-memory mapping via OS_Memory 14/15.
  *

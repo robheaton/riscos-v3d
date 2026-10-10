@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * cl_bands.h - the arithmetic of splitting a big fill or copy into bands (0.12).
  *

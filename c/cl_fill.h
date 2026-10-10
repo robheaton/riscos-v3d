@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * cl_fill.h - step 2 of the planned GraphicsV Render accelerator (see
  * README.md's "GraphicsV Render accelerator" section): generalise

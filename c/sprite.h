@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * sprite.h - M3: wrap a GPU-rendered buffer as a RISC OS sprite.
  *

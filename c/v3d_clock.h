@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * v3d_clock.h - query (and, once confirmed necessary, enable) the
  * firmware-managed V3D core clock via the property-tag mailbox.

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * screen_base.h - which physical address the accelerator draws a screen at (0.12).
  *

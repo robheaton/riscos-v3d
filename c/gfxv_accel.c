@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * gfxv_accel.c - see gfxv_accel.h.
  */

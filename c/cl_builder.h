@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * cl_builder.h - tiny byte-buffer writer for V3D control-list packets.
  *

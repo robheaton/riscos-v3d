@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * cl_common.h - the parts of GPU job submission that cl_fill.c and
  * cl_copy.c used to each carry their own copy of: the scratch-buffer

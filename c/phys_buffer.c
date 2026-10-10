@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * phys_buffer.c - see phys_buffer.h for the sourcing/verification notes.
  */

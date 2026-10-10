@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * accel_api.h - the functions module.c exports to gfxv_accel.c and the
  * job code, in ONE place.

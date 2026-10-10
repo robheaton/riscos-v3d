@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * beacon.c - see beacon.h. Only compiled into the diagnostic build (make beacons).
  */

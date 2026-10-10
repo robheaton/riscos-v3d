@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * cl_packets.h - V3D control-list packet emitters, shared by cl_clear.c
  * (hardware-proven M2/M3 single-64x64-tile path) and cl_fill.c (step 2's
