@@ -581,6 +581,7 @@ void v3d_service_handler(int service_number, _kernel_swi_regs *r, void *pw)
 unsigned int v3d_read_centiseconds(void)
 {
     _kernel_swi_regs regs;
+    regs.r[0] = 0; /* OS_ReadMonotonicTime takes no input; set so the compiler can see nothing is read unset */
     if (_kernel_swi(0x42, &regs, &regs))
         return 0u; /* diagnostic only - never let this become a new
                      * source of failure */

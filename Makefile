@@ -92,7 +92,29 @@ V3DDriver_beacons,ffa: $(BEACON_OBJS)
 
 beacons: V3DDriver_beacons,ffa
 
+# ---------------------------------------------------------------------------------------------
+# Build with the GCC 16 tool chain (https://github.com/robheaton/riscos-gcc16, the Linux cross compiler), into gcc16/
+# so that its objects never mix with the GCCSDK 4.7.4 ones. GCC16_BIN is that tool chain's bin directory. Its module
+# kit is ARMv6, soft-float and position-dependent (the module relocates itself at start); the sources are the same.
+GCC16_BIN  ?= $(HOME)/riscos-gcc16/riscos-gcc16-cross-16.2.0-24-x86_64-linux/bin
+GCC16_DIR  := gcc16
+GCC16_OBJS := $(patsubst c/%.o,$(GCC16_DIR)/%.o,$(filter c/%.o,$(OBJS))) $(GCC16_DIR)/V3DDriver.o
+
+# cmunge writes the header and the object together; the C files need the header, so they depend on the object.
+$(GCC16_DIR)/V3DDriver.o: cmhg/V3DDriver.cmhg
+	@mkdir -p $(GCC16_DIR)
+	$(GCC16_BIN)/cmunge -tgcc -32bit -p -d $(GCC16_DIR)/V3DDriver.h -o $@ $<
+
+$(GCC16_DIR)/%.o: c/%.c $(wildcard c/*.h) $(GCC16_DIR)/V3DDriver.o
+	$(GCC16_BIN)/arm-riscos-gnueabihf-gcc -mmodule -O2 -Wall -Wextra -Ic -I$(GCC16_DIR) -c $< -o $@
+
+V3DDriver_gcc16,ffa: $(GCC16_OBJS)
+	$(GCC16_BIN)/arm-riscos-gnueabihf-gcc -mmodule -o $@ $(GCC16_OBJS)
+
+gcc16: V3DDriver_gcc16,ffa
+
 clean:
+	rm -rf $(GCC16_DIR) "V3DDriver_gcc16,ffa"
 	rm -rf $(BEACON_DIR) "V3DDriver_beacons,ffa"
 	rm -f c/module.o c/phys_buffer.o c/cl_clear.o c/cl_common.o c/cl_fill.o c/cl_copy.o c/sprite.o c/bcmsupport.o c/memsplit.o c/v3d_clock.o c/v3d_irq.o c/screen_info.o c/gfxv_accel.o cmhg/V3DDriver.o cmhg/V3DDriver.h "V3DDriver,ffa"
 
@@ -121,4 +143,4 @@ beacontest:
 	gcc -O1 -Wall -no-pie -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast -DV3D_BEACONS '-DBEACON_DSB()=((void)0)' -Itest/host/shim -Ic -o test/host/beacon_test test/host/beacon_test.c c/beacon.c
 	cd test/host && ./beacon_test
 
-.PHONY: all clean hosttest beacontest beacons
+.PHONY: all clean hosttest beacontest beacons gcc16

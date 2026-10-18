@@ -88,12 +88,19 @@ freeze; it is never part of the normal build.
 
 ## Building
 
-GCCSDK's `arm-unknown-riscos-gcc` (4.7.4) and `cmunge`, on any host:
+Two tool chains build it from the same sources, and each release is offered built both ways:
 
 ```
-make            builds V3DDriver,ffa
-make hosttest
+make                  GCCSDK 4.7.4 (arm-unknown-riscos-gcc, cmunge): V3DDriver,ffa, the smaller module (about 83 KB)
+make gcc16            GCC 16 (github.com/robheaton/riscos-gcc16, the Linux cross compiler): V3DDriver_gcc16,ffa
+make hosttest         the host-side tests
+tools/mkrelease.py OUT.zip MODULE --toolchain TEXT     the release zip, with RISC OS file types
 ```
+
+`make gcc16` finds the tool chain in `~/riscos-gcc16/riscos-gcc16-cross-16.2.0-24-x86_64-linux/bin`; set `GCC16_BIN`
+to use another. The GCC 16 module kit makes ARMv6, soft-float, self-relocating modules with its own C library inside,
+so its module is bigger (about 147 KB, mostly zero-filled tables); the code, and what it does on the Pi, are the same
+(both builds pass the same hardware tests). Use the GCCSDK build unless you want the GCC 16 one.
 
 ## Known limitations
 

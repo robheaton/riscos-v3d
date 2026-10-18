@@ -15,3 +15,5 @@ V3DDriver_beacons,ffa
 dist4k/build/
 dist4k/build2/
 dist4k/*.zip
+gcc16/
+V3DDriver_gcc16,ffa
