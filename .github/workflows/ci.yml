@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Continuous integration for V3DDriver.
+#
+# What this can and cannot check: the module only runs on a Raspberry Pi 4 under RISC OS, so CI builds it and runs
+# the host-side tests (the real fill and copy code against a model screen); it cannot run the GPU. The GCCSDK 4.7.4
+# build is not done here (its toolchain is not packaged for CI); the GCC 16 build is.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  GCC16_TAG: v16.2.0-24
+  GCC16_ASSET: riscos-gcc16-cross-16.2.0-24-x86_64-linux
+
+jobs:
+  host-tests:
+    name: Host tests and source checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host tests
+        run: make hosttest
+      - name: Every C source has an SPDX licence line
+        run: |
+          missing=$(grep -L 'SPDX-License-Identifier' c/*.c c/*.h test/host/*.c || true)
+          if [ -n "$missing" ]; then echo "No SPDX line in:"; echo "$missing"; exit 1; fi
+      - name: BASIC lines fit in RISC OS BASIC (251 characters)
+        run: |
+          bad=$(awk 'length>251{print FILENAME": line "FNR": "length" characters"}' test/*.bas)
+          if [ -n "$bad" ]; then echo "$bad"; exit 1; fi
+
+  gcc16-build:
+    name: Module build with GCC 16
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache the cross compiler
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/riscos-gcc16
+          key: ${{ env.GCC16_ASSET }}
+      - name: Download and verify the cross compiler
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/riscos-gcc16 && cd ~/riscos-gcc16
+          base=https://github.com/robheaton/riscos-gcc16/releases/download/$GCC16_TAG
+          curl -fsSLO $base/$GCC16_ASSET.tar.xz
+          curl -fsSLO $base/SHA256SUMS
+          grep " $GCC16_ASSET.tar.xz\$" SHA256SUMS | sha256sum -c -
+          tar xf $GCC16_ASSET.tar.xz
+      - name: Build
+        run: make gcc16
+      - name: No floating-point instructions in the module
+        # The module is built soft-float and runs in a SVC-mode context where the FPU state is not ours to touch.
+        run: |
+          bin=$HOME/riscos-gcc16/$GCC16_ASSET/bin
+          for o in gcc16/*.o; do "$bin/arm-riscos-gnueabihf-objdump" -d "$o"; done > dis.txt
+          wc -l dis.txt
+          if grep -Ei '^\s+[0-9a-f]+:\s+[0-9a-f]+\s+(v(add|sub|mul|div|ldr|str|mov|cvt|cmp|push|pop)|ldf|stf|adf|suf|muf|dvf|fl[dt]|fst)' dis.txt; then
+            echo "floating-point instruction found"; exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: V3DDriver_gcc16
+          path: V3DDriver_gcc16,ffa

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Host test of cl_common.c's scratch cache, control-list builder and zeroing,
  * with a mock PMP. Builds the REAL cl_common.c against a shim kernel.h:

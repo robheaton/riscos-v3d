@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Host simulation: is a SINGLE-PASS overlapping copy through 64x64 tiles exactly
  * equal to memmove, if the tiles are visited in the right order?

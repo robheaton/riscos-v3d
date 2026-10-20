@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * beacon_test.c - draws the beacon bar into a fake framebuffer on the host and writes PPM pictures, so
  * the layout and colours can be looked at before a diagnostic build goes anywhere near the hardware.

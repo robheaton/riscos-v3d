@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Host check that cl_packets.h's integer-only clipper scaling / viewport maths
  * (v3d_f32_bits_of_uint, emit_clipper_xy_scaling_wh, emit_viewport_offset_whole)

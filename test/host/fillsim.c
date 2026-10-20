@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Host test (make hosttest): runs the REAL c/cl_fill.c (run_fill with its band splitting, the solid
  * and the striped/dithered paths) and the real c/cl_common.c scratch code against a MOCK v3d_job_run

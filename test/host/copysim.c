@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Host test (make hosttest): runs the REAL c/cl_copy.c (v3d_copy_screen and the one-pass ordered
  * v3d_copy_screen_overlapping, including run_copy's band splitting) and the real c/cl_common.c scratch

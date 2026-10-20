@@ -69,6 +69,8 @@ stable interface.
 If a GPU job ever times out, the driver switches acceleration off (a "fail-stop") and the desktop carries on on the
 CPU; reboot, or re-arm with `V3D_AccelTune 6`.
 
+The SWIs (control, statistics, diagnostics, and the test calls) and every error number are in [`docs/SWIs.md`](docs/SWIs.md).
+
 ## Tests and tools
 
 All in `test/` (RISC OS BASIC; double-click them in the Filer - **never type them into a Task Window**, which
