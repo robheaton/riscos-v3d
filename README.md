@@ -9,131 +9,79 @@ application. **Version 0.12 rev g. Experimental, and not an official ROOL projec
 ## What it does
 
 When RISC OS draws a rectangle fill or copy (`OS_Plot`, window scrolls, backdrop tiling), the kernel offers it to
-`GraphicsV` reason 13. This module takes the ones worth taking and runs them as V3D jobs; everything else is left to
-the CPU as usual.
+`GraphicsV`. This module runs the worthwhile ones as V3D jobs and leaves the rest to the CPU.
 
-- Rectangle **fills** (plain colours, and dither patterns that vary only from row to row), **copies**, and
-  **overlapping copies** (scrolls, in either direction).
-- **32 and 16 bits per pixel** (16bpp is the Pi's RGB565).
-- **Any screen size.** One GPU job holds at most 510 tiles of 64x64 pixels, so bigger rectangles are cut into bands
-  of whole tile rows. Works on a 3440x1440 screen on real hardware; true 3840x2160 is untested (see below).
-- Notices desktop **mode changes** and copes with them.
-- **Reload without a reboot** (`*RMKill` then `*RMLoad`) is safe.
+- **Fills** (plain colours, and dither patterns that vary only from row to row), **copies** and **scrolls**.
+- **32 and 16 bits per pixel** (16bpp is the Pi's RGB565), at any screen size: bigger rectangles are cut into
+  bands. Tested on real hardware up to 3440x1440.
+- Copes with desktop **mode changes**, and can be **reloaded without a reboot** (`*RMKill` then `*RMLoad`).
 
-Not accelerated: small operations (a GPU call has a fixed cost of about 119 microseconds, so the driver leaves
-anything small to the CPU), patterns that vary along a row, indexed colour depths (8bpp and below), text, icons,
-sprites and the Draw module (they do not go through `GraphicsV`).
+Not accelerated: small operations (a GPU call costs about 119 microseconds, so those stay on the CPU), patterns that
+vary along a row, 8bpp and below, and text, icons, sprites and Draw (they do not go through `GraphicsV`).
 
 ## How fast, and is it right?
 
-- **RISCOSmark** (an independent benchmark, 1080p, 32bpp): Rectangle Copy went from 1,333 to 3,288;
-  every other test was unchanged (about 2.5x).
-- **Big rectangles, 3440x1440** (`test/FillCopyBench`, CPU time against GPU time): copies 4 to 9x faster, scrolls 4
-  to 8x, large fills 1.3 to 4x. The desktop mostly draws small things, so the gain is most visible when dragging or
-  scrolling large windows.
-- **Correctness:** `test/VerifySuite` draws hundreds of fills, copies and scrolls on the GPU and again on the CPU
-  and compares every pixel. 450 of 450 identical, at 16 and 32bpp, at 1080p, 1920x1200 and 3440x1440, including runs
-  that force the job-cutting.
+- **RISCOSmark** (1080p, 32bpp): Rectangle Copy 1,333 to 3,288 (about 2.5x); every other test unchanged.
+- **Big rectangles, 3440x1440** (`test/FillCopyBench`): copies 4 to 9x faster, scrolls 4 to 8x, large fills 1.3 to
+  4x. The desktop mostly draws small things, so the gain shows when dragging or scrolling large windows.
+- **Correctness:** `test/VerifySuite` draws hundreds of operations on the GPU and the CPU and compares every pixel:
+  450 of 450 identical, at both depths and three screen sizes.
 
 ## Requirements
 
-- Raspberry Pi 4B, Pi 400 or Compute Module 4 (BCM2711). **Not** the Pi 5 or earlier Pis.
-- A recent RISC OS 5 build, in a 32bpp or 16bpp screen mode.
-- For very large screens, raise `gpu_mem` in `config.txt` (128 or more; untested at 4K).
+- Raspberry Pi 4B, Pi 400 or Compute Module 4. **Not** the Pi 5 or earlier Pis.
+- A recent RISC OS 5 build, in a 32bpp or 16bpp mode. For very large screens, set `gpu_mem` to 128 or more.
 
 ## Using it
 
 ```
 *RMLoad V3DDriver                  accelerates straight away
 *RMLoad V3DDriver NoAutoStart      load it but leave acceleration off until you ask
-*RMKill V3DDriver                  unload; reloading without a reboot works
+*RMKill V3DDriver                  unload
 ```
 
-Run `test/GpuCheck` (double-click it in the Filer) to see what the GPU has done: operations accelerated, failures,
-timeouts, interrupts and whether any screen was declined.
-
-The module's SWIs are in chunk `&5AE00` with the prefix `V3D`, and its errors in the block `&823100`, both allocated
-by ROOL. Releases up to 0.12.1 used a temporary chunk (`&C0040`): call the SWIs by name (`SYS "V3D_AccelTune"`),
-as the scripts in `test/` do, and nothing depends on the number.
-
-| SWI | Purpose |
-|---|---|
-| `V3D_AccelStart` / `V3D_AccelStop` | claim or release `GraphicsV` |
-| `V3D_AccelStats`, `V3D_AccelCopyStats`, `V3D_AccelProfile` | counters, health, interrupts, timings |
-| `V3D_AccelLimits` | the size limits below which an operation is left to the CPU |
-| `V3D_AccelTune` | tuning switches (job size, clock, scroll mode), a re-arm after a fail-stop |
-
-The other SWIs (`V3D_ClearTest`, `V3D_FillTest`, `V3D_RegSnapshot` and so on) are development and test tools, not a
-stable interface.
+Double-click `test/GpuCheck` in the Filer to see what the GPU has done: operations accelerated, failures, timeouts.
 
 If a GPU job ever times out, the driver switches acceleration off (a "fail-stop") and the desktop carries on on the
 CPU; reboot, or re-arm with `V3D_AccelTune 6`.
 
-The SWIs (control, statistics, diagnostics, and the test calls) and every error number are in [`docs/SWIs.md`](docs/SWIs.md).
+The SWIs (prefix `V3D`, chunk `&5AE00`) and errors (block `&823100`) are documented in
+[`docs/SWIs.md`](docs/SWIs.md). Call SWIs by name; the test SWIs are development tools, not a stable API.
 
-## Tests and tools
+## Tests
 
-All in `test/` (RISC OS BASIC; double-click them in the Filer - **never type them into a Task Window**, which
-swallows the drawing they test).
-
-| | |
-|---|---|
-| `VerifySuite` | GPU against CPU, pixel by pixel; includes forced job-cutting |
-| `GpuCheck` | what the GPU has done so far |
-| `FillCopyBench` | times fills, copies and scrolls of 17 sizes: CPU, GPU, and the default rules |
-| `ModeChangeTest` | desktop mode changes at both depths, up to 1920x1200 |
-| `TuneBench`, `TraceDump` | tuning measurements; the driver's event log |
-| `StressTest`, `ReloadProbe` | the old test path under repetition; the V3D's state around a reload |
-
-`make hosttest` runs the host-side tests (job-cutting against a model screen, scroll ordering, the screen-base rule).
-`make beacons` builds a diagnostic module that can draw numbered progress marks on screen, for locating a hard
-freeze; it is never part of the normal build.
+The BASIC programs in `test/` must be **double-clicked in the Filer, never typed into a Task Window**, which
+swallows the drawing they test. The main ones are `VerifySuite` (GPU against CPU, pixel by pixel), `FillCopyBench`
+(timings), `ModeChangeTest` and `GpuCheck`. `make hosttest` runs the host-side tests, and CI runs them on every push.
 
 ## Building
 
-Two tool chains build it from the same sources, and each release is offered built both ways:
-
 ```
 make                  GCCSDK 4.7.4 (arm-unknown-riscos-gcc, cmunge): V3DDriver,ffa, the smaller module (about 83 KB)
-make gcc16            GCC 16 (github.com/robheaton/riscos-gcc16, the Linux cross compiler): V3DDriver_gcc16,ffa
+make gcc16            GCC 16 (github.com/robheaton/riscos-gcc16): V3DDriver_gcc16,ffa (about 147 KB)
 make hosttest         the host-side tests
-tools/mkrelease.py OUT.zip MODULE --toolchain TEXT     the release zip, with RISC OS file types
 ```
 
-`make gcc16` finds the tool chain in `~/riscos-gcc16/riscos-gcc16-cross-16.2.0-24-x86_64-linux/bin`; set `GCC16_BIN`
-to use another. The GCC 16 module kit makes ARMv6, soft-float, self-relocating modules with its own C library inside,
-so its module is bigger (about 147 KB, mostly zero-filled tables); the code, and what it does on the Pi, are the same
-(both builds pass the same hardware tests). Use the GCCSDK build unless you want the GCC 16 one.
+Both builds come from the same sources and pass the same hardware tests; use the GCCSDK one unless you want GCC 16.
+`make gcc16` looks for the tool chain in `~/riscos-gcc16/riscos-gcc16-cross-16.2.0-24-x86_64-linux/bin`; set
+`GCC16_BIN` to use another. `tools/mkrelease.py` builds the release zip with RISC OS file types.
 
 ## Known limitations
 
-- Pi 4 family only; 32 and 16bpp only.
-- **True 4K (3840x2160) has not been run.** The job-cutting is proven on real hardware at 3440x1440 (1,242 tiles) and
-  against a model at 4K.
+- True 4K (3840x2160) has not been run; the job-cutting is proven at 3440x1440 and against a model at 4K.
 - The fail-stop after a timeout has not been provoked on hardware.
-- The test SWIs (`V3D_ClearTest`, `V3D_FillTest` and so on) are development tools, not a stable API.
 
 ## How it works
 
-The V3D runs a *binning* job and a *render* job (control lists) per operation, working in 64x64 tiles: a fill
-clears a tile buffer and stores it; a copy loads tiles and stores them elsewhere; an overlapping copy is one ordered
-pass whose tile order equals that of one big job, proven against `memmove` on 148,000 cases. Jobs are submitted
-through the V3D registers directly and completed by its interrupt. Key files: `c/module.c` (SWIs, `GraphicsV`
-handling), `c/cl_fill.c` and `c/cl_copy.c` (the jobs), `c/cl_common.c` (submission, bands, scratch memory),
-`c/v3d_irq.c` (interrupt), `c/gfxv_accel.c` (`GraphicsV` decoding).
+Each operation is a *binning* job plus a *render* job (V3D control lists) working in 64x64 tiles: a fill clears a
+tile buffer and stores it; a copy loads tiles and stores them elsewhere. Jobs are submitted through the V3D registers
+and completed by its interrupt. Start with `c/gfxv_accel.c` (`GraphicsV` decoding), `c/cl_fill.c` and `c/cl_copy.c`
+(the jobs), `c/cl_common.c` (submission, bands) and `c/module.c` (SWIs). The full history, including the long hunt
+for the reload freeze, is in [`docs/DEVELOPMENT-LOG.md`](docs/DEVELOPMENT-LOG.md).
 
-The full story - every hardware round trip, the bugs found, and the long hunt for the reload freeze (whose cause was a
-firmware clock flag that always reads "off", so every first power-on reset-pulsed a running V3D) - is in
-[`docs/DEVELOPMENT-LOG.md`](docs/DEVELOPMENT-LOG.md).
+## Licence and credits
 
-## Licence
-
-GNU General Public License, version 2 or (at your option) any later version - the same licence as the Linux V3D
-driver this one follows. See [`LICENSE`](LICENSE); third-party notices, including the MIT notice for the bare-metal
-reference the register offsets come from, are in [`NOTICE`](NOTICE).
-
-## Credits
-
-Register offsets and the power-on sequence are taken, with attribution, from the MIT-licensed bare-metal reference
-[rpi4-gpu-bare-metal-examples](https://github.com/Random06457/rpi4-gpu-bare-metal-examples). Behaviour was
+GNU General Public License, version 2 or later, the same as the Linux V3D driver this one follows: see
+[`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). Register offsets and the power-on sequence come, with attribution, from
+the MIT-licensed [rpi4-gpu-bare-metal-examples](https://github.com/Random06457/rpi4-gpu-bare-metal-examples),
 cross-checked against the Linux `v3d` driver and the RISC OS kernel and `BCMSupport`/`BCMVideo` sources.
