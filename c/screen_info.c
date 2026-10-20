@@ -13,6 +13,7 @@
 #include <stddef.h>
 #include "screen_info.h"
 #include "swis.h"
+#include "v3d_errors.h"
 
 #define SWI_OS_ReadVduVariables 0x31
 
@@ -166,7 +167,7 @@ _kernel_oserror *v3d_get_framestore_phys(const v3d_screen_info_t *info,
     if (regs.r[4] != 0)
     {
         static _kernel_oserror err_unclaimed = {
-            20, "V3DDriver: GraphicsV 9 (framestore information) was not "
+            V3D_ERR(20), "V3DDriver: GraphicsV 9 (framestore information) was not "
                 "claimed by the active display driver - it may not report "
                 "a separate framestore this way"
         };
@@ -179,7 +180,7 @@ _kernel_oserror *v3d_get_framestore_phys(const v3d_screen_info_t *info,
 
     if (fs_size < info->total_screen_size)
     {
-        static _kernel_oserror err_too_small = { 21, "" };
+        static _kernel_oserror err_too_small = { V3D_ERR(21), "" };
         unsigned int pos = 0;
         append_str(err_too_small.errmess, &pos, "V3DDriver: GraphicsV 9 "
                    "reported framestore size ");

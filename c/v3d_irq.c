@@ -13,6 +13,7 @@
 #include "v3d_regs.h"
 #include "cl_common.h" /* g_v3d_wedged - the fail-stop latch */
 #include <stddef.h>
+#include "v3d_errors.h"
 
 #define SWI_OS_ClaimDeviceVector   0x4Bu
 #define SWI_OS_ReleaseDeviceVector 0x4Cu
@@ -249,7 +250,7 @@ _kernel_oserror *v3d_irq_test_call_clear(void)
     if (!g_hal_irqclear_addr)
     {
         static _kernel_oserror err_not_resolved = {
-            1, "V3DDriver: HAL_IRQClear not resolved yet - "
+            V3D_ERR(1), "V3DDriver: HAL_IRQClear not resolved yet - "
                "call v3d_irq_resolve_clear first"
         };
         return &err_not_resolved;
@@ -275,7 +276,7 @@ static _kernel_oserror *v3d_irq_unmask(void)
     if (!g_v3d_permanent_mapped)
     {
         static _kernel_oserror err_not_mapped = {
-            2, "V3DDriver: v3d_irq_unmask called before registers mapped"
+            V3D_ERR(2), "V3DDriver: v3d_irq_unmask called before registers mapped"
         };
         return &err_not_mapped;
     }

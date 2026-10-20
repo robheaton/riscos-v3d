@@ -36,6 +36,7 @@
 #include "accel_api.h"
 #include "screen_base.h"
 #include "beacon.h"
+#include "v3d_errors.h"
 #include "V3DDriver.h" /* cmunge-generated: SWI numbers + entry-point
                          * prototypes. Included so a signature mismatch
                          * (like the module_final one below) is a compile
@@ -237,7 +238,7 @@ static int g_pmp_fill_failed = 0;
 static _kernel_oserror *ensure_pmp_fill(void)
 {
     static _kernel_oserror err_failed_earlier = {
-        32, "V3DDriver: creating the V3DFill Dynamic Area failed earlier - "
+        V3D_ERR(32), "V3DDriver: creating the V3DFill Dynamic Area failed earlier - "
             "acceleration unavailable until the module is reloaded"
     };
     _kernel_oserror *err;
@@ -286,7 +287,7 @@ static _kernel_oserror *ensure_pmp_fill(void)
             static _kernel_oserror err_clamped;
             unsigned int pos = 0;
 
-            err_clamped.errnum = 31;
+            err_clamped.errnum = V3D_ERR(31);
             pos = append_str_bounded(err_clamped.errmess, pos,
                                       "V3DDriver: V3DFill area granted only ");
             pos = append_uint_decimal(err_clamped.errmess, pos, g_pmp_fill.max_pages);
@@ -409,18 +410,18 @@ void v3d_accel_mode_changing(void)
 static _kernel_oserror *ensure_screen_framestore(void)
 {
     static _kernel_oserror err_bad_bpp = {
-        16, "V3DDriver: only 32bpp and 16bpp screen modes are supported"
+        V3D_ERR(16), "V3DDriver: only 32bpp and 16bpp screen modes are supported"
     };
     static _kernel_oserror err_bad_geom = {
-        33, "V3DDriver: the screen mode's geometry is inconsistent "
+        V3D_ERR(33), "V3DDriver: the screen mode's geometry is inconsistent "
             "(line length / height exceed the framestore) - declined"
     };
     static _kernel_oserror err_bank = {
-        34, "V3DDriver: the VDU write bank differs from the display bank "
+        V3D_ERR(34), "V3DDriver: the VDU write bank differs from the display bank "
             "and its address has not been seen yet - declined"
     };
     static _kernel_oserror err_vrender = {
-        35, "V3DDriver: the VDU write address lies outside the "
+        V3D_ERR(35), "V3DDriver: the VDU write address lies outside the "
             "framestore - declined"
     };
     _kernel_oserror *err;
@@ -532,7 +533,7 @@ static _kernel_oserror *screen_bpp_params(unsigned int *bytes_per_pixel_out,
     }
     {
         static _kernel_oserror err_bad_bpp = {
-            29, "V3DDriver: unsupported screen depth for accelerated copy/fill"
+            V3D_ERR(29), "V3DDriver: unsupported screen depth for accelerated copy/fill"
         };
         return &err_bad_bpp;
     }
@@ -686,7 +687,7 @@ static int v3d_hw_is_up(void)
 static _kernel_oserror *v3d_stop_bridge(void)
 {
     static _kernel_oserror err_no_stop = {
-        52, "V3DDriver: a V3D bus gate did not stop, so the V3D is not being reset - reboot"
+        V3D_ERR(52), "V3DDriver: a V3D bus gate did not stop, so the V3D is not being reset - reboot"
     };
     io_mapping_t m;
     _kernel_oserror *err;
@@ -845,7 +846,7 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
         io_mapping_t chk;
         unsigned int asb_m, asb_s;
         static _kernel_oserror err_asb_closed = {
-            45, "V3DDriver: the V3D clock is on but its bus gates are not "
+            V3D_ERR(45), "V3DDriver: the V3D clock is on but its bus gates are not "
                 "open (a previous power-on did not complete) - reboot"
         };
 
@@ -905,7 +906,7 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
         if (spin > 1000000)
         {
             static _kernel_oserror err_asb_m = {
-                2, "V3DDriver: timed out waiting for ASB master gate ACK "
+                V3D_ERR(2), "V3DDriver: timed out waiting for ASB master gate ACK "
                    "to clear during V3D power-on"
             };
             io_unmap(&v3d);
@@ -919,7 +920,7 @@ static _kernel_oserror *v3d_power_on(unsigned int *clock_rate_out)
         if (spin > 1000000)
         {
             static _kernel_oserror err_asb_s = {
-                3, "V3DDriver: timed out waiting for ASB slave gate ACK "
+                V3D_ERR(3), "V3DDriver: timed out waiting for ASB slave gate ACK "
                    "to clear during V3D power-on"
             };
             io_unmap(&v3d);
@@ -995,7 +996,7 @@ static _kernel_oserror *accel_prepare(unsigned int *bytes_per_pixel,
 }
 
 static _kernel_oserror err_rect_range = {
-    43, "V3DDriver: rectangle lies outside the screen - declined"
+    V3D_ERR(43), "V3DDriver: rectangle lies outside the screen - declined"
 };
 
 /*
@@ -1220,7 +1221,7 @@ static _kernel_oserror *v3d_read_ident(unsigned int *ident, unsigned int n)
     if (!g_powered_on)
     {
         static _kernel_oserror err_not_on = {
-            4, "V3DDriver: V3D_ReadIdent called before V3D_PowerOn"
+            V3D_ERR(4), "V3DDriver: V3D_ReadIdent called before V3D_PowerOn"
         };
         return &err_not_on;
     }
@@ -1456,7 +1457,7 @@ static int gpu_is_idle(void)
 _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
 {
     static _kernel_oserror err_gpu_busy = {
-        48, "V3DDriver: the GPU is still running a job (or timed out and "
+        V3D_ERR(48), "V3DDriver: the GPU is still running a job (or timed out and "
             "may still be) - not unloading. Reboot to clear it"
     };
     int idle;
@@ -1519,7 +1520,7 @@ _kernel_oserror *module_final(int fatal, int podule_base, void *pw)
 static _kernel_oserror *tune_reset_scratch(void)
 {
     static _kernel_oserror err_wedged_reset = {
-        46, "V3DDriver: the GPU is switched off after a timeout - re-arm "
+        V3D_ERR(46), "V3DDriver: the GPU is switched off after a timeout - re-arm "
             "(V3D_AccelTune 6) only if you are sure it is idle"
     };
     unsigned int clock_rate, phys;
@@ -1566,7 +1567,7 @@ static _kernel_oserror *tune_reset_scratch(void)
 static _kernel_oserror *accel_tune(_kernel_swi_regs *r)
 {
     static _kernel_oserror err_bad_setting = {
-        47, "V3DDriver: V3D_AccelTune: unknown setting, or value out of range"
+        V3D_ERR(47), "V3DDriver: V3D_AccelTune: unknown setting, or value out of range"
     };
     unsigned int key = (unsigned int) r->r[0];
     unsigned int val = (unsigned int) r->r[1];
@@ -1620,7 +1621,7 @@ static _kernel_oserror *accel_tune(_kernel_swi_regs *r)
             if (val != 0xFFFFFFFFu)
             {
                 static _kernel_oserror err_not_idle = {
-                    51, "V3DDriver: the V3D clock is only changed with the GPU idle"
+                    V3D_ERR(51), "V3DDriver: the V3D clock is only changed with the GPU idle"
                 };
 
                 /* 200 MHz and up: this is for raising the clock from the 250 MHz
@@ -1773,7 +1774,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    5, "V3DDriver: V3D_ClearTest called before V3D_PowerOn"
+                    V3D_ERR(5), "V3DDriver: V3D_ClearTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -1828,7 +1829,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    28, "V3DDriver: V3D_16bppFormatTest called before V3D_PowerOn"
+                    V3D_ERR(28), "V3DDriver: V3D_16bppFormatTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -1862,7 +1863,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    9, "V3DDriver: V3D_ClearToSprite called before V3D_PowerOn"
+                    V3D_ERR(9), "V3DDriver: V3D_ClearToSprite called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -1943,7 +1944,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             _kernel_oserror *err, *cleanup_err;
             unsigned int live_claimed = 0, live_spurious = 0;
             static _kernel_oserror err_irq_in_use = {
-                44, "V3DDriver: V3D_IRQTest cannot run once the accelerator "
+                V3D_ERR(44), "V3DDriver: V3D_IRQTest cannot run once the accelerator "
                     "has set up interrupts - it would switch them off for "
                     "good. Reboot first, or load with NoAutoStart"
             };
@@ -2018,7 +2019,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    13, "V3DDriver: V3D_FillTest called before V3D_PowerOn"
+                    V3D_ERR(13), "V3DDriver: V3D_FillTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2068,7 +2069,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    17, "V3DDriver: V3D_ScreenFillTest called before V3D_PowerOn"
+                    V3D_ERR(17), "V3DDriver: V3D_ScreenFillTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2085,7 +2086,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 !span_ok(y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
-                    18, "V3DDriver: V3D_ScreenFillTest rectangle is outside "
+                    V3D_ERR(18), "V3DDriver: V3D_ScreenFillTest rectangle is outside "
                         "the current screen mode's bounds"
                 };
                 return &err_out_of_bounds;
@@ -2148,7 +2149,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    17, "V3DDriver: V3D_ScreenStripedFillTest called before V3D_PowerOn"
+                    V3D_ERR(17), "V3DDriver: V3D_ScreenStripedFillTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2165,7 +2166,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 !span_ok(y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
-                    18, "V3DDriver: V3D_ScreenStripedFillTest rectangle is "
+                    V3D_ERR(18), "V3DDriver: V3D_ScreenStripedFillTest rectangle is "
                         "outside the current screen mode's bounds"
                 };
                 return &err_out_of_bounds;
@@ -2253,7 +2254,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    22, "V3DDriver: V3D_CopyTest called before V3D_PowerOn"
+                    V3D_ERR(22), "V3DDriver: V3D_CopyTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2297,7 +2298,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    30, "V3DDriver: V3D_CopyTest16bpp called before V3D_PowerOn"
+                    V3D_ERR(30), "V3DDriver: V3D_CopyTest16bpp called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2343,7 +2344,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    32, "V3DDriver: V3D_FillTest16bpp called before V3D_PowerOn"
+                    V3D_ERR(32), "V3DDriver: V3D_FillTest16bpp called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2397,7 +2398,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    23, "V3DDriver: V3D_ScreenCopyTest called before V3D_PowerOn"
+                    V3D_ERR(23), "V3DDriver: V3D_ScreenCopyTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2416,7 +2417,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 !span_ok(dest_y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
-                    24, "V3DDriver: V3D_ScreenCopyTest rectangle is outside "
+                    V3D_ERR(24), "V3DDriver: V3D_ScreenCopyTest rectangle is outside "
                         "the current screen mode's bounds"
                 };
                 return &err_out_of_bounds;
@@ -2428,7 +2429,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 src_y < dest_y + height && dest_y < src_y + height)
             {
                 static _kernel_oserror err_overlap = {
-                    25, "V3DDriver: V3D_ScreenCopyTest source and "
+                    V3D_ERR(25), "V3DDriver: V3D_ScreenCopyTest source and "
                         "destination rectangles overlap - not supported yet"
                 };
                 return &err_overlap;
@@ -2526,7 +2527,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    26, "V3DDriver: V3D_OverlapCopyTest called before V3D_PowerOn"
+                    V3D_ERR(26), "V3DDriver: V3D_OverlapCopyTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2581,7 +2582,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    27, "V3DDriver: V3D_ScreenCopyOverlapTest called before V3D_PowerOn"
+                    V3D_ERR(27), "V3DDriver: V3D_ScreenCopyOverlapTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -2600,7 +2601,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
                 !span_ok(dest_y, height, g_screen_info.ywind_limit))
             {
                 static _kernel_oserror err_out_of_bounds = {
-                    24, "V3DDriver: V3D_ScreenCopyOverlapTest rectangle is "
+                    V3D_ERR(24), "V3DDriver: V3D_ScreenCopyOverlapTest rectangle is "
                         "outside the current screen mode's bounds"
                 };
                 return &err_out_of_bounds;
@@ -2790,7 +2791,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             if (!g_powered_on)
             {
                 static _kernel_oserror err_not_on = {
-                    13, "V3DDriver: V3D_StripedFillTest called before V3D_PowerOn"
+                    V3D_ERR(13), "V3DDriver: V3D_StripedFillTest called before V3D_PowerOn"
                 };
                 return &err_not_on;
             }
@@ -3048,7 +3049,7 @@ _kernel_oserror *v3d_swi_handler(int swi_no, _kernel_swi_regs *r, void *pw)
             }
             if (view == 6u)
             {
-                r->r[0] = g_screen_cached_err ? (unsigned int) g_screen_cached_err->errnum : 0u;
+                r->r[0] = g_screen_cached_err ? V3D_ERR_INDEX(g_screen_cached_err->errnum) : 0u;
                 r->r[1] = g_screen_cached_err ? (unsigned int) g_screen_cached_err->errmess : 0u;
                 r->r[2] = g_screen_info.log2_bpp;
                 r->r[3] = g_screen_info.line_length;

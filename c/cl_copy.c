@@ -18,6 +18,7 @@
 #include "v3d_regs.h"
 #include "io_map.h"
 #include "v3d_irq.h"
+#include "v3d_errors.h"
 
 
 /* TILE_SIZE, the scratch cache, the completion wait, the barriers, the
@@ -239,7 +240,7 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: V3D_CopyTest width/height must be non-zero"
+            V3D_ERR(10), "V3DDriver: V3D_CopyTest width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -255,7 +256,7 @@ _kernel_oserror *v3d_copy_test(pmp_area_t *pmp, unsigned int base_page,
     if (buf_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_CopyTest rectangle too large for this "
+            V3D_ERR(14), "V3DDriver: V3D_CopyTest rectangle too large for this "
                 "test harness (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL))"
         };
         return &err_too_big;
@@ -325,7 +326,7 @@ _kernel_oserror *v3d_copy_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: V3D_CopyTest16bpp width/height must be non-zero"
+            V3D_ERR(10), "V3DDriver: V3D_CopyTest16bpp width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -342,7 +343,7 @@ _kernel_oserror *v3d_copy_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
         2u * buf_pages > COPY_TEST_16BPP_SLOT_PAGES - COPY_TEST_16BPP_SCRATCH_WORST_CASE_PAGES)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_CopyTest16bpp rectangle too large for its "
+            V3D_ERR(14), "V3DDriver: V3D_CopyTest16bpp rectangle too large for its "
                 "dedicated test PMP slot - try a smaller width/height"
         };
         return &err_too_big;
@@ -470,7 +471,7 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: overlapping copy width/height must be non-zero"
+            V3D_ERR(10), "V3DDriver: overlapping copy width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -500,7 +501,7 @@ _kernel_oserror *v3d_copy_screen_overlapping(pmp_area_t *pmp, unsigned int base_
     if (scratch_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: overlapping copy too large for a scratch-"
+            V3D_ERR(14), "V3DDriver: overlapping copy too large for a scratch-"
                 "buffer pass (the bounce buffer's page cap, PMP_MAX_PAGES_PER_CALL)"
         };
         return &err_too_big;
@@ -555,7 +556,7 @@ _kernel_oserror *v3d_copy_overlap_test(pmp_area_t *pmp, unsigned int base_page,
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: V3D_OverlapCopyTest width/height must be non-zero"
+            V3D_ERR(10), "V3DDriver: V3D_OverlapCopyTest width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -579,7 +580,7 @@ _kernel_oserror *v3d_copy_overlap_test(pmp_area_t *pmp, unsigned int base_page,
     if (buf_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_OverlapCopyTest rectangle+shift too "
+            V3D_ERR(14), "V3DDriver: V3D_OverlapCopyTest rectangle+shift too "
                 "large for this test harness (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL))"
         };
         return &err_too_big;

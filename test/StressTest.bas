@@ -33,7 +33,7 @@ REM
 REM Before running: *RMLoad the built V3DDriver,ffa yourself.
 
 i% = 0
-ON ERROR PRINT "FAIL at iteration "; i%; ": "; REPORT$; " (error "; ERR; ")" : END
+ON ERROR PRINT "FAIL at iteration "; i%; ": "; REPORT$; " (error &"; STR$~(ERR); ")" : END
 
 N% = 50
 irq_clear_count% = 0

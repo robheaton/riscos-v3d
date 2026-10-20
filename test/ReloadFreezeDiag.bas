@@ -36,7 +36,7 @@ REM   4. If it freezes, note the LAST few lines printed on screen
 REM      before it happened - that's the data this exists to capture.
 
 i% = 0
-ON ERROR PRINT "FAIL at iteration "; i%; ": "; REPORT$; " (error "; ERR; ")" : END
+ON ERROR PRINT "FAIL at iteration "; i%; ": "; REPORT$; " (error &"; STR$~(ERR); ")" : END
 
 N% = 5
 

@@ -4,6 +4,7 @@
  */
 
 #include <stddef.h>
+#include "v3d_errors.h"
 #include "gfxv_accel.h"
 #include "accel_api.h"
 #include "V3DDriver.h" /* for v3d_gfxv_entry - the cmunge-generated
@@ -322,9 +323,9 @@ static void trace_event(unsigned int kind, unsigned int outcome, unsigned int er
 static void note_no_screen(const _kernel_oserror *err)
 {
     g_gfxv_screen_decline_count++;
-    g_gfxv_screen_decline_last_errnum = (unsigned int) err->errnum;
+    g_gfxv_screen_decline_last_errnum = V3D_ERR_INDEX(err->errnum);
     g_trace_outcome = TRACE_NO_SCREEN;
-    g_trace_errnum = (unsigned int) err->errnum;
+    g_trace_errnum = V3D_ERR_INDEX(err->errnum);
 }
 
 /*
@@ -660,7 +661,7 @@ static void handle_render_fill(_kernel_swi_regs *r)
         if (err)
         {
             g_gfxv_error_count++;
-            g_gfxv_last_fail_errnum = (unsigned int) err->errnum;
+            g_gfxv_last_fail_errnum = V3D_ERR_INDEX(err->errnum);
             g_gfxv_last_fail_left = left;
             g_gfxv_last_fail_bottom = bottom;
             g_gfxv_last_fail_right = right;
@@ -668,7 +669,7 @@ static void handle_render_fill(_kernel_swi_regs *r)
             if (area < g_gfxv_fail_min_area) g_gfxv_fail_min_area = area;
             if (area > g_gfxv_fail_max_area) g_gfxv_fail_max_area = area;
             g_trace_outcome = TRACE_GPU_ERROR;
-            g_trace_errnum = (unsigned int) err->errnum;
+            g_trace_errnum = V3D_ERR_INDEX(err->errnum);
             return; /* GPU fill failed (e.g. timeout) - leave unclaimed
                       * so the OS's own CPU fallback still draws
                       * correctly; see gfxv_accel.h's top comment on
@@ -707,9 +708,9 @@ static void handle_render_fill(_kernel_swi_regs *r)
     if (err)
     {
         g_gfxv_striped_error_count++;
-        g_gfxv_striped_last_fail_errnum = (unsigned int) err->errnum;
+        g_gfxv_striped_last_fail_errnum = V3D_ERR_INDEX(err->errnum);
         g_trace_outcome = TRACE_STRIPED_ERROR;
-        g_trace_errnum = (unsigned int) err->errnum;
+        g_trace_errnum = V3D_ERR_INDEX(err->errnum);
         return; /* GPU fill failed (e.g. timeout) - leave unclaimed, same
                   * fail-safe reasoning as the solid path above. */
     }
@@ -785,10 +786,10 @@ static void handle_render_copy(_kernel_swi_regs *r)
         if (err)
         {
             g_gfxv_copy_overlap_error_count++;
-            g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
+            g_gfxv_copy_last_fail_errnum = V3D_ERR_INDEX(err->errnum);
             copy_last_fail_msg(err->errmess);
             g_trace_outcome = TRACE_GPU_ERROR;
-            g_trace_errnum = (unsigned int) err->errnum;
+            g_trace_errnum = V3D_ERR_INDEX(err->errnum);
             return; /* too large for the scratch-buffer path, or a GPU
                       * failure - leave unclaimed, same fail-safe
                       * reasoning as everywhere else in this driver. */
@@ -813,10 +814,10 @@ static void handle_render_copy(_kernel_swi_regs *r)
     if (err)
     {
         g_gfxv_copy_error_count++;
-        g_gfxv_copy_last_fail_errnum = (unsigned int) err->errnum;
+        g_gfxv_copy_last_fail_errnum = V3D_ERR_INDEX(err->errnum);
         copy_last_fail_msg(err->errmess);
         g_trace_outcome = TRACE_GPU_ERROR;
-        g_trace_errnum = (unsigned int) err->errnum;
+        g_trace_errnum = V3D_ERR_INDEX(err->errnum);
         return; /* GPU copy failed - leave unclaimed, same fail-safe
                   * reasoning as handle_render_fill. */
     }

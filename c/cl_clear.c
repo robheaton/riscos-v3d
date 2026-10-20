@@ -63,6 +63,7 @@
 #include "sprite.h"
 #include "v3d_irq.h"
 #include "cl_common.h" /* g_v3d_wedged, v3d_gpu_check: the fail-stop latch shared with the accelerated path */
+#include "v3d_errors.h"
 
 #define CL_PAGE_COUNT           1u  /* BCL+RCL combined, both tiny */
 #define RENDER_TARGET_PAGE_COUNT 4u /* 64*64*4 bytes = 16384 = 4 pages */
@@ -689,7 +690,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     LEG_UNMAP(&v3d);
 
     {
-        static _kernel_oserror err_bin_timeout = { 7, "" };
+        static _kernel_oserror err_bin_timeout = { V3D_ERR(7), "" };
         err = v3d_poll_counter(&g_v3d_irq_bin_done_count, last_bin_irq,
                                 &err_bin_timeout,
                                 "BFC (binning)", 1, bcl_start, bcl_end,
@@ -714,7 +715,7 @@ static _kernel_oserror *v3d_clear_run(pmp_area_t *pmp, unsigned int base_page,
     LEG_UNMAP(&v3d);
 
     {
-        static _kernel_oserror err_render_timeout = { 8, "" };
+        static _kernel_oserror err_render_timeout = { V3D_ERR(8), "" };
         err = v3d_poll_counter(&g_v3d_irq_render_done_count, last_render_irq,
                                 &err_render_timeout,
                                 "RFC (render)", 0, rcl_start, rcl_end,
@@ -893,7 +894,7 @@ _kernel_oserror *v3d_16bpp_format_test(pmp_area_t *pmp, unsigned int base_page,
     io_unmap(&v3d);
 
     {
-        static _kernel_oserror err_bin_timeout = { 7, "" };
+        static _kernel_oserror err_bin_timeout = { V3D_ERR(7), "" };
         err = v3d_poll_counter(&g_v3d_irq_bin_done_count, last_bin_irq,
                                 &err_bin_timeout,
                                 "BFC (binning)", 1, bcl_start, bcl_end,
@@ -914,7 +915,7 @@ _kernel_oserror *v3d_16bpp_format_test(pmp_area_t *pmp, unsigned int base_page,
     io_unmap(&v3d);
 
     {
-        static _kernel_oserror err_render_timeout = { 8, "" };
+        static _kernel_oserror err_render_timeout = { V3D_ERR(8), "" };
         err = v3d_poll_counter(&g_v3d_irq_render_done_count, last_render_irq,
                                 &err_render_timeout,
                                 "RFC (render)", 0, rcl_start, rcl_end,

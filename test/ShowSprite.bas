@@ -117,6 +117,6 @@ DEF PROCerror
   ON ERROR OFF : REM disarm first - belt and braces against this
                  REM handler ever recursing into itself again,
                  REM regardless of what future edits do here
-  REPORT : PRINT " (error "; ERR; " at line "; ERL; ")"
+  REPORT : PRINT " (error &"; STR$~(ERR); " at line "; ERL; ")"
   IF task% > 0 THEN SYS "Wimp_CloseDown", task%, &4B534154
 ENDPROC

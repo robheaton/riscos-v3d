@@ -9,6 +9,7 @@
 #include "v3d_regs.h"
 #include "io_map.h"
 #include "v3d_irq.h"
+#include "v3d_errors.h"
 
 /* ---------------------------------------------------------------- */
 /* Tunables, health, profile                                         */
@@ -26,37 +27,37 @@ v3d_timeout_diag_t g_v3d_timeout_diag;
 v3d_prof_t g_v3d_prof[2];
 
 static _kernel_oserror err_wedged = {
-    40, "V3DDriver: GPU acceleration is switched off because a GPU job timed "
+    V3D_ERR(40), "V3DDriver: GPU acceleration is switched off because a GPU job timed "
         "out earlier - reboot, or use V3D_AccelTune 6 to switch it back on"
 };
 
 static _kernel_oserror err_bad_dims = {
-    10, "V3DDriver: rectangle width/height must be non-zero and no larger "
+    V3D_ERR(10), "V3DDriver: rectangle width/height must be non-zero and no larger "
         "than 16384"
 };
 
 static _kernel_oserror err_too_big = {
-    14, "V3DDriver: rectangle too large for the cached scratch buffers"
+    V3D_ERR(14), "V3DDriver: rectangle too large for the cached scratch buffers"
 };
 
 static _kernel_oserror err_no_slot = {
-    15, "V3DDriver: no free scratch slot (too many distinct PMP bases in "
+    V3D_ERR(15), "V3DDriver: no free scratch slot (too many distinct PMP bases in "
         "use)"
 };
 
 static _kernel_oserror err_overflow = {
-    42, "V3DDriver: internal error - a control list outgrew its buffer; "
+    V3D_ERR(42), "V3DDriver: internal error - a control list outgrew its buffer; "
         "job not submitted"
 };
 
 static _kernel_oserror err_timeout[2][2] = {
     {
-        { 11, "V3DDriver: fill timed out waiting for binning" },
-        { 12, "V3DDriver: fill timed out waiting for rendering" }
+        { V3D_ERR(11), "V3DDriver: fill timed out waiting for binning" },
+        { V3D_ERR(12), "V3DDriver: fill timed out waiting for rendering" }
     },
     {
-        { 11, "V3DDriver: copy timed out waiting for binning" },
-        { 12, "V3DDriver: copy timed out waiting for rendering" }
+        { V3D_ERR(11), "V3DDriver: copy timed out waiting for binning" },
+        { V3D_ERR(12), "V3DDriver: copy timed out waiting for rendering" }
     }
 };
 

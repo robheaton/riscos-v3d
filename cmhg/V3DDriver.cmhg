@@ -1,23 +1,15 @@
 ; V3DDriver.cmhg - CMHG module header for the M0/M1 V3D driver sketch.
 ;
-; SWI chunk number, per ROOL documented allocation rules
-; (see riscosopen.org/content/allocate and the Introduction To SWIs
-; wiki page for the bit layout):
-;   bits 18-19 of the SWI number select the SWI group - 00=OS,
-;   01=OS modules, 10=third-party (officially allocated), 11=user
-;   applications (free for private/development use, it is the
-;   author responsibility to avoid clashes on their own machine).
-; 0xC0040 = group 0b11 (user applications, bits 18-19) plus chunk
-; number 1 (bits 6-16). This replaces an earlier placeholder (0x50EC0)
-; that sat in the OS modules group by mistake - safe for private dev
-; use, but NOT for release: before this is shared with anyone else,
-; request a real allocation via !Allocate to allocate@riscosopen.org.
+; SWI chunk: ROOL allocated chunk &5AE00 with the SWI prefix V3D on 2026-10-20 (allocation request made with !Allocate,
+; riscosopen.org/content/allocate). Before that the module used &C0040, the user-application range, while in
+; development; programs that call the SWIs by NAME (as every script in test/ does) need no change.
+; The error block, &823100, is in c/v3d_errors.h.
 
 title-string:            V3DDriver
-help-string:              V3DDriver 0.12 (rev f: reload fixed, safer cold start, fill and copy census, accel auto-starts - see NoAutoStart)
+help-string:              V3DDriver 0.12 (rev g: official SWI chunk and error block, reload fixed, accel auto-starts - see NoAutoStart)
 initialisation-code:      module_init
 finalisation-code:        module_final
-swi-chunk-base-number:    0xC0040
+swi-chunk-base-number:    0x5AE00
 swi-handler-code:         v3d_swi_handler
 swi-decoding-table:       V3D,PowerOn,ReadIdent,TestBuffer,ClearTest,ClearToSprite,MemSplit,ClockInfo,IRQTest,ScreenInfo,FillTest,ScreenFillTest,AccelStart,AccelStop,AccelStats,AccelFailInfo,CopyTest,ScreenCopyTest,AccelCopyStats,OverlapCopyTest,ScreenCopyOverlapTest,AccelCopyLastError,RegSnapshot,StripedFillTest,AccelStripedStats,ScreenStripedFillTest,AccelReentrantCount,AccelTimingStats,16bppFormatTest,CopyTest16bpp,FillTest16bpp,AccelLimits,AccelProfile,AccelTune
 

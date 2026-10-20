@@ -42,6 +42,7 @@
 #include "v3d_regs.h"
 #include "io_map.h"
 #include "v3d_irq.h"
+#include "v3d_errors.h"
 
 /* TILE_SIZE, the scratch cache, the completion wait, the barriers, the
  * control-list upload and the job kick sequence all live in cl_common.c
@@ -259,7 +260,7 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: V3D_FillTest width/height must be non-zero"
+            V3D_ERR(10), "V3DDriver: V3D_FillTest width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -287,7 +288,7 @@ _kernel_oserror *v3d_fill_test(pmp_area_t *pmp, unsigned int base_page,
     if (render_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_FillTest rectangle too large for this test "
+            V3D_ERR(14), "V3DDriver: V3D_FillTest rectangle too large for this test "
                 "harness (pmp_alloc's pmp_alloc's per-call page cap (PMP_MAX_PAGES_PER_CALL)) - try a smaller "
                 "width/height. Not a limit of the fill algorithm itself."
         };
@@ -324,7 +325,7 @@ _kernel_oserror *v3d_fill_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: V3D_FillTest16bpp width/height must be non-zero"
+            V3D_ERR(10), "V3DDriver: V3D_FillTest16bpp width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -341,7 +342,7 @@ _kernel_oserror *v3d_fill_test_16bpp(pmp_area_t *pmp, unsigned int base_page,
         render_pages > FILL_TEST_16BPP_SLOT_PAGES - FILL_TEST_16BPP_SCRATCH_WORST_CASE_PAGES)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_FillTest16bpp rectangle too large for its "
+            V3D_ERR(14), "V3DDriver: V3D_FillTest16bpp rectangle too large for its "
                 "dedicated test PMP slot - try a smaller width/height."
         };
         return &err_too_big;
@@ -451,7 +452,7 @@ _kernel_oserror *v3d_striped_fill_test(pmp_area_t *pmp, unsigned int base_page,
     if (width == 0u || height == 0u)
     {
         static _kernel_oserror err_bad_size = {
-            10, "V3DDriver: V3D_StripedFillTest width/height must be non-zero"
+            V3D_ERR(10), "V3DDriver: V3D_StripedFillTest width/height must be non-zero"
         };
         return &err_bad_size;
     }
@@ -472,7 +473,7 @@ _kernel_oserror *v3d_striped_fill_test(pmp_area_t *pmp, unsigned int base_page,
     if (render_pages > PMP_MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_too_big = {
-            14, "V3DDriver: V3D_StripedFillTest rectangle too large for "
+            V3D_ERR(14), "V3DDriver: V3D_StripedFillTest rectangle too large for "
                 "this test harness (pmp_alloc's per-call page cap) - try "
                 "a smaller width/height."
         };

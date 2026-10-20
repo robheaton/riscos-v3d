@@ -16,6 +16,7 @@
 #include "bcmsupport.h"
 #include "beacon.h"
 #include <stddef.h>
+#include "v3d_errors.h"
 
 #define TAG_GET_CLOCK_STATE    0x00030001u
 #define TAG_SET_CLOCK_STATE    0x00038001u
@@ -170,7 +171,7 @@ _kernel_oserror *v3d_set_clock_rate(unsigned int hz, unsigned int *rate_out,
     if (!max_rate)
     {
         static _kernel_oserror err_no_max = {
-            49, "V3DDriver: the firmware did not report a maximum V3D clock rate"
+            V3D_ERR(49), "V3DDriver: the firmware did not report a maximum V3D clock rate"
         };
         return &err_no_max;
     }
@@ -188,7 +189,7 @@ _kernel_oserror *v3d_set_clock_rate(unsigned int hz, unsigned int *rate_out,
     if (!rate)
     {
         static _kernel_oserror err_no_rate = {
-            50, "V3DDriver: the firmware did not report the V3D clock rate after "
+            V3D_ERR(50), "V3DDriver: the firmware did not report the V3D clock rate after "
                 "the request"
         };
         return &err_no_rate;

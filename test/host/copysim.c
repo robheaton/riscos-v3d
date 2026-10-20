@@ -14,6 +14,7 @@
  * bands, and full-screen scrolls at 1920x1200 and 3840x2160.
  * Built with cl_common.c compiled -Dv3d_job_run=v3d_job_run_real so the mock can take its place.
  */
+#include "v3d_errors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -159,7 +160,7 @@ static int run_case(const char *name, unsigned lw, unsigned bytes_pp, unsigned r
         e = v3d_copy_screen(&pmp, 0, sx, sy, dx, dy, w, h, SCR_BASE, lw * bytes_pp, bytes_pp, fmtc, &tx, &ty);
     if (e)
     {
-        if (e->errnum == 14 && two_pass) { nrefused++; free(ref); return 1; }  /* bounce buffer cap: refused by design */
+        if (e->errnum == V3D_ERR(14) && two_pass) { nrefused++; free(ref); return 1; }  /* bounce buffer cap: refused by design */
         printf("%-40s ERR %d %s\n", name, e->errnum, e->errmess);
         free(ref);
         return 0;

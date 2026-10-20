@@ -8,6 +8,7 @@
 #include "phys_buffer.h"
 #include "cl_common.h" /* v3d_scratch_note_release - see pmp_release */
 #include "V3DDriver.h" /* for v3d_da_resize_veneer's address */
+#include "v3d_errors.h"
 
 #define SWI_OS_DynamicArea 0x66
 #define SWI_OS_Memory       0x68
@@ -362,7 +363,7 @@ _kernel_oserror *pmp_alloc_policy(pmp_area_t *area, unsigned int page_index,
     if (num_pages == 0 || num_pages > MAX_PAGES_PER_CALL)
     {
         static _kernel_oserror err_bad_count = {
-            6, "V3DDriver: pmp_alloc requested with an invalid page count"
+            V3D_ERR(6), "V3DDriver: pmp_alloc requested with an invalid page count"
         };
         return &err_bad_count;
     }
@@ -424,7 +425,7 @@ _kernel_oserror *pmp_alloc_policy(pmp_area_t *area, unsigned int page_index,
 _kernel_oserror *v3d_da_resize_handler(_kernel_swi_regs *r, void *pw)
 {
     static _kernel_oserror err = {
-        1, /* not an officially allocated error number - see cmhg notes */
+        V3D_ERR(1), /* not an officially allocated error number - see cmhg notes */
         "V3DDriver: this Physical Memory Pool does not support "
         "OS_ChangeDynamicArea resizing"
     };

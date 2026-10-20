@@ -4,7 +4,7 @@ GPU-accelerated rectangle fills and copies for the RISC OS desktop on the Raspbe
 
 An independent RISC OS module that drives the Pi 4's VideoCore VI (V3D 4.2) directly. It hooks the kernel's
 `GraphicsV` Render call, so window dragging, scrolling and large fills are done by the GPU with no change to any
-application. **Version 0.12 rev d. Experimental, and not an official ROOL project.**
+application. **Version 0.12 rev g. Experimental, and not an official ROOL project.**
 
 ## What it does
 
@@ -52,8 +52,9 @@ sprites and the Draw module (they do not go through `GraphicsV`).
 Run `test/GpuCheck` (double-click it in the Filer) to see what the GPU has done: operations accelerated, failures,
 timeouts, interrupts and whether any screen was declined.
 
-The module's SWIs are in the "user applications" chunk `&C0040`. **That number is not an official allocation** and
-has to be replaced before any wider release.
+The module's SWIs are in chunk `&5AE00` with the prefix `V3D`, and its errors in the block `&823100`, both allocated
+by ROOL. Releases up to 0.12.1 used a temporary chunk (`&C0040`): call the SWIs by name (`SYS "V3D_AccelTune"`),
+as the scripts in `test/` do, and nothing depends on the number.
 
 | SWI | Purpose |
 |---|---|
@@ -108,7 +109,7 @@ so its module is bigger (about 147 KB, mostly zero-filled tables); the code, and
 - **True 4K (3840x2160) has not been run.** The job-cutting is proven on real hardware at 3440x1440 (1,242 tiles) and
   against a model at 4K.
 - The fail-stop after a timeout has not been provoked on hardware.
-- The test SWIs are not a stable API, and the SWI chunk number is unofficial.
+- The test SWIs (`V3D_ClearTest`, `V3D_FillTest` and so on) are development tools, not a stable API.
 
 ## How it works
 

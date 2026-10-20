@@ -6,6 +6,7 @@
  * behind it, and a request that does not fit a slot is refused on a cache
  * hit as well as on creation (the v0.06 overrun).
  */
+#include "v3d_errors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,13 +88,13 @@ int main(void)
     CHECK(!e && s2 == s, "512 tiles still fits exactly");
     /* THE v0.06 BUG: a slot created by a small request, then a bigger one */
     e = v3d_scratch_get(&pmp, 4608, 513, &s2);
-    CHECK(e && e->errnum == 14, "513 tiles REFUSED on a cache hit (v0.06 overran here)");
+    CHECK(e && e->errnum == V3D_ERR(14), "513 tiles REFUSED on a cache hit (v0.06 overran here)");
     e = v3d_scratch_get(&pmp, 4608, 570, &s2);
-    CHECK(e && e->errnum == 14, "570 tiles (1920x1200) refused on a hit");
+    CHECK(e && e->errnum == V3D_ERR(14), "570 tiles (1920x1200) refused on a hit");
     e = v3d_scratch_get(&pmp, 9216, 570, &s2);
-    CHECK(e && e->errnum == 14, "570 tiles refused at creation too");
+    CHECK(e && e->errnum == V3D_ERR(14), "570 tiles refused at creation too");
     e = v3d_scratch_get(&pmp, 9216, 2040, &s2);
-    CHECK(e && e->errnum == 14, "2040 tiles (4K) refused");
+    CHECK(e && e->errnum == V3D_ERR(14), "2040 tiles (4K) refused");
     CHECK(alloc_calls == 4, "refusals did not allocate anything");
 
     /* ---- same base in a different area is a different slot ---- */
@@ -155,7 +156,7 @@ int main(void)
         e = v3d_overlap_buffer_get(&pmp, 20000, 2048, &ph, &lg);
         CHECK(!e && alloc_calls == 1, "reused for a bigger request up to 2048 pages");
         e = v3d_overlap_buffer_get(&pmp, 20000, 2049, &ph, &lg);
-        CHECK(e && e->errnum == 14, "2049 pages refused");
+        CHECK(e && e->errnum == V3D_ERR(14), "2049 pages refused");
     }
 
     /* ---- zero modes (0 = whole requested pages, 1 = only what is used) ---- */

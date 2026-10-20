@@ -14,7 +14,9 @@ ON ERROR PROCfail
 
 PROCmodinfo
 PRINT "PlotCensus - module: "; help$
-IF INSTR(help$, "rev f") = 0 THEN PRINT "This needs V3DDriver 0.12 rev f or later." : END
+rv% = INSTR(help$, "rev ")
+IF rv% = 0 THEN PRINT "This needs V3DDriver 0.12 rev f or later." : END
+IF ASC(MID$(help$, rv% + 4, 1)) < ASC("f") THEN PRINT "This needs V3DDriver 0.12 rev f or later." : END
 PRINT
 INPUT "Type R and Enter to start a new recording, or just Enter to print the census: " a$
 IF a$ = "R" OR a$ = "r" THEN
